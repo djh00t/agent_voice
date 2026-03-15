@@ -3,7 +3,7 @@
 DOCS_DIR := website
 COMPOSE_ENV_FILE := $(if $(wildcard .env),.env,.env.example)
 
-.PHONY: help fmt test lint doc docs-install docs-build docs-serve docs-audit check docker-build docker-up docker-logs docker-down compose-config release-check clean
+.PHONY: help fmt test lint doc release-bin docs-install docs-build docs-serve docs-audit check docker-build docker-up docker-logs docker-down compose-config release-check clean
 
 help:
 	@printf '%s\n' \
@@ -11,6 +11,7 @@ help:
 		'make test           - run Rust tests' \
 		'make lint           - run clippy with warnings denied' \
 		'make doc            - build Rust API docs' \
+		'make release-bin    - build the release Rust binary for Docker packaging' \
 		'make docs-install   - install Docusaurus dependencies' \
 		'make docs-build     - build the Docusaurus site' \
 		'make docs-serve     - serve the built Docusaurus site' \
@@ -36,6 +37,9 @@ lint:
 doc:
 	cargo doc --no-deps
 
+release-bin:
+	cargo build --release
+
 docs-install:
 	cd $(DOCS_DIR) && npm ci
 
@@ -50,7 +54,7 @@ docs-audit:
 
 check: test lint doc docs-build
 
-docker-build:
+docker-build: release-bin
 	docker compose --env-file $(COMPOSE_ENV_FILE) build
 
 docker-up:
@@ -65,7 +69,7 @@ docker-down:
 compose-config:
 	docker compose --env-file $(COMPOSE_ENV_FILE) config
 
-release-check: docs-install test lint doc docs-build docker-build compose-config
+release-check: docs-install test lint doc docs-build release-bin docker-build compose-config
 
 clean:
 	rm -rf target $(DOCS_DIR)/build $(DOCS_DIR)/.docusaurus
