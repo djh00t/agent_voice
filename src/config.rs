@@ -155,11 +155,7 @@ impl AppConfig {
         apply_string(env, "TRANSCRIPT_DIR", &mut self.behavior.transcript_dir);
         apply_string(env, "PHONE_BOOK_PATH", &mut self.behavior.phone_book_path);
         apply_string(env, "ASSISTANT_NAME", &mut self.behavior.assistant_name);
-        apply_string(
-            env,
-            "DEFAULT_TIMEZONE",
-            &mut self.behavior.default_timezone,
-        );
+        apply_string(env, "DEFAULT_TIMEZONE", &mut self.behavior.default_timezone);
         apply_u64(
             env,
             "CALL_TURN_SILENCE_MS",
@@ -901,8 +897,14 @@ mod tests {
         assert!(!config.behavior.auto_end_calls);
         assert_eq!(config.behavior.end_call_buffer_ms, 1200);
         assert_eq!(config.behavior.context_window_events, 10);
-        assert_eq!(config.accounting.model_catalog_path, "./accounting/models.json");
-        assert_eq!(config.accounting.api_calls_csv_path, "./accounting/api_calls.csv");
+        assert_eq!(
+            config.accounting.model_catalog_path,
+            "./accounting/models.json"
+        );
+        assert_eq!(
+            config.accounting.api_calls_csv_path,
+            "./accounting/api_calls.csv"
+        );
         assert_eq!(
             config.accounting.call_totals_csv_path,
             "./accounting/call_totals.csv"

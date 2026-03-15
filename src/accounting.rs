@@ -221,13 +221,21 @@ pub async fn refresh_model_catalog_from_pricing_page(config: &AccountingConfig) 
         .await
         .with_context(|| format!("failed to fetch {}", config.pricing_page_url))?
         .error_for_status()
-        .with_context(|| format!("pricing page returned an error: {}", config.pricing_page_url))?;
+        .with_context(|| {
+            format!(
+                "pricing page returned an error: {}",
+                config.pricing_page_url
+            )
+        })?;
     let html = response
         .text()
         .await
         .context("failed to read pricing page body")?;
     let scraped = scrape_model_catalog_from_html(&html)?;
-    let merged = merge_catalogs(load_existing_catalog(&config.model_catalog_path).ok(), scraped);
+    let merged = merge_catalogs(
+        load_existing_catalog(&config.model_catalog_path).ok(),
+        scraped,
+    );
     ensure_parent_dir(&config.model_catalog_path)?;
     fs::write(
         &config.model_catalog_path,
@@ -249,10 +257,7 @@ impl AccountingStore {
     /// Loads the accounting store from the configured model catalog.
     pub fn load(config: &AccountingConfig) -> Result<Self> {
         let raw = fs::read_to_string(&config.model_catalog_path).with_context(|| {
-            format!(
-                "failed to read model catalog {}",
-                config.model_catalog_path
-            )
+            format!("failed to read model catalog {}", config.model_catalog_path)
         })?;
         let catalog: ModelCatalog =
             serde_json::from_str(&raw).context("failed to parse model catalog JSON")?;
@@ -298,7 +303,10 @@ impl AccountingStore {
         let Some(tokens_per_second) = self
             .model_pricing(model)
             .and_then(|pricing| pricing.estimated_output_audio_tokens_per_second)
-            .or(self.catalog.defaults.estimated_output_audio_tokens_per_second)
+            .or(self
+                .catalog
+                .defaults
+                .estimated_output_audio_tokens_per_second)
         else {
             return 0;
         };
@@ -430,7 +438,10 @@ impl AccountingStore {
     }
 
     fn model_pricing(&self, model: &str) -> Option<&ModelPricing> {
-        self.catalog.models.iter().find(|candidate| candidate.name == model)
+        self.catalog
+            .models
+            .iter()
+            .find(|candidate| candidate.name == model)
     }
 }
 
@@ -511,18 +522,20 @@ fn scrape_model_catalog_from_html(html: &str) -> Result<ModelCatalog> {
             && let Some((model_name, prices)) = parse_concatenated_pricing_row(line)
             && prices.len() >= 3
         {
-            let model = models.entry(model_name.clone()).or_insert_with(|| ModelPricing {
-                name: model_name.clone(),
-                service: "responses".to_string(),
-                input_text_usd_per_million_tokens: 0.0,
-                cached_input_text_usd_per_million_tokens: 0.0,
-                output_text_usd_per_million_tokens: 0.0,
-                input_audio_usd_per_million_tokens: 0.0,
-                output_audio_usd_per_million_tokens: 0.0,
-                estimated_chars_per_input_token: None,
-                estimated_input_audio_tokens_per_second: None,
-                estimated_output_audio_tokens_per_second: None,
-            });
+            let model = models
+                .entry(model_name.clone())
+                .or_insert_with(|| ModelPricing {
+                    name: model_name.clone(),
+                    service: "responses".to_string(),
+                    input_text_usd_per_million_tokens: 0.0,
+                    cached_input_text_usd_per_million_tokens: 0.0,
+                    output_text_usd_per_million_tokens: 0.0,
+                    input_audio_usd_per_million_tokens: 0.0,
+                    output_audio_usd_per_million_tokens: 0.0,
+                    estimated_chars_per_input_token: None,
+                    estimated_input_audio_tokens_per_second: None,
+                    estimated_output_audio_tokens_per_second: None,
+                });
             model.input_text_usd_per_million_tokens = prices[0].unwrap_or(0.0);
             model.cached_input_text_usd_per_million_tokens = prices[1].unwrap_or(0.0);
             model.output_text_usd_per_million_tokens = prices[2].unwrap_or(0.0);
@@ -796,7 +809,10 @@ mod tests {
         };
 
         assert_eq!(store.estimate_text_tokens("gpt-4o-mini-tts", "hello"), 3);
-        assert_eq!(store.estimate_output_audio_tokens("gpt-4o-mini-tts", 8000, 8000), 20);
+        assert_eq!(
+            store.estimate_output_audio_tokens("gpt-4o-mini-tts", 8000, 8000),
+            20
+        );
     }
 
     #[test]

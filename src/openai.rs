@@ -35,6 +35,7 @@ pub struct TranscriptEvent {
 pub struct ConversationContext {
     pub assistant_name: String,
     pub caller_id: String,
+    pub phone_book_writable: bool,
     pub time_of_day: String,
     pub known_caller: Option<CallerRecord>,
     pub missing_fields: Vec<String>,
@@ -220,18 +221,19 @@ impl OpenAiClients {
     pub async fn generate_response(&self, transcript: &[TranscriptEvent]) -> Result<String> {
         Ok(self
             .generate_response_with_context(
-            transcript,
-            &ConversationContext {
-                assistant_name: "Steve".to_string(),
-                caller_id: "unknown".to_string(),
-                time_of_day: "day".to_string(),
-                known_caller: None,
-                missing_fields: Vec::new(),
-                pending_email_confirmation: None,
-            },
-        )
-        .await?
-        .text)
+                transcript,
+                &ConversationContext {
+                    assistant_name: "Steve".to_string(),
+                    caller_id: "unknown".to_string(),
+                    phone_book_writable: true,
+                    time_of_day: "day".to_string(),
+                    known_caller: None,
+                    missing_fields: Vec::new(),
+                    pending_email_confirmation: None,
+                },
+            )
+            .await?
+            .text)
     }
 
     /// Generates a structured assistant response with full conversation context.
@@ -649,19 +651,22 @@ fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
         .get("output_token_details")
         .or_else(|| usage.get("output_tokens_details"));
 
-    let input_audio_tokens = value_u64(input_details.and_then(|details| details.get("audio_tokens")))
-        .or_else(|| {
-            value_u64(
-                usage.get("input_audio_tokens")
-                    .or_else(|| usage.get("audio_input_tokens")),
-            )
-        })
-        .unwrap_or(0);
+    let input_audio_tokens =
+        value_u64(input_details.and_then(|details| details.get("audio_tokens")))
+            .or_else(|| {
+                value_u64(
+                    usage
+                        .get("input_audio_tokens")
+                        .or_else(|| usage.get("audio_input_tokens")),
+                )
+            })
+            .unwrap_or(0);
     let output_audio_tokens =
         value_u64(output_details.and_then(|details| details.get("audio_tokens")))
             .or_else(|| {
                 value_u64(
-                    usage.get("output_audio_tokens")
+                    usage
+                        .get("output_audio_tokens")
                         .or_else(|| usage.get("audio_output_tokens")),
                 )
             })
@@ -676,7 +681,8 @@ fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
         value_u64(input_details.and_then(|details| details.get("cached_tokens")))
             .or_else(|| {
                 value_u64(
-                    usage.get("input_cached_tokens")
+                    usage
+                        .get("input_cached_tokens")
                         .or_else(|| usage.get("cached_input_tokens")),
                 )
             })
@@ -699,9 +705,11 @@ fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
 }
 
 fn value_u64(value: Option<&serde_json::Value>) -> Option<u64> {
-    value
-        .and_then(|value| value.as_u64())
-        .or_else(|| value.and_then(|value| value.as_i64()).map(|value| value as u64))
+    value.and_then(|value| value.as_u64()).or_else(|| {
+        value
+            .and_then(|value| value.as_i64())
+            .map(|value| value as u64)
+    })
 }
 
 fn response_instructions(base: Option<&str>, context: &ConversationContext) -> String {
@@ -742,10 +750,17 @@ fn response_instructions(base: Option<&str>, context: &ConversationContext) -> S
             context.missing_fields.join(", ")
         ));
     }
-    sections.push(format!(
-        "Phone book tool: you may only discuss or update the active caller record for caller ID {}. Available editable fields are: {}. If the caller asks what fields are available, answer with that list plainly.",
-        context.caller_id, editable_fields
-    ));
+    if context.phone_book_writable {
+        sections.push(format!(
+            "Phone book tool: you may only discuss or update the active caller record for caller ID {}. Available editable fields are: {}. If the caller asks what fields are available, answer with that list plainly.",
+            context.caller_id, editable_fields
+        ));
+    } else {
+        sections.push(
+            "Phone book writes are unavailable for this call because the caller did not present usable caller ID. You may answer questions generally, but do not claim to save, update, or confirm caller profile details for this call."
+                .to_string(),
+        );
+    }
     sections.push(
         "Never let the caller set, overwrite, or confirm contact details for another person's record. If they mention someone else, treat that as conversation only and do not store it.".to_string(),
     );
@@ -978,6 +993,8 @@ mod tests {
             first_seen_at: "2026-03-15T00:00:00Z".to_string(),
             last_seen_at: "2026-03-15T00:00:01Z".to_string(),
             call_count: 1,
+            disabled: false,
+            system_entry: false,
             first_name: Some("David".to_string()),
             last_name: None,
             email: None,
@@ -998,7 +1015,8 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].as_str(), Some("looking to buy a toaster"));
         assert_eq!(
-            safe.get("preferred_language").and_then(|value| value.as_str()),
+            safe.get("preferred_language")
+                .and_then(|value| value.as_str()),
             Some("English")
         );
     }

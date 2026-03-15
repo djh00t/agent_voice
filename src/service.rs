@@ -24,7 +24,10 @@ use crate::api;
 use crate::audio::{TELEPHONY_FRAME_SAMPLES, TELEPHONY_RATE, encode_wav_mono_i16};
 use crate::config::{AppConfig, BehaviorConfig};
 use crate::openai::{ConversationContext, OpenAiClients, TranscriptEvent, TranscriptSink};
-use crate::phonebook::{CallerUpdate, PhoneBookStore, is_valid_timezone, normalize_email_candidate};
+use crate::phonebook::{
+    CallerUpdate, PhoneBookStore, caller_id_display, is_valid_timezone, normalize_caller_id,
+    normalize_email_candidate,
+};
 
 #[derive(Clone)]
 /// The long-running SIP voice service used by the local agent API.
@@ -116,7 +119,8 @@ impl VoiceAgentService {
             .phone
             .dial(&target, DialOptions::default())
             .map_err(|error| anyhow!("failed to dial {}: {}", target, error))?;
-        self.bootstrap_call(call, "outbound").await
+        self.bootstrap_call(call, "outbound", normalize_caller_id(&target), true)
+            .await
     }
 
     /// Returns snapshots for all currently tracked calls.
@@ -228,6 +232,23 @@ impl VoiceAgentService {
     }
 
     async fn handle_incoming(self: Arc<Self>, call: Arc<Call>) -> Result<()> {
+        let access = self.phone_book.inbound_access_decision(&call.from());
+        if !access.allowed {
+            let caller_label = access
+                .caller_id
+                .clone()
+                .unwrap_or_else(|| caller_id_display(&call.from()));
+            info!(
+                call_id = %call.call_id(),
+                caller_id = %caller_label,
+                matched_record_key = %access.matched_record_key,
+                "rejecting inbound call by phone book access policy"
+            );
+            call.reject(603, "Inbound calls are not accepted for this caller")
+                .context("failed to reject inbound call")?;
+            return Ok(());
+        }
+
         if self.config.behavior.auto_answer_incoming || self.config.sip.accept_incoming_calls {
             let answer_delay_ms = self.config.behavior.incoming_answer_delay_ms;
             if answer_delay_ms > 0 {
@@ -240,20 +261,38 @@ impl VoiceAgentService {
             }
             call.accept().context("failed to accept incoming call")?;
         }
-        let snapshot = self.bootstrap_call(call, "inbound").await?;
+        let snapshot = self
+            .bootstrap_call(
+                call,
+                "inbound",
+                access.caller_id,
+                access.track_existing_caller,
+            )
+            .await?;
         if let Err(error) = self.play_incoming_greeting(&snapshot.call_id).await {
             warn!(call_id = %snapshot.call_id, error = %error, "failed to play incoming greeting");
         }
         Ok(())
     }
 
-    async fn bootstrap_call(&self, call: Arc<Call>, direction: &str) -> Result<CallSnapshot> {
+    async fn bootstrap_call(
+        &self,
+        call: Arc<Call>,
+        direction: &str,
+        phone_book_key: Option<String>,
+        track_existing_caller: bool,
+    ) -> Result<CallSnapshot> {
         let call_id = call.call_id();
         if let Some(existing) = self.state.calls.read().get(&call_id) {
             return Ok(existing.snapshot());
         }
 
-        let record = Arc::new(ManagedCall::new(Arc::clone(&call), direction.to_string()));
+        let record = Arc::new(ManagedCall::new(
+            Arc::clone(&call),
+            direction.to_string(),
+            phone_book_key,
+            track_existing_caller,
+        ));
 
         self.state
             .calls
@@ -268,7 +307,8 @@ impl VoiceAgentService {
             if let Err(error) = record_clone.persist_transcript(&transcript_dir) {
                 record_clone.mark_error(format!("failed to persist transcript: {error}"));
             }
-            if let Err(error) = accounting.record_call_total(&record_clone.call_totals_log_entry(reason))
+            if let Err(error) =
+                accounting.record_call_total(&record_clone.call_totals_log_entry(reason))
             {
                 record_clone.mark_error(format!("failed to persist call totals: {error}"));
             }
@@ -320,7 +360,10 @@ impl VoiceAgentService {
         )
         .await?;
 
-        if let Err(error) = self.phone_book.touch_caller(&record.peer) {
+        if record.track_existing_caller
+            && let Some(phone_book_key) = record.phone_book_key.as_deref()
+            && let Err(error) = self.phone_book.touch_caller(phone_book_key)
+        {
             record.mark_error(format!("failed to update phone book: {error}"));
         }
 
@@ -333,10 +376,13 @@ impl VoiceAgentService {
             .calls
             .read()
             .get(call_id)
-            .map(|call| call.peer.clone())
-            .unwrap_or_default();
-        let greeting =
-            build_initial_greeting(self.phone_book.get(&peer).as_ref(), &self.config.behavior);
+            .and_then(|call| call.phone_book_key.clone());
+        let greeting = build_initial_greeting(
+            peer.as_deref()
+                .and_then(|key| self.phone_book.get(key))
+                .as_ref(),
+            &self.config.behavior,
+        );
         if greeting.is_empty() {
             return Ok(());
         }
@@ -350,7 +396,7 @@ impl VoiceAgentService {
                 .map(|call| call.speaker_tx.read().is_some())
                 .unwrap_or(false);
             if media_ready {
-                let caller = self.phone_book.get(&peer);
+                let caller = peer.as_deref().and_then(|key| self.phone_book.get(key));
                 info!(call_id = %call_id, greeting = %greeting, "playing incoming greeting");
                 return self
                     .speak_text(
@@ -459,6 +505,8 @@ struct ManagedCall {
     last_error: RwLock<Option<String>>,
     started_at: String,
     peer: String,
+    phone_book_key: Option<String>,
+    track_existing_caller: bool,
     bridge_started: AtomicBool,
     end_requested: AtomicBool,
     input_suppressed_until: RwLock<Option<Instant>>,
@@ -469,12 +517,24 @@ struct ManagedCall {
 }
 
 impl ManagedCall {
-    fn new(call: Arc<Call>, direction: String) -> Self {
-        let peer = if direction == "inbound" {
+    fn new(
+        call: Arc<Call>,
+        direction: String,
+        phone_book_key: Option<String>,
+        track_existing_caller: bool,
+    ) -> Self {
+        let raw_peer = if direction == "inbound" {
             call.from()
         } else {
             call.to()
         };
+        let peer = phone_book_key.clone().unwrap_or_else(|| {
+            if direction == "inbound" {
+                caller_id_display(&raw_peer)
+            } else {
+                raw_peer
+            }
+        });
         Self {
             call,
             direction,
@@ -486,6 +546,8 @@ impl ManagedCall {
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_else(|_| "unknown".to_string()),
             peer,
+            phone_book_key,
+            track_existing_caller,
             bridge_started: AtomicBool::new(false),
             end_requested: AtomicBool::new(false),
             input_suppressed_until: RwLock::new(None),
@@ -595,7 +657,10 @@ impl ManagedCall {
     fn suppress_input_for(&self, duration: StdDuration) {
         let until = Instant::now() + duration;
         let mut suppressed_until = self.input_suppressed_until.write();
-        if suppressed_until.map(|existing| existing < until).unwrap_or(true) {
+        if suppressed_until
+            .map(|existing| existing < until)
+            .unwrap_or(true)
+        {
             *suppressed_until = Some(until);
         }
     }
@@ -751,18 +816,18 @@ async fn activate_media_bridge(
     );
 
     let record_clone = Arc::clone(&record);
-        let runtime = tokio::runtime::Handle::current();
-        let speaker_tx_clone = speaker_tx.clone();
-        std::thread::spawn(move || {
-            let mut turn_detector = TurnDetector::new(&behavior);
-            while let Ok(frame) = pcm_rx.recv() {
-                if record_clone.input_is_suppressed() {
-                    turn_detector.reset();
-                    continue;
-                }
-                if let Some(utterance) = turn_detector.push_frame(&frame)
-                    && let Err(error) = runtime.block_on(process_detected_utterance(
-                        &openai,
+    let runtime = tokio::runtime::Handle::current();
+    let speaker_tx_clone = speaker_tx.clone();
+    std::thread::spawn(move || {
+        let mut turn_detector = TurnDetector::new(&behavior);
+        while let Ok(frame) = pcm_rx.recv() {
+            if record_clone.input_is_suppressed() {
+                turn_detector.reset();
+                continue;
+            }
+            if let Some(utterance) = turn_detector.push_frame(&frame)
+                && let Err(error) = runtime.block_on(process_detected_utterance(
+                    &openai,
                     Arc::clone(&phone_book),
                     Arc::clone(&accounting),
                     behavior.clone(),
@@ -847,16 +912,22 @@ async fn process_detected_utterance(
 
     reconcile_pending_email_confirmation(&phone_book, &record, caller_text)?;
 
+    let caller_profile = record
+        .phone_book_key
+        .as_deref()
+        .and_then(|key| phone_book.get(key));
+
     let extraction_started = Instant::now();
-    if let Ok(update) = openai
-        .extract_caller_update(
-            &windowed_transcript(
-                &record.transcript_history(),
-                behavior.context_window_events * 2,
-            ),
-            phone_book.get(&record.peer).as_ref(),
-        )
-        .await
+    if let Some(phone_book_key) = record.phone_book_key.as_deref()
+        && let Ok(update) = openai
+            .extract_caller_update(
+                &windowed_transcript(
+                    &record.transcript_history(),
+                    behavior.context_window_events * 2,
+                ),
+                caller_profile.as_ref(),
+            )
+            .await
     {
         let extraction_usage = update.usage.clone();
         let sanitized_update = sanitize_caller_update(update.update, caller_text);
@@ -877,16 +948,16 @@ async fn process_detected_utterance(
                 usage: extraction_usage,
             },
         )?;
-        if let Err(error) = phone_book.merge_update(&record.peer, sanitized_update.update) {
+        if let Err(error) = phone_book.merge_update(phone_book_key, sanitized_update.update) {
             warn!(call_id = %record.call.call_id(), error = %error, "failed to persist caller update");
         }
     }
     let extraction_ms = extraction_started.elapsed().as_millis();
 
-    let caller_profile = phone_book.get(&record.peer);
     let context = ConversationContext {
         assistant_name: behavior.assistant_name.clone(),
         caller_id: record.peer.clone(),
+        phone_book_writable: record.phone_book_key.is_some(),
         time_of_day: time_of_day_label(
             caller_profile
                 .as_ref()
@@ -1053,7 +1124,9 @@ fn schedule_end_call(record: Arc<ManagedCall>, playback_ms: u64, buffer_ms: u64)
         sleep(Duration::from_millis(delay_ms)).await;
         match call.end() {
             Ok(()) => info!(call_id = %call_id, "sent SIP BYE after farewell"),
-            Err(error) => warn!(call_id = %call_id, error = %error, "failed to send SIP BYE after farewell"),
+            Err(error) => {
+                warn!(call_id = %call_id, error = %error, "failed to send SIP BYE after farewell")
+            }
         }
     });
 }
@@ -1230,9 +1303,13 @@ fn sanitize_caller_update(
     update.first_name = normalize_name_candidate(update.first_name);
     update.last_name = normalize_name_candidate(update.last_name);
     update.company = normalize_company_candidate(update.company);
-    update.timezone = update
-        .timezone
-        .and_then(|value| if is_valid_timezone(&value) { Some(value) } else { None });
+    update.timezone = update.timezone.and_then(|value| {
+        if is_valid_timezone(&value) {
+            Some(value)
+        } else {
+            None
+        }
+    });
 
     if update.preferred_language.is_some()
         && !caller_explicitly_set_language_preference(latest_caller_text)
@@ -1240,7 +1317,11 @@ fn sanitize_caller_update(
         update.preferred_language = None;
     }
 
-    if let Some(candidate) = update.email.take().and_then(|value| normalize_email_candidate(&value)) {
+    if let Some(candidate) = update
+        .email
+        .take()
+        .and_then(|value| normalize_email_candidate(&value))
+    {
         sanitized.pending_email_confirmation = Some(candidate);
     }
 
@@ -1296,7 +1377,8 @@ fn normalize_company_candidate(candidate: Option<String>) -> Option<String> {
 }
 
 fn sanitize_notes(notes: Vec<String>) -> Vec<String> {
-    notes.into_iter()
+    notes
+        .into_iter()
         .map(|note| note.trim().to_string())
         .filter(|note| !note.is_empty() && note.len() <= 120)
         .collect()
@@ -1311,9 +1393,14 @@ fn reconcile_pending_email_confirmation(
         return Ok(());
     };
 
+    let Some(phone_book_key) = record.phone_book_key.as_deref() else {
+        record.set_pending_email_confirmation(None);
+        return Ok(());
+    };
+
     if caller_confirmed_pending_value(latest_caller_text) {
         phone_book.merge_update(
-            &record.peer,
+            phone_book_key,
             CallerUpdate {
                 email: Some(pending_email.clone()),
                 ..Default::default()
@@ -1388,7 +1475,8 @@ fn build_initial_greeting(
 }
 
 fn time_of_day_label(timezone: &str) -> String {
-    let hour = current_hour_for_timezone(timezone).unwrap_or_else(|| current_hour_for_timezone("UTC").unwrap_or(12));
+    let hour = current_hour_for_timezone(timezone)
+        .unwrap_or_else(|| current_hour_for_timezone("UTC").unwrap_or(12));
     match hour {
         5..=11 => "morning".to_string(),
         12..=16 => "afternoon".to_string(),

@@ -16,4 +16,8 @@ if [ "${SIP_RESOLVE_HOST:-true}" = "true" ] && [ -n "${SIP_HOST:-}" ]; then
   esac
 fi
 
+if [ "$#" -eq 0 ] && [ -n "${AGENT_VOICE_CONFIG:-}" ]; then
+  set -- --config "$AGENT_VOICE_CONFIG"
+fi
+
 exec agent_voice "$@"

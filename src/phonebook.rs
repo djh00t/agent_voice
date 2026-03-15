@@ -19,6 +19,15 @@ pub const EDITABLE_CALLER_FIELDS: &[&str] = &[
     "notes",
 ];
 
+/// A wildcard access-control entry that applies to any caller ID without an exact record.
+pub const WILDCARD_CALLER_ID: &str = "*";
+
+/// The special access-control entry for callers that do not present caller ID.
+pub const NO_CALLER_ID_POLICY_KEY: &str = "__no_caller_id__";
+
+/// The display label used when a call does not present caller ID.
+pub const NO_CALLER_ID_DISPLAY: &str = "no-caller-id";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 /// The on-disk phone-book document.
 pub struct PhoneBook {
@@ -33,6 +42,10 @@ pub struct CallerRecord {
     pub first_seen_at: String,
     pub last_seen_at: String,
     pub call_count: u64,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub system_entry: bool,
     #[serde(default)]
     pub first_name: Option<String>,
     #[serde(default)]
@@ -56,6 +69,8 @@ impl CallerRecord {
             first_seen_at: now.clone(),
             last_seen_at: now,
             call_count: 0,
+            disabled: false,
+            system_entry: false,
             first_name: None,
             last_name: None,
             email: None,
@@ -63,6 +78,24 @@ impl CallerRecord {
             timezone: None,
             preferred_language: None,
             notes: Vec::new(),
+        }
+    }
+
+    fn new_system_entry(caller_id: &str, now: String, disabled: bool, notes: Vec<String>) -> Self {
+        Self {
+            caller_id: caller_id.to_string(),
+            first_seen_at: now.clone(),
+            last_seen_at: now,
+            call_count: 0,
+            disabled,
+            system_entry: true,
+            first_name: None,
+            last_name: None,
+            email: None,
+            company: None,
+            timezone: None,
+            preferred_language: None,
+            notes,
         }
     }
 
@@ -107,6 +140,24 @@ pub struct CallerUpdate {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The phone-book policy record that decided whether an inbound call may proceed.
+pub enum InboundPolicyMatch {
+    Exact,
+    Wildcard,
+    NoCallerId,
+}
+
+#[derive(Debug, Clone)]
+/// The resolved inbound access decision for a caller.
+pub struct InboundAccessDecision {
+    pub caller_id: Option<String>,
+    pub allowed: bool,
+    pub matched_policy: InboundPolicyMatch,
+    pub matched_record_key: String,
+    pub track_existing_caller: bool,
+}
+
 /// Thread-safe phone-book storage backed by a JSON file.
 pub struct PhoneBookStore {
     path: PathBuf,
@@ -125,7 +176,11 @@ impl PhoneBookStore {
         } else {
             PhoneBook::default()
         };
+        let seeded_entries = seed_policy_entries(&mut phone_book);
         sanitize_phone_book(&mut phone_book);
+        if seeded_entries {
+            persist_phone_book(&path, &phone_book)?;
+        }
 
         Ok(Self {
             path,
@@ -152,7 +207,48 @@ impl PhoneBookStore {
 
     /// Returns a cloned caller record by caller ID.
     pub fn get(&self, caller_id: &str) -> Option<CallerRecord> {
-        self.phone_book.read().callers.get(caller_id).cloned()
+        self.phone_book
+            .read()
+            .callers
+            .get(caller_id)
+            .filter(|caller| !caller.system_entry)
+            .cloned()
+    }
+
+    /// Evaluates whether an inbound call from the supplied caller ID is allowed.
+    pub fn inbound_access_decision(&self, raw_caller_id: &str) -> InboundAccessDecision {
+        let caller_id = normalize_caller_id(raw_caller_id);
+        let phone_book = self.phone_book.read();
+
+        if let Some(caller_id) = caller_id {
+            if let Some(record) = phone_book.callers.get(&caller_id) {
+                return InboundAccessDecision {
+                    caller_id: Some(caller_id.clone()),
+                    allowed: !record.disabled,
+                    matched_policy: InboundPolicyMatch::Exact,
+                    matched_record_key: caller_id,
+                    track_existing_caller: !record.disabled,
+                };
+            }
+
+            let wildcard = phone_book.callers.get(WILDCARD_CALLER_ID);
+            return InboundAccessDecision {
+                caller_id: Some(caller_id),
+                allowed: wildcard.map(|record| !record.disabled).unwrap_or(false),
+                matched_policy: InboundPolicyMatch::Wildcard,
+                matched_record_key: WILDCARD_CALLER_ID.to_string(),
+                track_existing_caller: false,
+            };
+        }
+
+        let no_caller_id = phone_book.callers.get(NO_CALLER_ID_POLICY_KEY);
+        InboundAccessDecision {
+            caller_id: None,
+            allowed: no_caller_id.map(|record| !record.disabled).unwrap_or(false),
+            matched_policy: InboundPolicyMatch::NoCallerId,
+            matched_record_key: NO_CALLER_ID_POLICY_KEY.to_string(),
+            track_existing_caller: false,
+        }
     }
 
     /// Merges a partial caller update into the stored record and persists it.
@@ -213,6 +309,43 @@ fn sanitize_phone_book(phone_book: &mut PhoneBook) {
     }
 }
 
+fn seed_policy_entries(phone_book: &mut PhoneBook) -> bool {
+    let now = now_rfc3339();
+    let mut changed = false;
+    phone_book
+        .callers
+        .entry(WILDCARD_CALLER_ID.to_string())
+        .or_insert_with(|| {
+            changed = true;
+            CallerRecord::new_system_entry(
+                WILDCARD_CALLER_ID,
+                now.clone(),
+                true,
+                vec![
+                    "System policy entry for callers that do present caller ID but do not have an exact record."
+                        .to_string(),
+                    "Disabled by default to enforce deny-by-default inbound access.".to_string(),
+                ],
+            )
+        });
+    phone_book
+        .callers
+        .entry(NO_CALLER_ID_POLICY_KEY.to_string())
+        .or_insert_with(|| {
+            changed = true;
+            CallerRecord::new_system_entry(
+                NO_CALLER_ID_POLICY_KEY,
+                now,
+                true,
+                vec![
+                    "System policy entry for callers that do not present caller ID.".to_string(),
+                    "Disabled by default to enforce deny-by-default inbound access.".to_string(),
+                ],
+            )
+        });
+    changed
+}
+
 fn merge_option(target: &mut Option<String>, candidate: Option<String>) {
     if let Some(value) = candidate.map(|value| value.trim().to_string())
         && !value.is_empty()
@@ -240,6 +373,62 @@ fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Normalizes a SIP caller ID into a stable phone-book key.
+pub fn normalize_caller_id(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '<' | '>' | '"' | '\''));
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    if matches!(
+        lowered.as_str(),
+        "anonymous" | "unknown" | "unavailable" | "private" | "restricted"
+    ) {
+        return None;
+    }
+
+    let without_scheme = if let Some(rest) = lowered.strip_prefix("sip:") {
+        &trimmed[trimmed.len() - rest.len()..]
+    } else if let Some(rest) = lowered.strip_prefix("sips:") {
+        &trimmed[trimmed.len() - rest.len()..]
+    } else if let Some(rest) = lowered.strip_prefix("tel:") {
+        &trimmed[trimmed.len() - rest.len()..]
+    } else {
+        trimmed
+    };
+
+    let without_params = without_scheme
+        .split([';', '?'])
+        .next()
+        .unwrap_or(without_scheme);
+    let user_part = without_params
+        .split('@')
+        .next()
+        .unwrap_or(without_params)
+        .trim();
+    if user_part.is_empty() {
+        return None;
+    }
+
+    let normalized = user_part
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '_' | '.'))
+        .collect::<String>();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+/// Returns the caller label used in logs and call snapshots.
+pub fn caller_id_display(raw: &str) -> String {
+    normalize_caller_id(raw).unwrap_or_else(|| NO_CALLER_ID_DISPLAY.to_string())
 }
 
 /// Returns the set of editable phone-book fields.
@@ -324,5 +513,116 @@ mod tests {
         assert_eq!(updated.notes, vec!["Interested in support"]);
 
         let _ = fs::remove_file(&temp_dir);
+    }
+
+    #[test]
+    fn load_seeds_policy_entries_with_deny_defaults() {
+        let temp_dir = std::env::temp_dir().join("agent_voice_phonebook_policy_test.json");
+        let _ = fs::remove_file(&temp_dir);
+        let store = PhoneBookStore::load(&temp_dir).expect("store");
+
+        let wildcard = store
+            .phone_book
+            .read()
+            .callers
+            .get(WILDCARD_CALLER_ID)
+            .cloned()
+            .expect("wildcard entry");
+        let no_caller_id = store
+            .phone_book
+            .read()
+            .callers
+            .get(NO_CALLER_ID_POLICY_KEY)
+            .cloned()
+            .expect("no caller id entry");
+
+        assert!(wildcard.disabled);
+        assert!(wildcard.system_entry);
+        assert!(no_caller_id.disabled);
+        assert!(no_caller_id.system_entry);
+
+        let _ = fs::remove_file(&temp_dir);
+    }
+
+    #[test]
+    fn inbound_access_denies_unknown_callers_by_default() {
+        let temp_dir = std::env::temp_dir().join("agent_voice_phonebook_access_default.json");
+        let _ = fs::remove_file(&temp_dir);
+        let store = PhoneBookStore::load(&temp_dir).expect("store");
+
+        let decision = store.inbound_access_decision("sip:61415850000@example.com");
+        assert!(!decision.allowed);
+        assert_eq!(decision.matched_policy, InboundPolicyMatch::Wildcard);
+        assert_eq!(decision.caller_id.as_deref(), Some("61415850000"));
+
+        let anonymous = store.inbound_access_decision("anonymous");
+        assert!(!anonymous.allowed);
+        assert_eq!(anonymous.matched_policy, InboundPolicyMatch::NoCallerId);
+        assert!(anonymous.caller_id.is_none());
+
+        let _ = fs::remove_file(&temp_dir);
+    }
+
+    #[test]
+    fn inbound_access_honors_exact_and_wildcard_records() {
+        let temp_dir = std::env::temp_dir().join("agent_voice_phonebook_access_exact.json");
+        let _ = fs::remove_file(&temp_dir);
+        let store = PhoneBookStore::load(&temp_dir).expect("store");
+
+        store
+            .merge_update(
+                "61415850000",
+                CallerUpdate {
+                    first_name: Some("David".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("seed explicit caller");
+
+        let exact = store.inbound_access_decision("sip:61415850000@example.com");
+        assert!(exact.allowed);
+        assert_eq!(exact.matched_policy, InboundPolicyMatch::Exact);
+        assert!(exact.track_existing_caller);
+
+        {
+            let mut phone_book = store.phone_book.write();
+            phone_book
+                .callers
+                .get_mut("61415850000")
+                .expect("explicit record")
+                .disabled = true;
+        }
+        let denied_exact = store.inbound_access_decision("61415850000");
+        assert!(!denied_exact.allowed);
+        assert_eq!(denied_exact.matched_policy, InboundPolicyMatch::Exact);
+
+        {
+            let mut phone_book = store.phone_book.write();
+            phone_book
+                .callers
+                .get_mut(WILDCARD_CALLER_ID)
+                .expect("wildcard record")
+                .disabled = false;
+        }
+        let wildcard = store.inbound_access_decision("sip:61419990000@example.com");
+        assert!(wildcard.allowed);
+        assert_eq!(wildcard.matched_policy, InboundPolicyMatch::Wildcard);
+        assert!(!wildcard.track_existing_caller);
+
+        let _ = fs::remove_file(&temp_dir);
+    }
+
+    #[test]
+    fn normalize_caller_id_parses_sip_and_tel_values() {
+        assert_eq!(
+            normalize_caller_id("sip:61415850000@example.com"),
+            Some("61415850000".to_string())
+        );
+        assert_eq!(
+            normalize_caller_id("tel:+61415850000"),
+            Some("+61415850000".to_string())
+        );
+        assert_eq!(normalize_caller_id("anonymous"), None);
+        assert_eq!(caller_id_display("anonymous"), NO_CALLER_ID_DISPLAY);
     }
 }

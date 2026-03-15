@@ -13,6 +13,7 @@ services:
       - ./accounting:/app/accounting
       - ./data:/app/data
     environment:
+      AGENT_VOICE_CONFIG: /app/config/agent_voice.yaml
       OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
       SIP_USERNAME: ${SIP_USERNAME:?set SIP_USERNAME in .env}
       SIP_PASSWORD: ${SIP_PASSWORD:?set SIP_PASSWORD in .env}
