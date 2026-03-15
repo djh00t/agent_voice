@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent Voice SIP bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agent_voice
+Environment=RUST_LOG=info,agent_voice=debug
+EnvironmentFile=-/etc/default/agent-voice
+ExecStart=/opt/agent_voice/target/release/agent_voice --config /opt/agent_voice/config/agent_voice.yaml
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
