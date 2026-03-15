@@ -102,6 +102,16 @@ impl AppConfig {
             "OPENAI_TRANSCRIPTION_API_URL",
             &mut self.openai.transcription_api_url,
         );
+        apply_u64(
+            env,
+            "OPENAI_HTTP_CONNECT_TIMEOUT_MS",
+            &mut self.openai.http_connect_timeout_ms,
+        );
+        apply_u64(
+            env,
+            "OPENAI_HTTP_TIMEOUT_MS",
+            &mut self.openai.http_timeout_ms,
+        );
         apply_string(env, "OPENAI_TTS_MODEL", &mut self.openai.tts_model);
         apply_string(env, "OPENAI_TTS_VOICE", &mut self.openai.tts_voice);
         apply_optional_string(
@@ -170,6 +180,16 @@ impl AppConfig {
             env,
             "POST_TTS_INPUT_SUPPRESSION_MS",
             &mut self.behavior.post_tts_input_suppression_ms,
+        );
+        apply_u64(
+            env,
+            "CALL_IDLE_PROMPT_AFTER_MS",
+            &mut self.behavior.idle_prompt_after_ms,
+        );
+        apply_string(
+            env,
+            "CALL_IDLE_PROMPT_TEXT",
+            &mut self.behavior.idle_prompt_text,
         );
         apply_u16(env, "CALL_VAD_THRESHOLD", &mut self.behavior.vad_threshold);
         apply_bool(env, "AUTO_END_CALLS", &mut self.behavior.auto_end_calls);
@@ -353,6 +373,10 @@ pub struct OpenAiConfig {
     pub transcription_model: String,
     #[serde(default = "default_transcription_api_url")]
     pub transcription_api_url: String,
+    #[serde(default = "default_openai_http_connect_timeout_ms")]
+    pub http_connect_timeout_ms: u64,
+    #[serde(default = "default_openai_http_timeout_ms")]
+    pub http_timeout_ms: u64,
     #[serde(default = "default_tts_model")]
     pub tts_model: String,
     #[serde(default = "default_tts_voice")]
@@ -388,6 +412,8 @@ impl Default for OpenAiConfig {
             audio_api_url: default_audio_api_url(),
             transcription_model: default_transcription_model(),
             transcription_api_url: default_transcription_api_url(),
+            http_connect_timeout_ms: default_openai_http_connect_timeout_ms(),
+            http_timeout_ms: default_openai_http_timeout_ms(),
             tts_model: default_tts_model(),
             tts_voice: default_tts_voice(),
             tts_instructions: default_tts_instructions(),
@@ -465,6 +491,10 @@ pub struct BehaviorConfig {
     pub min_utterance_ms: u64,
     #[serde(default = "default_post_tts_input_suppression_ms")]
     pub post_tts_input_suppression_ms: u64,
+    #[serde(default = "default_idle_prompt_after_ms")]
+    pub idle_prompt_after_ms: u64,
+    #[serde(default = "default_idle_prompt_text")]
+    pub idle_prompt_text: String,
     #[serde(default = "default_vad_threshold")]
     pub vad_threshold: u16,
     #[serde(default = "default_auto_end_calls")]
@@ -488,6 +518,8 @@ impl Default for BehaviorConfig {
             turn_silence_ms: default_turn_silence_ms(),
             min_utterance_ms: default_min_utterance_ms(),
             post_tts_input_suppression_ms: default_post_tts_input_suppression_ms(),
+            idle_prompt_after_ms: default_idle_prompt_after_ms(),
+            idle_prompt_text: default_idle_prompt_text(),
             vad_threshold: default_vad_threshold(),
             auto_end_calls: default_auto_end_calls(),
             end_call_buffer_ms: default_end_call_buffer_ms(),
@@ -553,6 +585,14 @@ fn default_audio_api_url() -> String {
 
 fn default_transcription_api_url() -> String {
     "https://api.openai.com/v1/audio/transcriptions".to_string()
+}
+
+const fn default_openai_http_connect_timeout_ms() -> u64 {
+    5_000
+}
+
+const fn default_openai_http_timeout_ms() -> u64 {
+    30_000
 }
 
 fn default_transcription_model() -> String {
@@ -655,6 +695,14 @@ const fn default_min_utterance_ms() -> u64 {
 
 const fn default_post_tts_input_suppression_ms() -> u64 {
     1200
+}
+
+const fn default_idle_prompt_after_ms() -> u64 {
+    20_000
+}
+
+fn default_idle_prompt_text() -> String {
+    "Are you still there?".to_string()
 }
 
 const fn default_vad_threshold() -> u16 {
@@ -824,6 +872,11 @@ mod tests {
                 "OPENAI_RESPONSE_MODEL".to_string(),
                 "gpt-4o-mini".to_string(),
             ),
+            (
+                "OPENAI_HTTP_CONNECT_TIMEOUT_MS".to_string(),
+                "4000".to_string(),
+            ),
+            ("OPENAI_HTTP_TIMEOUT_MS".to_string(), "25000".to_string()),
             ("AGENT_API_LISTEN".to_string(), "0.0.0.0:8089".to_string()),
             ("SIP_PREFERRED_CODECS".to_string(), "PCMU,PCMA".to_string()),
             ("AUTO_ANSWER_INCOMING".to_string(), "false".to_string()),
@@ -843,6 +896,11 @@ mod tests {
             (
                 "POST_TTS_INPUT_SUPPRESSION_MS".to_string(),
                 "900".to_string(),
+            ),
+            ("CALL_IDLE_PROMPT_AFTER_MS".to_string(), "15000".to_string()),
+            (
+                "CALL_IDLE_PROMPT_TEXT".to_string(),
+                "Still there?".to_string(),
             ),
             ("CALL_VAD_THRESHOLD".to_string(), "600".to_string()),
             ("AUTO_END_CALLS".to_string(), "false".to_string()),
@@ -881,6 +939,8 @@ mod tests {
         assert_eq!(config.sip.host, "sip.example.com");
         assert_eq!(config.openai.api_key(), "sk-test");
         assert_eq!(config.openai.response_model, "gpt-4o-mini");
+        assert_eq!(config.openai.http_connect_timeout_ms, 4000);
+        assert_eq!(config.openai.http_timeout_ms, 25000);
         assert_eq!(config.agent_api.listen, "0.0.0.0:8089");
         assert_eq!(config.sip.preferred_codecs, vec!["PCMU", "PCMA"]);
         assert!(!config.behavior.auto_answer_incoming);
@@ -893,6 +953,8 @@ mod tests {
         assert_eq!(config.behavior.turn_silence_ms, 1500);
         assert_eq!(config.behavior.min_utterance_ms, 500);
         assert_eq!(config.behavior.post_tts_input_suppression_ms, 900);
+        assert_eq!(config.behavior.idle_prompt_after_ms, 15000);
+        assert_eq!(config.behavior.idle_prompt_text, "Still there?");
         assert_eq!(config.behavior.vad_threshold, 600);
         assert!(!config.behavior.auto_end_calls);
         assert_eq!(config.behavior.end_call_buffer_ms, 1200);
