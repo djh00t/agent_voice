@@ -511,6 +511,7 @@ struct ManagedCall {
     end_requested: AtomicBool,
     input_suppressed_until: RwLock<Option<Instant>>,
     pending_email_confirmation: RwLock<Option<String>>,
+    last_reply_response_id: RwLock<Option<String>>,
     turn_stats: RwLock<TurnStats>,
     api_call_entries: RwLock<Vec<ApiCallLogEntry>>,
     call_accounting: RwLock<CallAccountingSummary>,
@@ -552,6 +553,7 @@ impl ManagedCall {
             end_requested: AtomicBool::new(false),
             input_suppressed_until: RwLock::new(None),
             pending_email_confirmation: RwLock::new(None),
+            last_reply_response_id: RwLock::new(None),
             turn_stats: RwLock::new(TurnStats::default()),
             api_call_entries: RwLock::new(Vec::new()),
             call_accounting: RwLock::new(CallAccountingSummary::default()),
@@ -678,6 +680,14 @@ impl ManagedCall {
 
     fn set_pending_email_confirmation(&self, email: Option<String>) {
         *self.pending_email_confirmation.write() = email;
+    }
+
+    fn last_reply_response_id(&self) -> Option<String> {
+        self.last_reply_response_id.read().clone()
+    }
+
+    fn set_last_reply_response_id(&self, response_id: Option<String>) {
+        *self.last_reply_response_id.write() = response_id;
     }
 
     fn call_totals_log_entry(&self, ended_reason: impl ToString) -> CallTotalsLogEntry {
@@ -909,6 +919,7 @@ async fn process_detected_utterance(
         "caller utterance transcribed"
     );
     record.record_caller_text(caller_text.to_string());
+    let transcript_history = record.transcript_history();
 
     reconcile_pending_email_confirmation(&phone_book, &record, caller_text)?;
 
@@ -919,12 +930,10 @@ async fn process_detected_utterance(
 
     let extraction_started = Instant::now();
     if let Some(phone_book_key) = record.phone_book_key.as_deref()
+        && should_extract_caller_update(&transcript_history, &record, caller_text)
         && let Ok(update) = openai
             .extract_caller_update(
-                &windowed_transcript(
-                    &record.transcript_history(),
-                    behavior.context_window_events * 2,
-                ),
+                &windowed_transcript(&transcript_history, 4),
                 caller_profile.as_ref(),
             )
             .await
@@ -987,15 +996,15 @@ async fn process_detected_utterance(
 
     info!(
         call_id = %record.call.call_id(),
-        transcript_events = record.transcript_history().len(),
+        transcript_events = transcript_history.len(),
         context_window_events = behavior.context_window_events,
         "sending transcript history to LLM"
     );
-    let context_history =
-        windowed_transcript(&record.transcript_history(), behavior.context_window_events);
+    let context_history = windowed_transcript(&transcript_history, behavior.context_window_events);
+    let previous_response_id = record.last_reply_response_id();
     let llm_started = Instant::now();
     let response = openai
-        .generate_response_with_context(&context_history, &context)
+        .generate_response_with_context(&context_history, &context, previous_response_id.as_deref())
         .await?;
     let llm_ms = llm_started.elapsed().as_millis();
     let llm_entry = record_api_call(
@@ -1017,11 +1026,14 @@ async fn process_detected_utterance(
         info!(call_id = %record.call.call_id(), "LLM returned empty assistant response");
         return Ok(());
     }
+    record.set_last_reply_response_id(response.response_id.clone());
 
     info!(
         call_id = %record.call.call_id(),
         response_text,
         llm_ms,
+        chained_response = previous_response_id.is_some(),
+        response_id = ?response.response_id,
         "assistant response generated"
     );
     info!(
@@ -1384,6 +1396,85 @@ fn sanitize_notes(notes: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn should_extract_caller_update(
+    transcript_history: &[TranscriptEvent],
+    record: &ManagedCall,
+    caller_text: &str,
+) -> bool {
+    if record.pending_email_confirmation().is_some() {
+        return true;
+    }
+
+    if caller_text_indicates_profile_update(caller_text) {
+        return true;
+    }
+
+    transcript_history
+        .iter()
+        .rev()
+        .find(|event| event.role == "assistant" && event.kind == "assistant.tts")
+        .map(|event| assistant_prompt_requests_profile_field(&event.text))
+        .unwrap_or(false)
+}
+
+fn caller_text_indicates_profile_update(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    normalized.contains('@')
+        || normalized.contains("email")
+        || normalized.contains("phone book")
+        || normalized.contains("address book")
+        || normalized.contains("my record")
+        || normalized.contains("profile")
+        || normalized.contains("preferences")
+        || normalized.contains("first name")
+        || normalized.contains("last name")
+        || normalized.contains("surname")
+        || normalized.contains("company")
+        || normalized.contains("work at")
+        || normalized.contains("work for")
+        || normalized.contains("calling from")
+        || normalized.contains("i'm from")
+        || normalized.contains("i am from")
+        || normalized.contains("live in")
+        || normalized.contains("based in")
+        || normalized.contains("timezone")
+        || normalized.contains("language")
+        || normalized.contains("prefer ")
+        || normalized.contains("spelt ")
+        || normalized.contains("spell ")
+        || normalized.contains("spelled ")
+        || normalized.contains("correct")
+}
+
+fn assistant_prompt_requests_profile_field(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    normalized.contains("what is it")
+        || normalized.contains("what's your")
+        || normalized.contains("what is your")
+        || normalized.contains("who should i say is calling")
+        || normalized.contains("spell it")
+        || normalized.contains("spell that")
+        || normalized.contains("confirm")
+        || normalized.contains("email")
+        || normalized.contains("first name")
+        || normalized.contains("last name")
+        || normalized.contains("surname")
+        || normalized.contains("company")
+        || normalized.contains("where are you calling from")
+        || normalized.contains("which city")
+        || normalized.contains("what city")
+        || normalized.contains("what fields")
+        || normalized.contains("fields are available")
+}
+
 fn reconcile_pending_email_confirmation(
     phone_book: &PhoneBookStore,
     record: &ManagedCall,
@@ -1599,5 +1690,26 @@ mod tests {
             sanitized.pending_email_confirmation.as_deref(),
             Some("david@example.com")
         );
+    }
+
+    #[test]
+    fn caller_text_indicates_profile_update_detects_contact_fields() {
+        assert!(caller_text_indicates_profile_update("My email is david@example.com"));
+        assert!(caller_text_indicates_profile_update("My last name is Hooton"));
+        assert!(caller_text_indicates_profile_update("I work at Example Corp"));
+        assert!(!caller_text_indicates_profile_update("Can you tell me a joke?"));
+    }
+
+    #[test]
+    fn assistant_prompt_requests_profile_field_detects_follow_up_prompts() {
+        assert!(assistant_prompt_requests_profile_field(
+            "I don't have your last name yet. What is it?"
+        ));
+        assert!(assistant_prompt_requests_profile_field(
+            "Could you spell that email address for me?"
+        ));
+        assert!(!assistant_prompt_requests_profile_field(
+            "Anything else you need help with tonight?"
+        ));
     }
 }
