@@ -1,0 +1,63 @@
+sip:
+  username: "1001"
+  password: "replace-me"
+  host: "sip.example.com"
+  port: 5060
+  transport: "udp"
+  local_ip: null
+  rtp_port_min: 10000
+  rtp_port_max: 20000
+  register_expiry_secs: 300
+  register_retry_secs: 2
+  register_max_retry: 5
+  nat_keepalive_secs: 25
+  stun_server: null
+  accept_incoming_calls: true
+  preferred_codecs:
+    - "PCMU"
+    - "PCMA"
+
+openai:
+  api_key: null
+  realtime_url: "wss://api.openai.com/v1/realtime"
+  audio_api_url: "https://api.openai.com/v1/audio/speech"
+  transcription_model: "gpt-4o-transcribe"
+  transcription_api_url: "https://api.openai.com/v1/audio/transcriptions"
+  tts_model: "gpt-4o-mini-tts"
+  tts_voice: "alloy"
+  tts_instructions: "Speak in a cheerful, upbeat, warm, and helpful tone with a friendly Australian accent. Sound engaged and natural, not flat, stiff, or monotone."
+  responses_api_url: "https://api.openai.com/v1/responses"
+  response_model: "gpt-4o-mini"
+  transcription_prompt: null
+  transcription_language: null
+  tts_format: "wav"
+  response_instructions: "You are a helpful voice agent on a phone call. Keep replies brief, natural, and conversational."
+
+agent_api:
+  listen: "127.0.0.1:8089"
+
+accounting:
+  model_catalog_path: "./accounting/models.json"
+  api_calls_csv_path: "./accounting/api_calls.csv"
+  call_totals_csv_path: "./accounting/call_totals.csv"
+  pricing_page_url: "https://developers.openai.com/api/docs/pricing"
+  refresh_pricing_on_startup: true
+
+behavior:
+  auto_answer_incoming: true
+  incoming_answer_delay_ms: 2000
+  incoming_greeting_text: "Welcome"
+  transcript_dir: "./data/transcripts"
+  phone_book_path: "./data/phone_book.json"
+  assistant_name: "Steve"
+  default_timezone: "UTC"
+  turn_silence_ms: 1200
+  min_utterance_ms: 400
+  post_tts_input_suppression_ms: 1200
+  vad_threshold: 500
+  auto_end_calls: true
+  end_call_buffer_ms: 1500
+  context_window_events: 8
+
+logging:
+  level: "info,agent_voice=debug"
