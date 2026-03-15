@@ -55,6 +55,7 @@ pub struct ResponseResult {
     pub text: String,
     pub end_call: bool,
     pub usage: TokenUsage,
+    pub response_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +232,7 @@ impl OpenAiClients {
                     missing_fields: Vec::new(),
                     pending_email_confirmation: None,
                 },
+                None,
             )
             .await?
             .text)
@@ -241,24 +243,9 @@ impl OpenAiClients {
         &self,
         transcript: &[TranscriptEvent],
         context: &ConversationContext,
+        previous_response_id: Option<&str>,
     ) -> Result<ResponseResult> {
-        let input = transcript
-            .iter()
-            .filter(|event| {
-                event.kind == "assistant.tts" || event.kind == "caller.transcript.completed"
-            })
-            .map(|event| {
-                let role = if event.role == "caller" {
-                    "user"
-                } else {
-                    "assistant"
-                };
-                json!({
-                    "role": role,
-                    "content": event.text
-                })
-            })
-            .collect::<Vec<_>>();
+        let input = response_input(transcript, previous_response_id);
 
         let mut body = json!({
             "model": self.config.response_model,
@@ -288,9 +275,14 @@ impl OpenAiClients {
             self.config.response_instructions.as_deref(),
             context,
         ));
+        if let Some(previous_response_id) = previous_response_id {
+            body["previous_response_id"] = json!(previous_response_id);
+        }
 
         debug!(
             endpoint = %self.config.responses_api_url,
+            previous_response_id = ?previous_response_id,
+            input_items = body["input"].as_array().map(|items| items.len()).unwrap_or(0),
             request_body = %body,
             "sending OpenAI responses request"
         );
@@ -325,6 +317,7 @@ impl OpenAiClients {
             text: plan.say,
             end_call: plan.end_call,
             usage: extract_usage(&payload),
+            response_id: extract_response_id(&payload),
         })
     }
 
@@ -637,6 +630,45 @@ fn extract_response_text(payload: &serde_json::Value) -> Result<String> {
     Err(anyhow!(
         "agent response payload did not contain output text"
     ))
+}
+
+fn extract_response_id(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("id")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn response_input(
+    transcript: &[TranscriptEvent],
+    previous_response_id: Option<&str>,
+) -> Vec<serde_json::Value> {
+    if previous_response_id.is_some()
+        && let Some(latest_caller) = transcript.iter().rev().find(|event| {
+            event.role == "caller" && event.kind == "caller.transcript.completed"
+        })
+    {
+        return vec![json!({
+            "role": "user",
+            "content": latest_caller.text
+        })];
+    }
+
+    transcript
+        .iter()
+        .filter(|event| event.kind == "assistant.tts" || event.kind == "caller.transcript.completed")
+        .map(|event| {
+            let role = if event.role == "caller" {
+                "user"
+            } else {
+                "assistant"
+            };
+            json!({
+                "role": role,
+                "content": event.text
+            })
+        })
+        .collect::<Vec<_>>()
 }
 
 fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
@@ -1041,6 +1073,39 @@ mod tests {
         let plan = extract_turn_plan(&payload).expect("turn plan");
         assert_eq!(plan.say, "Okay, see you later.");
         assert!(plan.end_call);
+    }
+
+    #[test]
+    fn response_input_uses_latest_caller_turn_when_chained() {
+        let transcript = vec![
+            TranscriptEvent {
+                role: "assistant".to_string(),
+                kind: "assistant.tts".to_string(),
+                text: "How can I help?".to_string(),
+                at: "2026-03-16T00:00:00Z".to_string(),
+            },
+            TranscriptEvent {
+                role: "caller".to_string(),
+                kind: "caller.transcript.completed".to_string(),
+                text: "Update my email.".to_string(),
+                at: "2026-03-16T00:00:01Z".to_string(),
+            },
+        ];
+
+        let input = response_input(&transcript, Some("resp_123"));
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Update my email.");
+    }
+
+    #[test]
+    fn extract_response_id_reads_top_level_id() {
+        let payload = json!({
+            "id": "resp_123",
+            "output_text": "{\"say\":\"Hello\",\"end_call\":false}"
+        });
+
+        assert_eq!(extract_response_id(&payload).as_deref(), Some("resp_123"));
     }
 
     #[test]
