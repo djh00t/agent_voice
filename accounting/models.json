@@ -1,0 +1,38 @@
+{
+  "defaults": {
+    "estimated_chars_per_input_token": 4.0,
+    "estimated_input_audio_tokens_per_second": 16.66666667,
+    "estimated_output_audio_tokens_per_second": 20.83333333
+  },
+  "models": [
+    {
+      "name": "gpt-4o-mini",
+      "service": "responses",
+      "input_text_usd_per_million_tokens": 0.15,
+      "cached_input_text_usd_per_million_tokens": 0.075,
+      "output_text_usd_per_million_tokens": 0.6,
+      "input_audio_usd_per_million_tokens": 0.0,
+      "output_audio_usd_per_million_tokens": 0.0
+    },
+    {
+      "name": "gpt-4o-transcribe",
+      "service": "transcription",
+      "input_text_usd_per_million_tokens": 2.4,
+      "cached_input_text_usd_per_million_tokens": 0.0,
+      "output_text_usd_per_million_tokens": 9.6,
+      "input_audio_usd_per_million_tokens": 6.0,
+      "output_audio_usd_per_million_tokens": 0.0,
+      "estimated_input_audio_tokens_per_second": 16.66666667
+    },
+    {
+      "name": "gpt-4o-mini-tts",
+      "service": "tts",
+      "input_text_usd_per_million_tokens": 0.6,
+      "cached_input_text_usd_per_million_tokens": 0.0,
+      "output_text_usd_per_million_tokens": 0.0,
+      "input_audio_usd_per_million_tokens": 0.0,
+      "output_audio_usd_per_million_tokens": 12.0,
+      "estimated_output_audio_tokens_per_second": 20.83333333
+    }
+  ]
+}
