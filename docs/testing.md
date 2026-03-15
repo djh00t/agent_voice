@@ -15,6 +15,7 @@ docker compose config
 
 1. Copy `.env.example` to `.env`.
 2. Fill in the SIP and OpenAI values.
+   Leave `AGENT_VOICE_CONFIG=/app/config/agent_voice.yaml` so the mounted YAML baseline is used inside the container.
    Set `INCOMING_ANSWER_DELAY_MS=2000` if you want a two-second pause before answering inbound calls.
    Set `INCOMING_GREETING_TEXT=Welcome` to speak a greeting after answer.
    Set `OPENAI_RESPONSE_INSTRUCTIONS` if you want to change the agent persona.
@@ -24,6 +25,7 @@ docker compose config
 3. Build and start:
 
 ```bash
+cargo build --release
 docker compose build
 docker compose up -d
 docker compose logs -f
@@ -43,8 +45,12 @@ curl -sS http://127.0.0.1:8089/v1/status | jq
    Watch for `recorded OpenAI API accounting entry` lines to confirm token counts and `cost_usd` are being logged for each API call.
 8. Hang up and check `./data/transcripts` for the saved caller and assistant transcript.
 9. Check `./data/phone_book.json` to confirm caller details are being remembered by caller ID. Editable fields are `first_name`, `last_name`, `email`, `company`, `timezone`, `preferred_language`, and `notes`.
+   Confirm that the seeded `*` and `__no_caller_id__` policy entries exist and default to `disabled: true`.
+   Confirm that a caller with an exact record and `disabled: false` is accepted.
+   Confirm that an exact record with `disabled: true` is rejected before answer.
+   Confirm that an unknown caller is rejected while `*` remains disabled.
 10. Email should not be written immediately. The agent should read it back and get a confirmation first; only then should it appear in the phone book.
-10. Check `./accounting/api_calls.csv` and `./accounting/call_totals.csv` for per-request and per-call token/cost accounting.
+11. Check `./accounting/api_calls.csv` and `./accounting/call_totals.csv` for per-request and per-call token/cost accounting.
 
 ## Remote build
 
