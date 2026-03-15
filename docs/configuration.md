@@ -74,3 +74,33 @@ Validation rules:
 - `timezone` must come from the caller's own explicit location.
 - `preferred_language` must come from an explicit caller preference.
 - `notes` are low-priority caller-specific memory, not the main conversational context.
+
+## Inbound access control
+
+Inbound caller-ID control is enforced through the phone book JSON.
+
+- Exact caller records are allowed by default unless that record has `disabled: true`.
+- The wildcard record `*` controls callers that do present caller ID but do not have an exact record.
+- The special record `__no_caller_id__` controls callers that do not present caller ID.
+- Both policy records are auto-seeded as `disabled: true`, so the default posture is deny-all for unknown caller IDs and deny-all for missing caller ID.
+
+Example policy entries:
+
+```json
+{
+  "callers": {
+    "*": {
+      "disabled": true,
+      "system_entry": true
+    },
+    "__no_caller_id__": {
+      "disabled": true,
+      "system_entry": true
+    },
+    "61415850000": {
+      "disabled": false,
+      "first_name": "David"
+    }
+  }
+}
+```
