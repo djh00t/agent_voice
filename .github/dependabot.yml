@@ -11,6 +11,6 @@ updates:
 
   # Node.js (npm)
   - package-ecosystem: "npm"
-    directory: "/"
+    directory: "/website/"
     schedule:
       interval: "weekly"
