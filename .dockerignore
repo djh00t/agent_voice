@@ -1,0 +1,4 @@
+target
+.git
+.env
+config/agent_voice.yaml
