@@ -12,6 +12,7 @@ It registers a SIP endpoint with `xphone`, exposes a localhost HTTP API for agen
 - Agent replies via OpenAI `POST /v1/responses`
 - Outbound speech injection via OpenAI `POST /v1/audio/speech`
 - Persistent JSON phone book keyed by caller ID
+- Deny-by-default inbound caller-ID access control via the phone book
 - Local control API for agents on `127.0.0.1`
 - Unit-tested audio conversion and protocol event parsing
 
@@ -138,10 +139,13 @@ make docker-logs
 
 The container runs from environment variables by default. If you prefer a mounted YAML file, add a bind mount and set `AGENT_VOICE_CONFIG=/app/config/agent_voice.yaml`.
 The Makefile-backed Compose targets automatically use `.env` when present and fall back to `.env.example` for build and config rendering.
+`make docker-build` first compiles `target/release/agent_voice` on the host and then packages that binary into the runtime image, so the Docker build does not need cargo registry access.
+The bundled Compose file sets `AGENT_VOICE_CONFIG=/app/config/agent_voice.yaml` so the mounted YAML baseline is always readable inside the container, but environment variables still override that file on startup.
 Compose defaults the container user to `0:0` so it can refresh the mounted pricing catalog and append accounting CSV rows on bind-mounted host directories. Override `AGENT_VOICE_UID` and `AGENT_VOICE_GID` if you want a different runtime user.
 Inbound auto-answer delay is controlled with `INCOMING_ANSWER_DELAY_MS`. Set it to `2000` for a two-second delay before answering.
 Inbound greeting text is controlled with `INCOMING_GREETING_TEXT`. Caller turn detection is tuned with `CALL_TURN_SILENCE_MS`, `CALL_MIN_UTTERANCE_MS`, and `CALL_VAD_THRESHOLD`.
 The assistant identity is controlled by `ASSISTANT_NAME`. The JSON phone book path is controlled by `PHONE_BOOK_PATH`.
+Inbound access control is enforced from `PHONE_BOOK_PATH`. Exact caller records are allowed unless `disabled: true`. Unknown caller IDs fall back to the `*` policy record, and callers without caller ID fall back to `__no_caller_id__`. Both policy entries are seeded as `disabled: true` by default, so inbound access is deny-by-default until you explicitly allow callers.
 Conversation replay is bounded by `CALL_CONTEXT_WINDOW_EVENTS` so per-turn LLM latency stays flatter as calls get longer.
 At `info` level, each detected caller turn logs `gap_since_previous_turn_ms`, `stt_ms`, `extraction_ms`, `llm_ms`, `tts_ms`, `total_turn_ms`, and running averages so you can see where time is going.
 Each OpenAI call also logs token counts and `cost_usd`, while `GET /v1/status` and `GET /v1/calls/{call_id}` expose the running per-call totals. Detailed rows land in the mounted CSV files under `./accounting`.
