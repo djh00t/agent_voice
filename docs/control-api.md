@@ -29,6 +29,18 @@ curl -sS -X POST http://127.0.0.1:8089/v1/calls/<call_id>/speak \
   -d '{"text":"Testing the OpenAI TTS bridge."}'
 ```
 
+## Status payload notes
+
+`GET /v1/status` includes the active speech backends so you can confirm whether the runtime is using OpenAI or local sherpa-onnx for STT and TTS.
+
+Relevant top-level fields:
+
+- `phone_state`
+- `stt_backend`
+- `tts_backend`
+- `tts_model`
+- `calls`
+
 ## Transcript example
 
 ```bash
