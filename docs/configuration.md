@@ -30,6 +30,31 @@ That makes the Docker and Compose workflow environment-first while still allowin
 - `OPENAI_TTS_INSTRUCTIONS`
 - `OPENAI_RESPONSE_INSTRUCTIONS`
 
+### Speech backends
+
+- `SPEECH_STT_PROVIDER`
+- `SPEECH_TTS_PROVIDER`
+- `SHERPA_ONNX_PYTHON_BIN`
+- `SHERPA_ONNX_BRIDGE_SCRIPT`
+- `SHERPA_ONNX_PROVIDER`
+- `SHERPA_ONNX_NUM_THREADS`
+- `SHERPA_ONNX_DEBUG`
+- `SHERPA_ONNX_STT_MODEL_FAMILY`
+- `SHERPA_ONNX_STT_MOONSHINE_PREPROCESSOR`
+- `SHERPA_ONNX_STT_MOONSHINE_ENCODER`
+- `SHERPA_ONNX_STT_MOONSHINE_UNCACHED_DECODER`
+- `SHERPA_ONNX_STT_MOONSHINE_CACHED_DECODER`
+- `SHERPA_ONNX_STT_MOONSHINE_DECODER`
+- `SHERPA_ONNX_STT_MOONSHINE_TOKENS`
+- `SHERPA_ONNX_TTS_MODEL_FAMILY`
+- `SHERPA_ONNX_TTS_SPEED`
+- `SHERPA_ONNX_TTS_SPEAKER_ID`
+- `SHERPA_ONNX_TTS_KOKORO_MODEL`
+- `SHERPA_ONNX_TTS_KOKORO_VOICES`
+- `SHERPA_ONNX_TTS_KOKORO_TOKENS`
+- `SHERPA_ONNX_TTS_KOKORO_DATA_DIR`
+- `SHERPA_ONNX_TTS_KOKORO_LANG`
+
 ### Call behavior
 
 - `INCOMING_ANSWER_DELAY_MS`
@@ -53,6 +78,19 @@ That makes the Docker and Compose workflow environment-first while still allowin
 - `ACCOUNTING_CALL_TOTALS_CSV_PATH`
 - `ACCOUNTING_PRICING_PAGE_URL`
 - `ACCOUNTING_REFRESH_PRICING_ON_STARTUP`
+
+## Local sherpa-onnx speech
+
+When `SPEECH_STT_PROVIDER=sherpa_onnx`, caller audio is transcribed locally with the repo-managed uv environment and the configured Moonshine model files.
+
+When `SPEECH_TTS_PROVIDER=sherpa_onnx`, assistant speech is synthesized locally with the configured sherpa-onnx TTS model files. The current implementation supports Kokoro for local TTS and uses `SHERPA_ONNX_TTS_SPEAKER_ID` to select a built-in voice.
+
+The Compose stack mounts `./models` at `/app/models`, so the default local model paths are expected to exist under:
+
+- `/app/models/stt/moonshine`
+- `/app/models/tts/kokoro`
+
+The repo-managed Python environment is expected at `./.venv` on the host and `/app/.venv` in Docker. Use `make uv-sync` to create it.
 
 ## Phone-book rules
 
