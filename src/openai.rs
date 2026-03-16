@@ -119,14 +119,38 @@ impl OpenAiClients {
             body["instructions"] = json!(instructions);
         }
 
+        // Validate the configured audio API URL before using it to avoid SSRF.
+        let tts_url: reqwest::Url = self
+            .config
+            .audio_api_url
+            .parse()
+            .context("invalid TTS audio_api_url")?;
+
+        if tts_url.scheme() != "https" {
+            return Err(anyhow!("invalid TTS endpoint scheme: {}", tts_url.scheme()));
+        }
+
+        // Restrict TTS requests to a known set of allowed hosts.
+        let allowed_hosts = [
+            "api.openai.com",
+            "api.groq.com",
+            "api.anthropic.com",
+        ];
+        let host = tts_url
+            .host_str()
+            .ok_or_else(|| anyhow!("TTS endpoint is missing host"))?;
+        if !allowed_hosts.contains(&host) {
+            return Err(anyhow!("untrusted TTS endpoint host: {}", host));
+        }
+
         debug!(
-            endpoint = %self.config.audio_api_url,
+            endpoint = %tts_url,
             request_body = %body,
             "sending OpenAI TTS request"
         );
         let response = self
             .client
-            .post(&self.config.audio_api_url)
+            .post(tts_url)
             .bearer_auth(self.config.api_key())
             .json(&body)
             .send()
