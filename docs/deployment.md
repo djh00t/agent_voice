@@ -6,6 +6,7 @@ Linux host networking is the simplest way to run SIP and RTP in Docker without l
 
 ```bash
 cp .env.example .env
+make uv-sync
 docker compose build
 docker compose up -d
 docker compose logs -f
@@ -16,8 +17,9 @@ The Compose file mounts:
 - `./config`
 - `./accounting`
 - `./data`
+- `./models`
 
-That keeps configuration, the pricing catalog, accounting CSVs, transcripts, and the phone book on the host.
+That keeps configuration, the pricing catalog, accounting CSVs, transcripts, the phone book, and any local sherpa-onnx model assets on the host.
 
 ## systemd
 
