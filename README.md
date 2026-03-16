@@ -127,6 +127,7 @@ The current local implementation supports:
 - Kokoro for offline TTS
 - persistent preloaded STT and TTS worker processes
 - startup warmup so the first real greeting or caller turn does not pay the full model-load cost
+- segmented local TTS playback so speech can start before the entire reply finishes synthesizing
 - numeric `speaker_id` selection for built-in Kokoro voices
 
 True custom voice creation is not part of the current runtime path yet.
