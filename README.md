@@ -2,15 +2,16 @@
 
 `agent_voice` is a Rust SIP bridge for agent workflows.
 
-It registers a SIP endpoint with `xphone`, exposes a localhost HTTP API for agents, turns inbound RTP into caller utterances, sends those turns to OpenAI speech-to-text and responses APIs, and sends outbound OpenAI TTS audio back into the SIP/RTP stream.
+It registers a SIP endpoint with `xphone`, exposes a localhost HTTP API for agents, turns inbound RTP into caller utterances, sends those turns to the configured speech backend, calls OpenAI Responses for reasoning, and sends outbound speech back into the SIP/RTP stream.
 
 ## Features
 
 - SIP registration with UDP/TCP/TLS transport support through `xphone`
 - Incoming and outgoing call handling
-- Inbound caller turn detection with OpenAI `POST /v1/audio/transcriptions`
+- Selectable OpenAI or local sherpa-onnx speech backends for STT and TTS
+- Inbound caller turn detection with OpenAI `POST /v1/audio/transcriptions` or local Moonshine
 - Agent replies via OpenAI `POST /v1/responses`
-- Outbound speech injection via OpenAI `POST /v1/audio/speech`
+- Outbound speech injection via OpenAI `POST /v1/audio/speech` or local Kokoro
 - Persistent JSON phone book keyed by caller ID
 - Deny-by-default inbound caller-ID access control via the phone book
 - Local control API for agents on `127.0.0.1`
@@ -65,10 +66,16 @@ Important environment variables:
 
 - SIP username, password, host, and transport details
 - `OPENAI_API_KEY`
+- `SPEECH_STT_PROVIDER`
+- `SPEECH_TTS_PROVIDER`
 - `OPENAI_TRANSCRIPTION_API_URL`
 - `OPENAI_RESPONSES_API_URL`
 - `OPENAI_RESPONSE_MODEL`
 - `OPENAI_RESPONSE_INSTRUCTIONS`
+- `SHERPA_ONNX_PYTHON_BIN`
+- `SHERPA_ONNX_BRIDGE_SCRIPT`
+- `SHERPA_ONNX_STT_*`
+- `SHERPA_ONNX_TTS_*`
 - `AGENT_API_LISTEN`
 - `INCOMING_ANSWER_DELAY_MS`
 - `INCOMING_GREETING_TEXT`
@@ -91,10 +98,42 @@ The binary auto-loads `./config/agent_voice.yaml` or `/opt/agent_voice/config/ag
 The container entrypoint resolves hostname-style `SIP_HOST` values to IPv4 automatically before launch because `xphone` expects a socket-address target.
 On startup the app can refresh [accounting/models.json](/Users/djh/agent_voice_work/accounting/models.json) from the official OpenAI pricing page and then use that mounted catalog for token and cost accounting.
 
+## Local sherpa-onnx speech
+
+Local speech uses an uv-managed Python environment plus the official `sherpa-onnx` package.
+
+Bootstrap the local runtime:
+
+```bash
+make uv-sync
+make sherpa-download-models
+```
+
+Then switch `.env` or YAML to:
+
+```bash
+SPEECH_STT_PROVIDER=sherpa_onnx
+SPEECH_TTS_PROVIDER=sherpa_onnx
+```
+
+The default example paths expect:
+
+- `./models/stt/moonshine`
+- `./models/tts/kokoro`
+
+The current local implementation supports:
+
+- Moonshine for offline STT
+- Kokoro for offline TTS
+- numeric `speaker_id` selection for built-in Kokoro voices
+
+True custom voice creation is not part of the current runtime path yet.
+
 ## Local development
 
 ```bash
 cargo fmt
+make uv-sync
 cargo test
 cargo doc --no-deps
 cargo run -- --config ./config/agent_voice.yaml
@@ -132,6 +171,7 @@ Linux host networking is the simplest way to run SIP + RTP in Docker without fig
 
 ```bash
 cp .env.example .env
+make uv-sync
 make docker-build
 make docker-up
 make docker-logs
@@ -151,6 +191,7 @@ At `info` level, each detected caller turn logs `gap_since_previous_turn_ms`, `s
 Each OpenAI call also logs token counts and `cost_usd`, while `GET /v1/status` and `GET /v1/calls/{call_id}` expose the running per-call totals. Detailed rows land in the mounted CSV files under `./accounting`.
 `AUTO_END_CALLS` and `END_CALL_BUFFER_MS` are available for the call wrap-up path.
 Transcripts are written under `TRANSCRIPT_DIR`. The Compose file mounts `./config`, `./accounting`, and `./data` so config files, the model catalog, CSV accounting, transcripts, and the phone book all persist on the host.
+If you enable local sherpa-onnx speech, the Compose file also mounts `./models` at `/app/models`, and `/v1/status` reports `stt_backend` and `tts_backend` so you can confirm the active speech path.
 
 ## Deployment
 
