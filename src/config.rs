@@ -170,6 +170,21 @@ impl AppConfig {
             "SHERPA_ONNX_NUM_THREADS",
             &mut self.speech.sherpa_onnx.num_threads,
         );
+        apply_bool(
+            env,
+            "SHERPA_ONNX_WARMUP_ON_STARTUP",
+            &mut self.speech.sherpa_onnx.warmup_on_startup,
+        );
+        apply_u64(
+            env,
+            "SHERPA_ONNX_STARTUP_TIMEOUT_MS",
+            &mut self.speech.sherpa_onnx.startup_timeout_ms,
+        );
+        apply_u64(
+            env,
+            "SHERPA_ONNX_REQUEST_TIMEOUT_MS",
+            &mut self.speech.sherpa_onnx.request_timeout_ms,
+        );
         apply_bool(env, "SHERPA_ONNX_DEBUG", &mut self.speech.sherpa_onnx.debug);
         apply_string(
             env,
@@ -618,6 +633,12 @@ pub struct SherpaOnnxConfig {
     pub provider: String,
     #[serde(default = "default_sherpa_num_threads")]
     pub num_threads: u32,
+    #[serde(default = "default_sherpa_warmup_on_startup")]
+    pub warmup_on_startup: bool,
+    #[serde(default = "default_sherpa_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+    #[serde(default = "default_sherpa_request_timeout_ms")]
+    pub request_timeout_ms: u64,
     #[serde(default)]
     pub debug: bool,
     #[serde(default)]
@@ -721,6 +742,9 @@ impl Default for SherpaOnnxConfig {
             bridge_script: default_sherpa_bridge_script(),
             provider: default_sherpa_provider(),
             num_threads: default_sherpa_num_threads(),
+            warmup_on_startup: default_sherpa_warmup_on_startup(),
+            startup_timeout_ms: default_sherpa_startup_timeout_ms(),
+            request_timeout_ms: default_sherpa_request_timeout_ms(),
             debug: false,
             stt: SherpaOnnxSttConfig::default(),
             tts: SherpaOnnxTtsConfig::default(),
@@ -1094,6 +1118,18 @@ fn default_sherpa_provider() -> String {
 
 const fn default_sherpa_num_threads() -> u32 {
     2
+}
+
+const fn default_sherpa_warmup_on_startup() -> bool {
+    true
+}
+
+const fn default_sherpa_startup_timeout_ms() -> u64 {
+    120_000
+}
+
+const fn default_sherpa_request_timeout_ms() -> u64 {
+    60_000
 }
 
 fn default_sherpa_stt_model_family() -> String {
@@ -1507,6 +1543,14 @@ mod tests {
             ("SPEECH_TTS_PROVIDER".to_string(), "sherpa_onnx".to_string()),
             ("SHERPA_ONNX_TTS_SPEAKER_ID".to_string(), "3".to_string()),
             ("SHERPA_ONNX_TTS_SPEED".to_string(), "1.25".to_string()),
+            (
+                "SHERPA_ONNX_WARMUP_ON_STARTUP".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "SHERPA_ONNX_REQUEST_TIMEOUT_MS".to_string(),
+                "45000".to_string(),
+            ),
         ]);
 
         config.apply_env_overrides_from_map(&env);
@@ -1515,5 +1559,7 @@ mod tests {
         assert_eq!(config.speech.tts_provider, SpeechProvider::SherpaOnnx);
         assert_eq!(config.speech.sherpa_onnx.tts.speaker_id, 3);
         assert_eq!(config.speech.sherpa_onnx.tts.speed, 1.25);
+        assert!(!config.speech.sherpa_onnx.warmup_on_startup);
+        assert_eq!(config.speech.sherpa_onnx.request_timeout_ms, 45_000);
     }
 }
