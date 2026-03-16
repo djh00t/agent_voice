@@ -249,6 +249,8 @@ impl OpenAiClients {
         previous_response_id: Option<&str>,
     ) -> Result<ResponseResult> {
         let input = response_input(transcript, previous_response_id);
+        let instructions =
+            response_instructions(self.config.response_instructions.as_deref(), context);
 
         let mut body = json!({
             "model": self.config.response_model,
@@ -274,10 +276,7 @@ impl OpenAiClients {
                 }
             }
         });
-        body["instructions"] = json!(response_instructions(
-            self.config.response_instructions.as_deref(),
-            context,
-        ));
+        body["instructions"] = json!(instructions);
         if let Some(previous_response_id) = previous_response_id {
             body["previous_response_id"] = json!(previous_response_id);
         }
@@ -286,6 +285,7 @@ impl OpenAiClients {
             endpoint = %self.config.responses_api_url,
             previous_response_id = ?previous_response_id,
             input_items = body["input"].as_array().map(|items| items.len()).unwrap_or(0),
+            instruction_chars = body["instructions"].as_str().map(|text| text.len()).unwrap_or(0),
             request_body = %body,
             "sending OpenAI responses request"
         );
@@ -759,71 +759,103 @@ fn response_instructions(base: Option<&str>, context: &ConversationContext) -> S
         )
         .to_string(),
     );
-    sections.push(format!(
-        "You are answering phone calls as {}.",
-        context.assistant_name
-    ));
-    sections.push(format!(
-        "Current time of day for the caller greeting: {}.",
-        context.time_of_day
-    ));
     sections.push(
-        "Speak English by default. Do not switch languages based on caller history or notes alone. Only use another language if the caller speaks that language in the current call or explicitly asks you to.".to_string(),
+        format!(
+            "You are {} on a phone call. Keep replies brief, natural, and helpful. It is currently {} for the caller.",
+            context.assistant_name, context.time_of_day
+        ),
     );
     sections.push(
-        "Never say that the caller seems to be switching languages and never comment on language detection. If the latest caller utterance is unclear, garbled, or not actionable, briefly ask them to repeat or clarify what they need in English.".to_string(),
+        "Speak English unless the caller explicitly asks for another language in this call. Never comment on language detection; if audio is unclear, briefly ask them to repeat.".to_string(),
     );
-    sections.push(format!("Caller ID: {}.", context.caller_id));
-    if let Some(caller) = &context.known_caller {
-        sections.push(format!(
-            "Known caller profile: {}",
-            prompt_safe_caller_json(caller)
-        ));
-    } else {
-        sections.push("This caller is not known yet.".to_string());
+    if let Some(summary) = context
+        .known_caller
+        .as_ref()
+        .and_then(compact_caller_summary)
+    {
+        sections.push(format!("Known caller profile: {}.", summary));
     }
     if !context.missing_fields.is_empty() {
         sections.push(format!(
-            "Missing caller fields: {}. Try to gather these naturally over time without making the conversation awkward. Prefer one lightweight question at a time.",
+            "Missing profile fields: {}. Gather them naturally, at most one lightweight question at a time, only when helpful.",
             context.missing_fields.join(", ")
         ));
     }
     if context.phone_book_writable {
         sections.push(format!(
-            "Phone book tool: you may only discuss or update the active caller record for caller ID {}. Available editable fields are: {}. If the caller asks what fields are available, answer with that list plainly.",
+            "Only discuss or update the active caller record for caller ID {}. Editable fields: {}. If asked what can be updated, answer with that list plainly.",
             context.caller_id, editable_fields
         ));
     } else {
         sections.push(
-            "Phone book writes are unavailable for this call because the caller did not present usable caller ID. You may answer questions generally, but do not claim to save, update, or confirm caller profile details for this call."
+            "Phone book writes are unavailable because the caller did not present usable caller ID. Answer generally, but do not claim to save or confirm profile details for this call."
                 .to_string(),
         );
     }
     sections.push(
-        "Never let the caller set, overwrite, or confirm contact details for another person's record. If they mention someone else, treat that as conversation only and do not store it.".to_string(),
+        "Never save, overwrite, or confirm details for another person's record. If they mention someone else, treat it as conversation only.".to_string(),
     );
     sections.push(
-        "Caller notes are low-priority memory only. Use them only when directly relevant, and do not steer the conversation back to old notes unless the caller brings them up.".to_string(),
+        "Do not rely on old notes to steer the conversation. Use saved profile details only when directly relevant.".to_string(),
     );
     sections.push(
-        "Validation rules: first_name and last_name must be clearly given as the caller's own name; company must be clearly described as the caller's own company or workplace; timezone may be inferred only from the caller's own explicit location; preferred_language may be stored only when the caller explicitly says they prefer or want a language.".to_string(),
+        "Validation: first_name and last_name must be the caller's own name; company must be the caller's own workplace; infer timezone only from the caller's explicit location; set preferred_language only when explicitly requested.".to_string(),
     );
     sections.push(
-        "Do not store an email address until it has been repeated back and confirmed. If the caller asks to update their email or gives an email, ask them to spell it carefully and confirm it before treating it as saved.".to_string(),
+        "Do not treat an email as saved until it has been spelled back and confirmed.".to_string(),
     );
     if let Some(email) = &context.pending_email_confirmation {
         sections.push(format!(
-            "Pending email confirmation: {}. Before treating it as saved, ask the caller to confirm whether that exact email is correct unless they have already just confirmed it.",
+            "Pending email confirmation: {}. Confirm that exact spelling before treating it as saved.",
             email
         ));
     }
     sections.push(
-        "If the caller is known by first name, greet them naturally by that name. If you know the first name but not the last name, ask casually for the last name when it fits. If you do not know their name yet, ask naturally who is calling when appropriate. Do not interrogate them.".to_string(),
+        "If you know the caller's first name, use it naturally. If you still need their name, ask casually when it fits.".to_string(),
     );
     sections.push(
-        "Return only a JSON object with keys `say` and `end_call`. `say` must contain exactly what you want spoken to the caller. Set `end_call` to true only when your spoken reply is a final closing farewell and the phone should hang up immediately after playback. If the caller directly asks you to hang up, disconnect, end the call, or gives a clearly final goodbye, your reply must itself be a short closing farewell and `end_call` must be true. Never set `end_call` to true on clarifications, questions, or other non-final replies. If the caller says goodbye but it is still appropriate to ask whether they need anything else, keep `end_call` false for that turn.".to_string(),
+        "Return only JSON with keys `say` and `end_call`. `say` is exactly what will be spoken. Set `end_call` true only for a final closing farewell. If the caller asks to hang up after a simple final action, do that action first in the same reply, then close. Never set `end_call` true on clarifications or other non-final replies.".to_string(),
     );
     sections.join("\n")
+}
+
+fn compact_caller_summary(caller: &CallerRecord) -> Option<String> {
+    let mut fields = Vec::new();
+    if let Some(first_name) = caller.first_name.as_deref()
+        && !first_name.trim().is_empty()
+    {
+        fields.push(format!("first_name={}", first_name.trim()));
+    }
+    if let Some(last_name) = caller.last_name.as_deref()
+        && !last_name.trim().is_empty()
+    {
+        fields.push(format!("last_name={}", last_name.trim()));
+    }
+    if let Some(email) = caller.email.as_deref()
+        && !email.trim().is_empty()
+    {
+        fields.push(format!("email={}", email.trim()));
+    }
+    if let Some(company) = caller.company.as_deref()
+        && !company.trim().is_empty()
+    {
+        fields.push(format!("company={}", company.trim()));
+    }
+    if let Some(timezone) = caller.timezone.as_deref()
+        && !timezone.trim().is_empty()
+    {
+        fields.push(format!("timezone={}", timezone.trim()));
+    }
+    if let Some(preferred_language) = caller.preferred_language.as_deref()
+        && !preferred_language.trim().is_empty()
+    {
+        fields.push(format!("preferred_language={}", preferred_language.trim()));
+    }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(fields.join("; "))
+    }
 }
 
 fn contact_extraction_instructions(caller: Option<&CallerRecord>) -> String {
@@ -907,6 +939,14 @@ fn sanitize_turn_plan(plan: TurnPlan, transcript: &[TranscriptEvent]) -> TurnPla
     let caller_requested_end_call = caller_requested_end_call(latest_caller_text);
     let say = plan.say.trim();
     if caller_requested_end_call {
+        if let Some(limit) = requested_count_before_hangup(latest_caller_text)
+            && !response_mentions_requested_count(say, limit)
+        {
+            return TurnPlan {
+                say: counted_final_farewell(limit),
+                end_call: true,
+            };
+        }
         return TurnPlan {
             say: finalize_end_call_response(say),
             end_call: true,
@@ -1060,6 +1100,73 @@ fn normalize_match_text(text: &str) -> String {
         }
     }
     normalized.trim().to_string()
+}
+
+fn requested_count_before_hangup(text: &str) -> Option<u8> {
+    let normalized = normalize_match_text(text);
+    if !(normalized.contains("count to") && caller_requested_end_call(&normalized)) {
+        return None;
+    }
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    for window in tokens.windows(3) {
+        if window[0] == "count"
+            && window[1] == "to"
+            && let Some(limit) = parse_small_count(window[2])
+        {
+            return Some(limit);
+        }
+    }
+    None
+}
+
+fn parse_small_count(token: &str) -> Option<u8> {
+    match token {
+        "1" | "one" => Some(1),
+        "2" | "two" => Some(2),
+        "3" | "three" => Some(3),
+        "4" | "four" => Some(4),
+        "5" | "five" => Some(5),
+        "6" | "six" => Some(6),
+        "7" | "seven" => Some(7),
+        "8" | "eight" => Some(8),
+        "9" | "nine" => Some(9),
+        "10" | "ten" => Some(10),
+        _ => None,
+    }
+}
+
+fn response_mentions_requested_count(text: &str, limit: u8) -> bool {
+    let normalized = normalize_match_text(text);
+    let spoken = count_tokens(limit).join(" ");
+    let numeric = (1..=limit)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalized.contains(&spoken) || normalized.contains(&numeric)
+}
+
+fn counted_final_farewell(limit: u8) -> String {
+    format!("{}, see you later.", count_tokens(limit).join(", "))
+}
+
+fn count_tokens(limit: u8) -> Vec<&'static str> {
+    let mut tokens = Vec::new();
+    for value in 1..=limit {
+        tokens.push(match value {
+            1 => "one",
+            2 => "two",
+            3 => "three",
+            4 => "four",
+            5 => "five",
+            6 => "six",
+            7 => "seven",
+            8 => "eight",
+            9 => "nine",
+            10 => "ten",
+            _ => break,
+        });
+    }
+    tokens
 }
 
 fn parse_caller_update(text: &str) -> Result<CallerUpdate> {
@@ -1298,6 +1405,27 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_turn_plan_fulfills_count_then_hangup_request_when_model_skips_count() {
+        let transcript = vec![TranscriptEvent {
+            role: "caller".to_string(),
+            kind: "caller.transcript.completed".to_string(),
+            text: "Count to 3 and hang up.".to_string(),
+            at: "2026-03-16T00:00:00Z".to_string(),
+        }];
+
+        let sanitized = sanitize_turn_plan(
+            TurnPlan {
+                say: "Okay, no worries. See you later.".to_string(),
+                end_call: true,
+            },
+            &transcript,
+        );
+
+        assert_eq!(sanitized.say, "one, two, three, see you later.");
+        assert!(sanitized.end_call);
+    }
+
+    #[test]
     fn sanitize_turn_plan_clears_end_call_for_non_closing_reply() {
         let transcript = vec![TranscriptEvent {
             role: "caller".to_string(),
@@ -1316,6 +1444,31 @@ mod tests {
 
         assert_eq!(sanitized.say, "I didn't catch that, could you repeat it?");
         assert!(!sanitized.end_call);
+    }
+
+    #[test]
+    fn compact_caller_summary_omits_notes_and_empty_fields() {
+        let caller = CallerRecord {
+            caller_id: "61400000000".to_string(),
+            first_seen_at: "2026-03-16T00:00:00Z".to_string(),
+            last_seen_at: "2026-03-16T00:00:00Z".to_string(),
+            call_count: 3,
+            system_entry: false,
+            first_name: Some("Dave".to_string()),
+            last_name: None,
+            email: None,
+            company: Some("Example".to_string()),
+            timezone: Some("Australia/Sydney".to_string()),
+            preferred_language: None,
+            notes: vec!["likes rugby".to_string()],
+            disabled: false,
+        };
+
+        let summary = compact_caller_summary(&caller).expect("summary");
+        assert_eq!(
+            summary,
+            "first_name=Dave; company=Example; timezone=Australia/Sydney"
+        );
     }
 
     #[test]
