@@ -1017,11 +1017,30 @@ async fn process_detected_utterance(
             usage: response.usage.clone(),
         },
     )?;
-    let response_text = response.text.trim();
-    let should_end_call = response.end_call && bridge.behavior.auto_end_calls;
+    let caller_requested_end_call = caller_requested_end_call(caller_text);
+    let caller_requested_immediate_hangup = caller_requested_immediate_hangup(caller_text);
+    let mut response_text = response.text.trim().to_string();
+    if bridge.behavior.auto_end_calls && caller_requested_end_call {
+        response_text = finalize_end_call_response(&response_text);
+    }
+    let model_requested_end_call = response.end_call && bridge.behavior.auto_end_calls;
+    let response_has_final_farewell = looks_like_final_farewell(&response_text);
+    if model_requested_end_call && !response_has_final_farewell {
+        warn!(
+            call_id = %record.call.call_id(),
+            response_text,
+            "ignoring model end_call because assistant reply is not a final closing"
+        );
+    }
+    let should_end_call = bridge.behavior.auto_end_calls
+        && (caller_requested_end_call || (model_requested_end_call && response_has_final_farewell));
     if response_text.is_empty() {
-        info!(call_id = %record.call.call_id(), "LLM returned empty assistant response");
-        return Ok(());
+        if should_end_call {
+            response_text = default_final_farewell().to_string();
+        } else {
+            info!(call_id = %record.call.call_id(), "LLM returned empty assistant response");
+            return Ok(());
+        }
     }
     record.set_last_reply_response_id(response.response_id.clone());
 
@@ -1031,6 +1050,9 @@ async fn process_detected_utterance(
         llm_ms,
         chained_response = previous_response_id.is_some(),
         response_id = ?response.response_id,
+        caller_requested_end_call,
+        model_requested_end_call,
+        should_end_call,
         "assistant response generated"
     );
     info!(
@@ -1044,7 +1066,7 @@ async fn process_detected_utterance(
         &bridge.accounting,
         &record,
         &speaker_tx,
-        response_text,
+        &response_text,
         "tts.reply",
         bridge.behavior.post_tts_input_suppression_ms,
     )
@@ -1062,11 +1084,12 @@ async fn process_detected_utterance(
         "suppressing inbound turn detection during assistant playback"
     );
     if should_end_call {
-        schedule_end_call(
-            Arc::clone(&record),
-            playback_ms,
-            bridge.behavior.end_call_buffer_ms,
-        );
+        let end_call_buffer_ms = if caller_requested_immediate_hangup {
+            bridge.behavior.end_call_buffer_ms.min(300)
+        } else {
+            bridge.behavior.end_call_buffer_ms
+        };
+        schedule_end_call(Arc::clone(&record), playback_ms, end_call_buffer_ms);
     } else {
         schedule_idle_prompt(
             bridge.speech.clone(),
@@ -1771,6 +1794,124 @@ fn caller_rejected_pending_value(text: &str) -> bool {
         || normalized == "that is wrong"
 }
 
+fn caller_requested_end_call(text: &str) -> bool {
+    let normalized = normalize_match_text(text);
+    [
+        "goodbye",
+        "good bye",
+        "bye",
+        "bye bye",
+        "see you",
+        "see ya",
+        "catch you later",
+        "talk to you later",
+        "that s all",
+        "that is all",
+        "nothing else",
+        "hang up",
+        "hanging up",
+        "hangup",
+        "disconnect",
+        "end the call",
+        "drop the call",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn caller_requested_immediate_hangup(text: &str) -> bool {
+    let normalized = normalize_match_text(text);
+    [
+        "hang up",
+        "hanging up",
+        "hangup",
+        "disconnect",
+        "end the call",
+        "drop the call",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn looks_like_final_farewell(text: &str) -> bool {
+    let normalized = normalize_match_text(text);
+    [
+        "goodbye",
+        "good bye",
+        "bye",
+        "see you",
+        "see ya",
+        "take care",
+        "have a good",
+        "have a great",
+        "talk soon",
+        "catch you later",
+        "call back",
+        "thanks for calling",
+        "no worries bye",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn finalize_end_call_response(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || looks_like_clarification_request(trimmed) {
+        return default_final_farewell().to_string();
+    }
+    if looks_like_final_farewell(trimmed) {
+        return trimmed.to_string();
+    }
+    let suffix = " See you later.";
+    if trimmed.ends_with(['.', '!', '?']) {
+        format!("{trimmed}{suffix}")
+    } else {
+        format!("{trimmed}.{suffix}")
+    }
+}
+
+fn looks_like_clarification_request(text: &str) -> bool {
+    let normalized = normalize_match_text(text);
+    [
+        "could you say that again",
+        "can you say that again",
+        "could you repeat that",
+        "can you repeat that",
+        "i didn t catch that",
+        "i did not catch that",
+        "pardon",
+        "sorry",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn default_final_farewell() -> &'static str {
+    "Okay, no worries. See you later."
+}
+
+fn normalize_match_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut last_was_space = true;
+    for ch in text.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            ' '
+        };
+        if mapped == ' ' {
+            if !last_was_space {
+                normalized.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            normalized.push(mapped);
+            last_was_space = false;
+        }
+    }
+    normalized.trim().to_string()
+}
+
 fn build_initial_greeting(
     caller: Option<&crate::phonebook::CallerRecord>,
     behavior: &BehaviorConfig,
@@ -1980,5 +2121,37 @@ mod tests {
         );
 
         assert_eq!(segments, vec!["This is a long enough response that local TTS would segment it, but OpenAI should keep it together as one request.".to_string()]);
+    }
+
+    #[test]
+    fn caller_requested_end_call_detects_farewell_and_garbled_hangup() {
+        assert!(caller_requested_end_call("Goodbye for now."));
+        assert!(caller_requested_end_call("It's re-inhanging up."));
+        assert!(caller_requested_end_call(
+            "Please count to three and hang up."
+        ));
+        assert!(!caller_requested_end_call(
+            "Can you help me update my email?"
+        ));
+    }
+
+    #[test]
+    fn finalize_end_call_response_appends_a_real_closing() {
+        assert_eq!(
+            finalize_end_call_response("One, two, three."),
+            "One, two, three. See you later."
+        );
+        assert_eq!(
+            finalize_end_call_response("I didn't catch that, could you repeat it?"),
+            default_final_farewell()
+        );
+    }
+
+    #[test]
+    fn looks_like_final_farewell_requires_an_actual_closing() {
+        assert!(looks_like_final_farewell("Okay, see you later."));
+        assert!(!looks_like_final_farewell(
+            "I didn't catch that, could you repeat it?"
+        ));
     }
 }
