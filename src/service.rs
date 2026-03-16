@@ -169,23 +169,34 @@ impl VoiceAgentService {
             .get(call_id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown call id {}", call_id))?;
-        let tts_started = Instant::now();
-        let synthesis = self.speech.speak_text(&text, voice, instructions).await?;
-        let tts_ms = tts_started.elapsed().as_millis();
-        let sample_count = synthesis.pcm.len();
-        let playback_ms = pcm_playback_ms(sample_count);
         let tx = call
             .speaker_tx
             .read()
             .clone()
             .ok_or_else(|| anyhow!("call media is not ready yet"))?;
-        call.suppress_input_for(StdDuration::from_millis(
-            playback_ms.saturating_add(self.config.behavior.post_tts_input_suppression_ms),
-        ));
-        self.record_tts_call(&call, "tts.manual", &text, &synthesis, tts_ms)?;
-        tx.send(synthesis.pcm)
-            .map_err(|_| anyhow!("paced pcm channel closed"))?;
-        call.record_assistant_text(text);
+        let summary = queue_tts_text(
+            &self.speech,
+            &self.accounting,
+            &call,
+            &tx,
+            QueuedTtsRequest {
+                text: &text,
+                operation: "tts.manual",
+                post_tts_input_suppression_ms: self.config.behavior.post_tts_input_suppression_ms,
+                voice,
+                instructions,
+            },
+        )
+        .await?;
+        info!(
+            call_id = %call.call.call_id(),
+            backend = self.speech.tts_backend_name(),
+            total_tts_ms = summary.total_tts_ms,
+            tts_first_audio_ms = summary.first_audio_ms,
+            total_playback_ms = summary.total_playback_ms,
+            segment_count = summary.segment_count,
+            "manual assistant audio queued for RTP playback"
+        );
         Ok(())
     }
 
@@ -418,47 +429,6 @@ impl VoiceAgentService {
         }
 
         Err(anyhow!("call media did not become ready for greeting"))
-    }
-
-    fn record_tts_call(
-        &self,
-        call: &ManagedCall,
-        operation: &str,
-        text: &str,
-        synthesis: &SynthesisOutcome,
-        duration_ms: u128,
-    ) -> Result<()> {
-        let usage = tts_usage_for_outcome(&self.accounting, synthesis, text);
-        let at = rfc3339_now();
-        let entry = self.accounting.record_api_call(
-            ApiCallContext {
-                at: &at,
-                call_id: &call.call.call_id(),
-                direction: &call.direction,
-                peer: &call.peer,
-                operation,
-                endpoint: &synthesis.endpoint,
-                model: &synthesis.model,
-                duration_ms,
-                usage_source: synthesis.usage_source,
-                estimated: synthesis.estimated,
-            },
-            usage,
-        )?;
-        call.record_api_call(entry.clone());
-        info!(
-            call_id = %call.call.call_id(),
-            operation,
-            backend = synthesis.backend,
-            model = %entry.model,
-            estimated = entry.estimated,
-            cost_usd = format_args!("{:.8}", entry.cost_usd),
-            input_text_tokens = entry.input_text_tokens,
-            output_audio_tokens = entry.output_audio_tokens,
-            total_call_cost_usd = format_args!("{:.8}", call.accounting_summary().total_cost_usd),
-            "recorded TTS accounting entry"
-        );
-        Ok(())
     }
 }
 
@@ -767,6 +737,7 @@ struct TurnMetrics {
     extraction_ms: u128,
     llm_ms: u128,
     tts_ms: u128,
+    tts_first_audio_ms: u128,
     total_ms: u128,
 }
 
@@ -1068,7 +1039,7 @@ async fn process_detected_utterance(
         chars = response_text.len(),
         "sending assistant text to TTS"
     );
-    let (tts_ms, tts_entry, playback_ms, idle_generation) = queue_assistant_tts(
+    let tts_summary = queue_assistant_tts(
         &bridge.speech,
         &bridge.accounting,
         &record,
@@ -1078,6 +1049,10 @@ async fn process_detected_utterance(
         bridge.behavior.post_tts_input_suppression_ms,
     )
     .await?;
+    let tts_ms = tts_summary.total_tts_ms;
+    let tts_entry = tts_summary.last_entry;
+    let playback_ms = tts_summary.total_playback_ms;
+    let idle_generation = tts_summary.idle_generation;
     let suppression_ms = playback_ms.saturating_add(bridge.behavior.post_tts_input_suppression_ms);
     info!(
         call_id = %record.call.call_id(),
@@ -1111,6 +1086,7 @@ async fn process_detected_utterance(
         extraction_ms,
         llm_ms,
         tts_ms,
+        tts_first_audio_ms: tts_summary.first_audio_ms,
         total_ms,
     };
     let summary = record.record_turn_metrics(&metrics);
@@ -1122,6 +1098,7 @@ async fn process_detected_utterance(
         extraction_ms = metrics.extraction_ms,
         llm_ms = metrics.llm_ms,
         tts_ms = metrics.tts_ms,
+        tts_first_audio_ms = metrics.tts_first_audio_ms,
         total_turn_ms = metrics.total_ms,
         avg_total_turn_ms = summary.avg_total_ms,
         avg_stt_ms = summary.avg_stt_ms,
@@ -1146,33 +1123,108 @@ async fn queue_assistant_tts(
     text: &str,
     operation: &'static str,
     post_tts_input_suppression_ms: u64,
-) -> Result<(u128, ApiCallLogEntry, u64, u64)> {
-    let tts_started = Instant::now();
-    let synthesis = speech.speak_text(text, None, None).await?;
-    let tts_ms = tts_started.elapsed().as_millis();
-    let tts_entry = record_api_call(
+) -> Result<QueuedTtsSummary> {
+    queue_tts_text(
+        speech,
         accounting,
         record,
-        LoggedApiCall {
+        speaker_tx,
+        QueuedTtsRequest {
+            text,
             operation,
-            endpoint: &synthesis.endpoint,
-            model: &synthesis.model,
-            duration_ms: tts_ms,
-            usage_source: synthesis.usage_source,
-            estimated: synthesis.estimated,
-            usage: tts_usage_for_outcome(accounting, &synthesis, text),
+            post_tts_input_suppression_ms,
+            voice: None,
+            instructions: None,
         },
-    )?;
-    let playback_ms = pcm_playback_ms(synthesis.pcm.len());
-    record.suppress_input_for(StdDuration::from_millis(
-        playback_ms.saturating_add(post_tts_input_suppression_ms),
-    ));
-    speaker_tx
-        .send(synthesis.pcm)
-        .map_err(|_| anyhow!("paced pcm channel closed"))?;
-    record.record_assistant_text(text.to_string());
+    )
+    .await
+}
+
+struct QueuedTtsSummary {
+    total_tts_ms: u128,
+    first_audio_ms: u128,
+    last_entry: ApiCallLogEntry,
+    total_playback_ms: u64,
+    idle_generation: u64,
+    segment_count: usize,
+}
+
+struct QueuedTtsRequest<'a> {
+    text: &'a str,
+    operation: &'static str,
+    post_tts_input_suppression_ms: u64,
+    voice: Option<String>,
+    instructions: Option<String>,
+}
+
+async fn queue_tts_text(
+    speech: &SpeechServices,
+    accounting: &Arc<AccountingStore>,
+    record: &Arc<ManagedCall>,
+    speaker_tx: &crossbeam_channel::Sender<Vec<i16>>,
+    request: QueuedTtsRequest<'_>,
+) -> Result<QueuedTtsSummary> {
+    let segments = split_tts_text(request.text, speech.tts_backend_name());
+    let segment_count = segments.len();
+    let mut total_tts_ms = 0_u128;
+    let mut total_playback_ms = 0_u64;
+    let mut first_audio_ms = None;
+    let mut last_entry = None;
+
+    for (index, segment) in segments.iter().enumerate() {
+        let segment_started = Instant::now();
+        let synthesis = speech
+            .speak_text(segment, request.voice.clone(), request.instructions.clone())
+            .await?;
+        let segment_tts_ms = segment_started.elapsed().as_millis();
+        total_tts_ms += segment_tts_ms;
+        if first_audio_ms.is_none() {
+            first_audio_ms = Some(total_tts_ms);
+        }
+        let entry = record_api_call(
+            accounting,
+            record,
+            LoggedApiCall {
+                operation: request.operation,
+                endpoint: &synthesis.endpoint,
+                model: &synthesis.model,
+                duration_ms: segment_tts_ms,
+                usage_source: synthesis.usage_source,
+                estimated: synthesis.estimated,
+                usage: tts_usage_for_outcome(accounting, &synthesis, segment),
+            },
+        )?;
+        let playback_ms = pcm_playback_ms(synthesis.pcm.len());
+        total_playback_ms = total_playback_ms.saturating_add(playback_ms);
+        record.suppress_input_for(StdDuration::from_millis(
+            playback_ms.saturating_add(request.post_tts_input_suppression_ms),
+        ));
+        speaker_tx
+            .send(synthesis.pcm)
+            .map_err(|_| anyhow!("paced pcm channel closed"))?;
+        info!(
+            call_id = %record.call.call_id(),
+            backend = speech.tts_backend_name(),
+            segment_index = index + 1,
+            segment_count,
+            chars = segment.len(),
+            segment_tts_ms,
+            segment_playback_ms = playback_ms,
+            "queued assistant TTS segment"
+        );
+        last_entry = Some(entry);
+    }
+
+    record.record_assistant_text(request.text.to_string());
     let idle_generation = record.note_activity();
-    Ok((tts_ms, tts_entry, playback_ms, idle_generation))
+    Ok(QueuedTtsSummary {
+        total_tts_ms,
+        first_audio_ms: first_audio_ms.unwrap_or(0),
+        last_entry: last_entry.ok_or_else(|| anyhow!("no TTS segments were generated"))?,
+        total_playback_ms,
+        idle_generation,
+        segment_count,
+    })
 }
 
 fn tts_usage_for_outcome(
@@ -1194,6 +1246,66 @@ fn tts_usage_for_outcome(
         };
     }
     synthesis.usage.clone()
+}
+
+fn split_tts_text(text: &str, backend: &str) -> Vec<String> {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return vec![String::new()];
+    }
+    if backend != "sherpa-onnx" {
+        return vec![normalized];
+    }
+
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut last_break_at = None;
+
+    for ch in normalized.chars() {
+        current.push(ch);
+        if matches!(ch, '.' | '!' | '?' | ';' | ':') || (ch == ',' && current.len() >= 48) {
+            last_break_at = Some(current.len());
+        }
+
+        if current.len() >= 24 && matches!(ch, '.' | '!' | '?' | ';' | ':') {
+            let segment = current.trim();
+            if !segment.is_empty() {
+                segments.push(segment.to_string());
+            }
+            current.clear();
+            last_break_at = None;
+            continue;
+        }
+
+        if current.len() >= 72 {
+            if let Some(index) = last_break_at.take() {
+                let tail = current.split_off(index);
+                let segment = current.trim();
+                if !segment.is_empty() {
+                    segments.push(segment.to_string());
+                }
+                current = tail.trim_start().to_string();
+            } else if let Some(index) = current.rfind(' ') {
+                let tail = current.split_off(index);
+                let segment = current.trim();
+                if !segment.is_empty() {
+                    segments.push(segment.to_string());
+                }
+                current = tail.trim_start().to_string();
+            }
+            last_break_at = None;
+        }
+    }
+
+    if !current.trim().is_empty() {
+        segments.push(current.trim().to_string());
+    }
+
+    if segments.is_empty() {
+        vec![normalized]
+    } else {
+        segments
+    }
 }
 
 fn schedule_idle_prompt(
@@ -1845,5 +1957,28 @@ mod tests {
         assert!(!assistant_prompt_requests_profile_field(
             "Anything else you need help with tonight?"
         ));
+    }
+
+    #[test]
+    fn split_tts_text_prefers_sentence_boundaries_for_local_tts() {
+        let segments = split_tts_text(
+            "One, two, three, four, five, six, seven. Just hanging out with you! What else can I do for you tonight?",
+            "sherpa-onnx",
+        );
+
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0], "One, two, three, four, five, six, seven.");
+        assert_eq!(segments[1], "Just hanging out with you!");
+        assert_eq!(segments[2], "What else can I do for you tonight?");
+    }
+
+    #[test]
+    fn split_tts_text_keeps_openai_text_as_single_segment() {
+        let segments = split_tts_text(
+            "This is a long enough response that local TTS would segment it, but OpenAI should keep it together as one request.",
+            "openai",
+        );
+
+        assert_eq!(segments, vec!["This is a long enough response that local TTS would segment it, but OpenAI should keep it together as one request.".to_string()]);
     }
 }
