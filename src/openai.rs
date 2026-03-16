@@ -647,9 +647,10 @@ fn response_input(
     previous_response_id: Option<&str>,
 ) -> Vec<serde_json::Value> {
     if previous_response_id.is_some()
-        && let Some(latest_caller) = transcript.iter().rev().find(|event| {
-            event.role == "caller" && event.kind == "caller.transcript.completed"
-        })
+        && let Some(latest_caller) = transcript
+            .iter()
+            .rev()
+            .find(|event| event.role == "caller" && event.kind == "caller.transcript.completed")
     {
         return vec![json!({
             "role": "user",
@@ -659,7 +660,9 @@ fn response_input(
 
     transcript
         .iter()
-        .filter(|event| event.kind == "assistant.tts" || event.kind == "caller.transcript.completed")
+        .filter(|event| {
+            event.kind == "assistant.tts" || event.kind == "caller.transcript.completed"
+        })
         .map(|event| {
             let role = if event.role == "caller" {
                 "user"
