@@ -1,6 +1,19 @@
+FROM rust:1.94-bookworm AS rust-builder
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock /build/
+COPY src /build/src
+
+RUN --mount=type=bind,source=.cargo/registry/cache,target=/usr/local/cargo/registry/cache,readonly \
+    --mount=type=bind,source=.cargo/registry/index,target=/usr/local/cargo/registry/index,readonly \
+    --mount=type=bind,source=.cargo/registry/src,target=/usr/local/cargo/registry/src,readonly \
+    cargo build --release --offline
+
 FROM python:3.10-slim-bookworm
 
 COPY --from=ghcr.io/astral-sh/uv:0.10.2 /uv /uvx /usr/local/bin/
+COPY --from=rust-builder /build/target/release/agent_voice /usr/local/bin/agent_voice
 
 RUN useradd --system --uid 10001 --gid nogroup --create-home --home-dir /app agentvoice
 
@@ -16,7 +29,6 @@ RUN ln -sf /usr/local/bin/python3 /app/.venv/bin/python \
   && ln -sf python /app/.venv/bin/python3 \
   && ln -sf python /app/.venv/bin/python3.10
 
-COPY target/debug/agent_voice /usr/local/bin/agent_voice
 COPY config /app/config
 COPY deploy /app/deploy
 COPY docs /app/docs
