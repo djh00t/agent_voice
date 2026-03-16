@@ -911,129 +911,159 @@ async fn process_detected_utterance(
     record.record_caller_text(caller_text.to_string());
     record.note_activity();
     let transcript_history = record.transcript_history();
+    let caller_requested_end_call = caller_requested_end_call(caller_text);
+    let caller_requested_immediate_hangup = caller_requested_immediate_hangup(caller_text);
 
     reconcile_pending_email_confirmation(&bridge.phone_book, &record, caller_text)?;
-
-    let caller_profile = record
-        .phone_book_key
-        .as_deref()
-        .and_then(|key| bridge.phone_book.get(key));
-
-    let extraction_started = Instant::now();
-    if let Some(phone_book_key) = record.phone_book_key.as_deref()
-        && should_extract_caller_update(&transcript_history, &record, caller_text)
-        && let Ok(update) = bridge
-            .llm
-            .extract_caller_update(
-                &windowed_transcript(&transcript_history, 4),
-                caller_profile.as_ref(),
-            )
-            .await
+    let mut extraction_ms = 0_u128;
+    let mut llm_ms = 0_u128;
+    let mut llm_cost_usd = 0.0_f64;
+    let mut chained_response = false;
+    let mut response_id = None;
+    let mut model_requested_end_call = false;
+    let (mut response_text, should_end_call) = if let Some(response_text) = bridge
+        .behavior
+        .auto_end_calls
+        .then(|| fast_path_end_call_response(caller_text))
+        .flatten()
     {
-        let extraction_usage = update.usage.clone();
-        let sanitized_update = sanitize_caller_update(update.update, caller_text);
-        if let Some(email) = sanitized_update.pending_email_confirmation.clone() {
-            record.set_pending_email_confirmation(Some(email));
+        info!(
+            call_id = %record.call.call_id(),
+            caller_text,
+            response_text,
+            "using direct end-call fast path without LLM"
+        );
+        (response_text, true)
+    } else {
+        let caller_profile = record
+            .phone_book_key
+            .as_deref()
+            .and_then(|key| bridge.phone_book.get(key));
+
+        let extraction_started = Instant::now();
+        if let Some(phone_book_key) = record.phone_book_key.as_deref()
+            && should_extract_caller_update(&transcript_history, &record, caller_text)
+            && let Ok(update) = bridge
+                .llm
+                .extract_caller_update(
+                    &windowed_transcript(&transcript_history, 4),
+                    caller_profile.as_ref(),
+                )
+                .await
+        {
+            let extraction_usage = update.usage.clone();
+            let sanitized_update = sanitize_caller_update(update.update, caller_text);
+            if let Some(email) = sanitized_update.pending_email_confirmation.clone() {
+                record.set_pending_email_confirmation(Some(email));
+            }
+            let completed_extraction_ms = extraction_started.elapsed().as_millis();
+            let _ = record_api_call(
+                &bridge.accounting,
+                &record,
+                LoggedApiCall {
+                    operation: "responses.contact_extraction",
+                    endpoint: &bridge.llm.config().responses_api_url,
+                    model: &bridge.llm.config().response_model,
+                    duration_ms: completed_extraction_ms,
+                    usage_source: "api",
+                    estimated: false,
+                    usage: extraction_usage,
+                },
+            )?;
+            if let Err(error) = bridge
+                .phone_book
+                .merge_update(phone_book_key, sanitized_update.update)
+            {
+                warn!(call_id = %record.call.call_id(), error = %error, "failed to persist caller update");
+            }
         }
-        let extraction_ms = extraction_started.elapsed().as_millis();
-        let _ = record_api_call(
+        extraction_ms = extraction_started.elapsed().as_millis();
+
+        let context = ConversationContext {
+            assistant_name: bridge.behavior.assistant_name.clone(),
+            caller_id: record.peer.clone(),
+            phone_book_writable: record.phone_book_key.is_some(),
+            time_of_day: time_of_day_label(
+                caller_profile
+                    .as_ref()
+                    .and_then(|caller| caller.timezone.as_deref())
+                    .unwrap_or(&bridge.behavior.default_timezone),
+            ),
+            missing_fields: caller_profile
+                .as_ref()
+                .map(|caller| {
+                    caller
+                        .missing_fields()
+                        .into_iter()
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| {
+                    vec![
+                        "first_name".to_string(),
+                        "last_name".to_string(),
+                        "email".to_string(),
+                        "company".to_string(),
+                    ]
+                }),
+            known_caller: caller_profile,
+            pending_email_confirmation: record.pending_email_confirmation(),
+        };
+
+        info!(
+            call_id = %record.call.call_id(),
+            transcript_events = transcript_history.len(),
+            context_window_events = bridge.behavior.context_window_events,
+            "sending transcript history to LLM"
+        );
+        let context_history =
+            windowed_transcript(&transcript_history, bridge.behavior.context_window_events);
+        let previous_response_id = record.last_reply_response_id();
+        let llm_started = Instant::now();
+        let response = bridge
+            .llm
+            .generate_response_with_context(
+                &context_history,
+                &context,
+                previous_response_id.as_deref(),
+            )
+            .await?;
+        llm_ms = llm_started.elapsed().as_millis();
+        let llm_entry = record_api_call(
             &bridge.accounting,
             &record,
             LoggedApiCall {
-                operation: "responses.contact_extraction",
+                operation: "responses.reply",
                 endpoint: &bridge.llm.config().responses_api_url,
                 model: &bridge.llm.config().response_model,
-                duration_ms: extraction_ms,
+                duration_ms: llm_ms,
                 usage_source: "api",
                 estimated: false,
-                usage: extraction_usage,
+                usage: response.usage.clone(),
             },
         )?;
-        if let Err(error) = bridge
-            .phone_book
-            .merge_update(phone_book_key, sanitized_update.update)
-        {
-            warn!(call_id = %record.call.call_id(), error = %error, "failed to persist caller update");
+        llm_cost_usd = llm_entry.cost_usd;
+        let mut response_text = response.text.trim().to_string();
+        if bridge.behavior.auto_end_calls && caller_requested_end_call {
+            response_text = finalize_end_call_response(&response_text);
         }
-    }
-    let extraction_ms = extraction_started.elapsed().as_millis();
-
-    let context = ConversationContext {
-        assistant_name: bridge.behavior.assistant_name.clone(),
-        caller_id: record.peer.clone(),
-        phone_book_writable: record.phone_book_key.is_some(),
-        time_of_day: time_of_day_label(
-            caller_profile
-                .as_ref()
-                .and_then(|caller| caller.timezone.as_deref())
-                .unwrap_or(&bridge.behavior.default_timezone),
-        ),
-        missing_fields: caller_profile
-            .as_ref()
-            .map(|caller| {
-                caller
-                    .missing_fields()
-                    .into_iter()
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| {
-                vec![
-                    "first_name".to_string(),
-                    "last_name".to_string(),
-                    "email".to_string(),
-                    "company".to_string(),
-                ]
-            }),
-        known_caller: caller_profile,
-        pending_email_confirmation: record.pending_email_confirmation(),
+        model_requested_end_call = response.end_call && bridge.behavior.auto_end_calls;
+        let response_has_final_farewell = looks_like_final_farewell(&response_text);
+        if model_requested_end_call && !response_has_final_farewell {
+            warn!(
+                call_id = %record.call.call_id(),
+                response_text,
+                "ignoring model end_call because assistant reply is not a final closing"
+            );
+        }
+        let should_end_call = bridge.behavior.auto_end_calls
+            && (caller_requested_end_call
+                || (model_requested_end_call && response_has_final_farewell));
+        record.set_last_reply_response_id(response.response_id.clone());
+        chained_response = previous_response_id.is_some();
+        response_id = response.response_id.clone();
+        (response_text, should_end_call)
     };
-
-    info!(
-        call_id = %record.call.call_id(),
-        transcript_events = transcript_history.len(),
-        context_window_events = bridge.behavior.context_window_events,
-        "sending transcript history to LLM"
-    );
-    let context_history =
-        windowed_transcript(&transcript_history, bridge.behavior.context_window_events);
-    let previous_response_id = record.last_reply_response_id();
-    let llm_started = Instant::now();
-    let response = bridge
-        .llm
-        .generate_response_with_context(&context_history, &context, previous_response_id.as_deref())
-        .await?;
-    let llm_ms = llm_started.elapsed().as_millis();
-    let llm_entry = record_api_call(
-        &bridge.accounting,
-        &record,
-        LoggedApiCall {
-            operation: "responses.reply",
-            endpoint: &bridge.llm.config().responses_api_url,
-            model: &bridge.llm.config().response_model,
-            duration_ms: llm_ms,
-            usage_source: "api",
-            estimated: false,
-            usage: response.usage.clone(),
-        },
-    )?;
-    let caller_requested_end_call = caller_requested_end_call(caller_text);
-    let caller_requested_immediate_hangup = caller_requested_immediate_hangup(caller_text);
-    let mut response_text = response.text.trim().to_string();
-    if bridge.behavior.auto_end_calls && caller_requested_end_call {
-        response_text = finalize_end_call_response(&response_text);
-    }
-    let model_requested_end_call = response.end_call && bridge.behavior.auto_end_calls;
-    let response_has_final_farewell = looks_like_final_farewell(&response_text);
-    if model_requested_end_call && !response_has_final_farewell {
-        warn!(
-            call_id = %record.call.call_id(),
-            response_text,
-            "ignoring model end_call because assistant reply is not a final closing"
-        );
-    }
-    let should_end_call = bridge.behavior.auto_end_calls
-        && (caller_requested_end_call || (model_requested_end_call && response_has_final_farewell));
     if response_text.is_empty() {
         if should_end_call {
             response_text = default_final_farewell().to_string();
@@ -1042,14 +1072,12 @@ async fn process_detected_utterance(
             return Ok(());
         }
     }
-    record.set_last_reply_response_id(response.response_id.clone());
-
     info!(
         call_id = %record.call.call_id(),
         response_text,
         llm_ms,
-        chained_response = previous_response_id.is_some(),
-        response_id = ?response.response_id,
+        chained_response,
+        response_id = ?response_id,
         caller_requested_end_call,
         model_requested_end_call,
         should_end_call,
@@ -1129,7 +1157,7 @@ async fn process_detected_utterance(
         avg_llm_ms = summary.avg_llm_ms,
         avg_tts_ms = summary.avg_tts_ms,
         stt_cost_usd = format_args!("{:.8}", stt_entry.cost_usd),
-        llm_cost_usd = format_args!("{:.8}", llm_entry.cost_usd),
+        llm_cost_usd = format_args!("{:.8}", llm_cost_usd),
         tts_cost_usd = format_args!("{:.8}", tts_entry.cost_usd),
         end_call = should_end_call,
         total_call_cost_usd = format_args!("{:.8}", record.accounting_summary().total_cost_usd),
@@ -1855,6 +1883,16 @@ fn caller_requested_immediate_hangup(text: &str) -> bool {
     .any(|phrase| normalized.contains(phrase))
 }
 
+fn fast_path_end_call_response(text: &str) -> Option<String> {
+    if let Some(limit) = requested_count_before_hangup(text) {
+        return Some(format!("{}, bye.", count_words(limit).join(", ")));
+    }
+    if caller_requested_immediate_hangup(text) {
+        return Some("Okay, bye.".to_string());
+    }
+    None
+}
+
 fn looks_like_final_farewell(text: &str) -> bool {
     let normalized = normalize_match_text(text);
     [
@@ -1932,6 +1970,67 @@ fn normalize_match_text(text: &str) -> String {
         }
     }
     normalized.trim().to_string()
+}
+
+fn requested_count_before_hangup(text: &str) -> Option<u8> {
+    let normalized = normalize_match_text(text);
+    if !caller_requested_immediate_hangup(&normalized) {
+        return None;
+    }
+
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    for window in tokens.windows(3) {
+        if window[0] == "count"
+            && window[1] == "to"
+            && let Some(limit) = parse_count_word(window[2])
+        {
+            return Some(limit);
+        }
+    }
+    for window in tokens.windows(2) {
+        if window[0] == "count"
+            && let Some(limit) = parse_count_word(window[1])
+        {
+            return Some(limit);
+        }
+    }
+    None
+}
+
+fn parse_count_word(token: &str) -> Option<u8> {
+    match token {
+        "1" | "one" => Some(1),
+        "2" | "two" => Some(2),
+        "3" | "three" => Some(3),
+        "4" | "four" => Some(4),
+        "5" | "five" => Some(5),
+        "6" | "six" => Some(6),
+        "7" | "seven" => Some(7),
+        "8" | "eight" => Some(8),
+        "9" | "nine" => Some(9),
+        "10" | "ten" => Some(10),
+        _ => None,
+    }
+}
+
+fn count_words(limit: u8) -> Vec<&'static str> {
+    let mut words = Vec::new();
+    for value in 1..=limit {
+        words.push(match value {
+            1 => "one",
+            2 => "two",
+            3 => "three",
+            4 => "four",
+            5 => "five",
+            6 => "six",
+            7 => "seven",
+            8 => "eight",
+            9 => "nine",
+            10 => "ten",
+            _ => break,
+        });
+    }
+    words
 }
 
 fn build_initial_greeting(
@@ -2209,5 +2308,26 @@ mod tests {
         assert!(!looks_like_final_farewell(
             "I didn't catch that, could you repeat it?"
         ));
+    }
+
+    #[test]
+    fn fast_path_end_call_response_counts_then_hangs_up_without_llm() {
+        assert_eq!(
+            fast_path_end_call_response("Count three and hang up.").as_deref(),
+            Some("one, two, three, bye.")
+        );
+        assert_eq!(
+            fast_path_end_call_response("Count to 3 and hang up.").as_deref(),
+            Some("one, two, three, bye.")
+        );
+    }
+
+    #[test]
+    fn fast_path_end_call_response_shortens_immediate_hangup_requests() {
+        assert_eq!(
+            fast_path_end_call_response("Hang up now.").as_deref(),
+            Some("Okay, bye.")
+        );
+        assert_eq!(fast_path_end_call_response("Goodbye."), None);
     }
 }
