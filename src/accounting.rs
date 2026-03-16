@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
@@ -313,6 +313,22 @@ impl AccountingStore {
         ((sample_count as f64 / sample_rate as f64) * tokens_per_second).ceil() as u64
     }
 
+    /// Returns a path for writing accounting CSV data that is constrained to a
+    /// dedicated subdirectory, to avoid writing to arbitrary filesystem locations.
+    fn safe_log_path(&self, configured: &str) -> PathBuf {
+        // Use a fixed base directory for accounting logs relative to the current
+        // working directory. This prevents absolute or traversal paths from
+        // escaping the intended logging area.
+        let base = PathBuf::from("logs");
+        let mut relative = configured.trim_start_matches(|c| c == '/' || c == '\\');
+        // On Windows, also strip a possible drive prefix like "C:\".
+        if let Some(idx) = relative.find(':') {
+            relative = &relative[idx + 1..];
+            relative = relative.trim_start_matches(|c| c == '/' || c == '\\');
+        }
+        base.join(relative)
+    }
+
     pub fn record_api_call(
         &self,
         context: ApiCallContext<'_>,
@@ -343,13 +359,19 @@ impl AccountingStore {
 
     pub fn record_call_total(&self, entry: &CallTotalsLogEntry) -> Result<()> {
         let _guard = self.write_lock.lock();
-        ensure_parent_dir(&self.call_totals_csv_path)?;
-        let file_exists = Path::new(&self.call_totals_csv_path).exists();
+        let path = self.safe_log_path(&self.call_totals_csv_path);
+        ensure_parent_dir(path.to_str().unwrap_or(&self.call_totals_csv_path))?;
+        let file_exists = Path::new(&path).exists();
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.call_totals_csv_path)
-            .with_context(|| format!("failed to open {}", self.call_totals_csv_path))?;
+            .open(&path)
+            .with_context(|| {
+                format!(
+                    "failed to open {}",
+                    path.to_str().unwrap_or(&self.call_totals_csv_path)
+                )
+            })?;
         if !file_exists {
             file.write_all(CALL_TOTALS_HEADER.as_bytes())
                 .context("failed to write call totals CSV header")?;
@@ -381,13 +403,19 @@ impl AccountingStore {
 
     fn append_api_call_csv(&self, entry: &ApiCallLogEntry) -> Result<()> {
         let _guard = self.write_lock.lock();
-        ensure_parent_dir(&self.api_calls_csv_path)?;
-        let file_exists = Path::new(&self.api_calls_csv_path).exists();
+        let path = self.safe_log_path(&self.api_calls_csv_path);
+        ensure_parent_dir(path.to_str().unwrap_or(&self.api_calls_csv_path))?;
+        let file_exists = Path::new(&path).exists();
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.api_calls_csv_path)
-            .with_context(|| format!("failed to open {}", self.api_calls_csv_path))?;
+            .open(&path)
+            .with_context(|| {
+                format!(
+                    "failed to open {}",
+                    path.to_str().unwrap_or(&self.api_calls_csv_path)
+                )
+            })?;
         if !file_exists {
             file.write_all(API_CALLS_HEADER.as_bytes())
                 .context("failed to write API calls CSV header")?;
