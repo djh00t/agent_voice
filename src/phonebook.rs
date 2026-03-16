@@ -171,12 +171,10 @@ impl PhoneBookStore {
         let full_path = resolve_phone_book_path(path.into())?;
 
         let mut phone_book = if full_path.exists() {
-            let raw = fs::read_to_string(&full_path).with_context(|| {
-                format!("failed to read phone book {}", full_path.display())
-            })?;
-            serde_json::from_str(&raw).with_context(|| {
-                format!("failed to parse phone book {}", full_path.display())
-            })?
+            let raw = fs::read_to_string(&full_path)
+                .with_context(|| format!("failed to read phone book {}", full_path.display()))?;
+            serde_json::from_str(&raw)
+                .with_context(|| format!("failed to parse phone book {}", full_path.display()))?
         } else {
             PhoneBook::default()
         };
@@ -308,9 +306,9 @@ fn resolve_phone_book_path(configured: PathBuf) -> Result<PathBuf> {
         .context("failed to resolve current working directory for phone book")?;
     let full_path = base_dir.join(&configured);
     if full_path.exists() {
-        let canonical = full_path
-            .canonicalize()
-            .with_context(|| format!("failed to resolve phone book path {}", full_path.display()))?;
+        let canonical = full_path.canonicalize().with_context(|| {
+            format!("failed to resolve phone book path {}", full_path.display())
+        })?;
         if !canonical.starts_with(&base_dir) {
             return Err(anyhow::anyhow!(
                 "phone book path must reside under {}",
