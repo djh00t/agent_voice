@@ -16,7 +16,7 @@ RUN ln -sf /usr/local/bin/python3 /app/.venv/bin/python \
   && ln -sf python /app/.venv/bin/python3 \
   && ln -sf python /app/.venv/bin/python3.10
 
-COPY target/release/agent_voice /usr/local/bin/agent_voice
+COPY target/debug/agent_voice /usr/local/bin/agent_voice
 COPY config /app/config
 COPY deploy /app/deploy
 COPY docs /app/docs
