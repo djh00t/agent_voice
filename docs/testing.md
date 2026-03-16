@@ -68,7 +68,7 @@ curl -sS http://127.0.0.1:8089/v1/status | jq
 5. Place or receive a SIP call.
 6. Confirm the call answers after two seconds and plays `Welcome`.
 7. Speak into the call and wait for the agent to answer you.
-   Watch `docker compose logs -f` for per-turn timing lines that include `gap_since_previous_turn_ms`, `stt_ms`, `extraction_ms`, `llm_ms`, `tts_ms`, and `total_turn_ms`.
+   Watch `docker compose logs -f` for per-turn timing lines that include `gap_since_previous_turn_ms`, `stt_ms`, `extraction_ms`, `llm_ms`, `tts_ms`, `tts_first_audio_ms`, and `total_turn_ms`.
    Watch for `recorded TTS accounting entry` and `recorded API accounting entry` lines to confirm cost and token details are being logged.
 8. Hang up and check `./data/transcripts` for the saved caller and assistant transcript.
 9. Check `./data/phone_book.json` to confirm caller details are being remembered by caller ID. Editable fields are `first_name`, `last_name`, `email`, `company`, `timezone`, `preferred_language`, and `notes`.
