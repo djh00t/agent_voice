@@ -821,7 +821,7 @@ fn response_instructions(base: Option<&str>, context: &ConversationContext) -> S
         "If the caller is known by first name, greet them naturally by that name. If you know the first name but not the last name, ask casually for the last name when it fits. If you do not know their name yet, ask naturally who is calling when appropriate. Do not interrogate them.".to_string(),
     );
     sections.push(
-        "Return only a JSON object with keys `say` and `end_call`. `say` must contain exactly what you want spoken to the caller. Set `end_call` to true only when your spoken reply is a final closing farewell and the phone should hang up immediately after playback. If the caller says goodbye but it is still appropriate to ask whether they need anything else, keep `end_call` false for that turn.".to_string(),
+        "Return only a JSON object with keys `say` and `end_call`. `say` must contain exactly what you want spoken to the caller. Set `end_call` to true only when your spoken reply is a final closing farewell and the phone should hang up immediately after playback. If the caller directly asks you to hang up, disconnect, end the call, or gives a clearly final goodbye, your reply must itself be a short closing farewell and `end_call` must be true. Never set `end_call` to true on clarifications, questions, or other non-final replies. If the caller says goodbye but it is still appropriate to ask whether they need anything else, keep `end_call` false for that turn.".to_string(),
     );
     sections.join("\n")
 }
@@ -892,24 +892,43 @@ fn extract_turn_plan(payload: &serde_json::Value) -> Result<TurnPlan> {
 }
 
 fn sanitize_turn_plan(plan: TurnPlan, transcript: &[TranscriptEvent]) -> TurnPlan {
-    if !looks_like_language_comment(&plan.say) {
-        return plan;
+    let latest_caller_text = latest_caller_text(transcript);
+    if looks_like_language_comment(&plan.say) {
+        if caller_explicitly_discussed_language(latest_caller_text) {
+            return plan;
+        }
+
+        return TurnPlan {
+            say: "Sorry, I didn't quite catch that. Could you say that again?".to_string(),
+            end_call: false,
+        };
     }
 
-    let latest_caller_text = transcript
+    let caller_requested_end_call = caller_requested_end_call(latest_caller_text);
+    let say = plan.say.trim();
+    if caller_requested_end_call {
+        return TurnPlan {
+            say: finalize_end_call_response(say),
+            end_call: true,
+        };
+    }
+    if plan.end_call && !looks_like_final_farewell(say) {
+        return TurnPlan {
+            say: say.to_string(),
+            end_call: false,
+        };
+    }
+
+    plan
+}
+
+fn latest_caller_text(transcript: &[TranscriptEvent]) -> &str {
+    transcript
         .iter()
         .rev()
         .find(|event| event.role == "caller" && event.kind == "caller.transcript.completed")
         .map(|event| event.text.as_str())
-        .unwrap_or_default();
-    if caller_explicitly_discussed_language(latest_caller_text) {
-        return plan;
-    }
-
-    TurnPlan {
-        say: "Sorry, I didn't quite catch that. Could you say that again?".to_string(),
-        end_call: false,
-    }
+        .unwrap_or_default()
 }
 
 fn looks_like_language_comment(text: &str) -> bool {
@@ -941,6 +960,106 @@ fn caller_explicitly_discussed_language(text: &str) -> bool {
         || normalized.contains("thai")
         || normalized.contains("speak ")
         || normalized.contains("translation")
+}
+
+fn caller_requested_end_call(text: &str) -> bool {
+    let normalized = normalize_match_text(text);
+    [
+        "goodbye",
+        "good bye",
+        "bye",
+        "bye bye",
+        "see you",
+        "see ya",
+        "catch you later",
+        "talk to you later",
+        "that s all",
+        "that is all",
+        "nothing else",
+        "hang up",
+        "hanging up",
+        "hangup",
+        "disconnect",
+        "end the call",
+        "drop the call",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn looks_like_final_farewell(text: &str) -> bool {
+    let normalized = normalize_match_text(text);
+    [
+        "goodbye",
+        "good bye",
+        "bye",
+        "see you",
+        "see ya",
+        "take care",
+        "have a good",
+        "have a great",
+        "talk soon",
+        "catch you later",
+        "call back",
+        "thanks for calling",
+        "no worries bye",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn finalize_end_call_response(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || looks_like_clarification_request(trimmed) {
+        return "Okay, no worries. See you later.".to_string();
+    }
+    if looks_like_final_farewell(trimmed) {
+        return trimmed.to_string();
+    }
+    let suffix = " See you later.";
+    if trimmed.ends_with(['.', '!', '?']) {
+        format!("{trimmed}{suffix}")
+    } else {
+        format!("{trimmed}.{suffix}")
+    }
+}
+
+fn looks_like_clarification_request(text: &str) -> bool {
+    let normalized = normalize_match_text(text);
+    [
+        "could you say that again",
+        "can you say that again",
+        "could you repeat that",
+        "can you repeat that",
+        "i didn t catch that",
+        "i did not catch that",
+        "pardon",
+        "sorry",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn normalize_match_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut last_was_space = true;
+    for ch in text.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            ' '
+        };
+        if mapped == ' ' {
+            if !last_was_space {
+                normalized.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            normalized.push(mapped);
+            last_was_space = false;
+        }
+    }
+    normalized.trim().to_string()
 }
 
 fn parse_caller_update(text: &str) -> Result<CallerUpdate> {
@@ -1155,6 +1274,48 @@ mod tests {
 
         assert_eq!(sanitized.say, original.say);
         assert_eq!(sanitized.end_call, original.end_call);
+    }
+
+    #[test]
+    fn sanitize_turn_plan_promotes_explicit_hangup_request_to_final_closing() {
+        let transcript = vec![TranscriptEvent {
+            role: "caller".to_string(),
+            kind: "caller.transcript.completed".to_string(),
+            text: "Please count to three and hang up.".to_string(),
+            at: "2026-03-16T00:00:00Z".to_string(),
+        }];
+
+        let sanitized = sanitize_turn_plan(
+            TurnPlan {
+                say: "One, two, three.".to_string(),
+                end_call: false,
+            },
+            &transcript,
+        );
+
+        assert_eq!(sanitized.say, "One, two, three. See you later.");
+        assert!(sanitized.end_call);
+    }
+
+    #[test]
+    fn sanitize_turn_plan_clears_end_call_for_non_closing_reply() {
+        let transcript = vec![TranscriptEvent {
+            role: "caller".to_string(),
+            kind: "caller.transcript.completed".to_string(),
+            text: "Tell me a joke.".to_string(),
+            at: "2026-03-16T00:00:00Z".to_string(),
+        }];
+
+        let sanitized = sanitize_turn_plan(
+            TurnPlan {
+                say: "I didn't catch that, could you repeat it?".to_string(),
+                end_call: true,
+            },
+            &transcript,
+        );
+
+        assert_eq!(sanitized.say, "I didn't catch that, could you repeat it?");
+        assert!(!sanitized.end_call);
     }
 
     #[test]
