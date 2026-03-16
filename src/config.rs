@@ -1116,8 +1116,10 @@ fn default_sherpa_provider() -> String {
     "cpu".to_string()
 }
 
-const fn default_sherpa_num_threads() -> u32 {
-    2
+fn default_sherpa_num_threads() -> u32 {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().clamp(2, 8) as u32)
+        .unwrap_or(4)
 }
 
 const fn default_sherpa_warmup_on_startup() -> bool {
