@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
@@ -313,6 +313,33 @@ impl AccountingStore {
         ((sample_count as f64 / sample_rate as f64) * tokens_per_second).ceil() as u64
     }
 
+    /// Returns a path for writing accounting CSV data that is constrained to a
+    /// dedicated subdirectory, to avoid writing to arbitrary filesystem locations.
+    fn safe_log_path(&self, configured: &str) -> Result<PathBuf> {
+        let base = PathBuf::from("logs");
+        let configured_path = Path::new(configured);
+        let mut relative = PathBuf::new();
+        for component in configured_path.components() {
+            match component {
+                std::path::Component::Normal(part) => relative.push(part),
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_) => {
+                    bail!(
+                        "accounting log path must stay within {}: {}",
+                        base.display(),
+                        configured
+                    );
+                }
+            }
+        }
+        if relative.as_os_str().is_empty() {
+            bail!("accounting log path must include a file name");
+        }
+        Ok(base.join(relative))
+    }
+
     pub fn record_api_call(
         &self,
         context: ApiCallContext<'_>,
@@ -343,13 +370,14 @@ impl AccountingStore {
 
     pub fn record_call_total(&self, entry: &CallTotalsLogEntry) -> Result<()> {
         let _guard = self.write_lock.lock();
-        ensure_parent_dir(&self.call_totals_csv_path)?;
-        let file_exists = Path::new(&self.call_totals_csv_path).exists();
+        let path = self.safe_log_path(&self.call_totals_csv_path)?;
+        ensure_parent_dir(&path)?;
+        let file_exists = path.exists();
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.call_totals_csv_path)
-            .with_context(|| format!("failed to open {}", self.call_totals_csv_path))?;
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
         if !file_exists {
             file.write_all(CALL_TOTALS_HEADER.as_bytes())
                 .context("failed to write call totals CSV header")?;
@@ -381,13 +409,14 @@ impl AccountingStore {
 
     fn append_api_call_csv(&self, entry: &ApiCallLogEntry) -> Result<()> {
         let _guard = self.write_lock.lock();
-        ensure_parent_dir(&self.api_calls_csv_path)?;
-        let file_exists = Path::new(&self.api_calls_csv_path).exists();
+        let path = self.safe_log_path(&self.api_calls_csv_path)?;
+        ensure_parent_dir(&path)?;
+        let file_exists = path.exists();
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.api_calls_csv_path)
-            .with_context(|| format!("failed to open {}", self.api_calls_csv_path))?;
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
         if !file_exists {
             file.write_all(API_CALLS_HEADER.as_bytes())
                 .context("failed to write API calls CSV header")?;
@@ -669,8 +698,8 @@ const fn default_chars_per_token() -> f64 {
     4.0
 }
 
-fn ensure_parent_dir(path: &str) -> Result<()> {
-    if let Some(parent) = Path::new(path).parent()
+fn ensure_parent_dir(path: impl AsRef<Path>) -> Result<()> {
+    if let Some(parent) = path.as_ref().parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)
@@ -700,6 +729,29 @@ fn format_usd(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_store() -> AccountingStore {
+        AccountingStore {
+            catalog: ModelCatalog {
+                defaults: ModelCatalogDefaults::default(),
+                models: vec![ModelPricing {
+                    name: "gpt-4o-mini".to_string(),
+                    service: "responses".to_string(),
+                    input_text_usd_per_million_tokens: 0.15,
+                    cached_input_text_usd_per_million_tokens: 0.075,
+                    output_text_usd_per_million_tokens: 0.60,
+                    input_audio_usd_per_million_tokens: 0.0,
+                    output_audio_usd_per_million_tokens: 0.0,
+                    estimated_chars_per_input_token: None,
+                    estimated_input_audio_tokens_per_second: None,
+                    estimated_output_audio_tokens_per_second: None,
+                }],
+            },
+            api_calls_csv_path: "api_calls.csv".to_string(),
+            call_totals_csv_path: "call_totals.csv".to_string(),
+            write_lock: Mutex::new(()),
+        }
+    }
 
     #[test]
     fn call_summary_aggregates_model_usage() {
@@ -813,6 +865,33 @@ mod tests {
             store.estimate_output_audio_tokens("gpt-4o-mini-tts", 8000, 8000),
             20
         );
+    }
+
+    #[test]
+    fn safe_log_path_rejects_parent_dir_traversal() {
+        let store = test_store();
+        let error = store
+            .safe_log_path("../../etc/passwd")
+            .expect_err("traversal should fail");
+        assert!(error.to_string().contains("must stay within logs"));
+    }
+
+    #[test]
+    fn safe_log_path_rejects_absolute_paths() {
+        let store = test_store();
+        let error = store
+            .safe_log_path("/tmp/api_calls.csv")
+            .expect_err("absolute path should fail");
+        assert!(error.to_string().contains("must stay within logs"));
+    }
+
+    #[test]
+    fn safe_log_path_preserves_colon_in_filename() {
+        let store = test_store();
+        let path = store
+            .safe_log_path("foo:bar.csv")
+            .expect("colon file name should be preserved");
+        assert_eq!(path, PathBuf::from("logs").join("foo:bar.csv"));
     }
 
     #[test]
