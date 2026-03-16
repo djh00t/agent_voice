@@ -6,10 +6,32 @@ Run these before copying to `tv04`:
 
 ```bash
 cargo fmt
+make uv-sync
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 docker compose config
 ```
+
+## Local speech model bootstrap
+
+If you want to exercise local sherpa-onnx speech instead of OpenAI STT/TTS:
+
+```bash
+make sherpa-download-models
+cp .env.example .env
+```
+
+Then set these in `.env`:
+
+```bash
+SPEECH_STT_PROVIDER=sherpa_onnx
+SPEECH_TTS_PROVIDER=sherpa_onnx
+```
+
+The default example paths assume:
+
+- Moonshine files under `./models/stt/moonshine`
+- Kokoro files under `./models/tts/kokoro`
 
 ## Docker smoke test
 
@@ -22,6 +44,7 @@ docker compose config
    Set `ASSISTANT_NAME=Steve` or whatever caller-facing name you want the agent to use.
    Set `CALL_CONTEXT_WINDOW_EVENTS=8` to keep only a bounded recent window in LLM context.
    Leave `ACCOUNTING_REFRESH_PRICING_ON_STARTUP=true` if you want the container to refresh `./accounting/models.json` from the official OpenAI pricing page at boot.
+   Set `SPEECH_STT_PROVIDER=sherpa_onnx` and `SPEECH_TTS_PROVIDER=sherpa_onnx` if you want local Moonshine STT plus local Kokoro TTS instead of OpenAI speech.
 3. Build and start:
 
 ```bash
@@ -38,11 +61,13 @@ curl -sS http://127.0.0.1:8089/healthz
 curl -sS http://127.0.0.1:8089/v1/status | jq
 ```
 
+   Confirm `/v1/status` reports the expected `stt_backend` and `tts_backend`.
+
 5. Place or receive a SIP call.
 6. Confirm the call answers after two seconds and plays `Welcome`.
 7. Speak into the call and wait for the agent to answer you.
    Watch `docker compose logs -f` for per-turn timing lines that include `gap_since_previous_turn_ms`, `stt_ms`, `extraction_ms`, `llm_ms`, `tts_ms`, and `total_turn_ms`.
-   Watch for `recorded OpenAI API accounting entry` lines to confirm token counts and `cost_usd` are being logged for each API call.
+   Watch for `recorded TTS accounting entry` and `recorded API accounting entry` lines to confirm cost and token details are being logged.
 8. Hang up and check `./data/transcripts` for the saved caller and assistant transcript.
 9. Check `./data/phone_book.json` to confirm caller details are being remembered by caller ID. Editable fields are `first_name`, `last_name`, `email`, `company`, `timezone`, `preferred_language`, and `notes`.
    Confirm that the seeded `*` and `__no_caller_id__` policy entries exist and default to `disabled: true`.
@@ -51,6 +76,7 @@ curl -sS http://127.0.0.1:8089/v1/status | jq
    Confirm that an unknown caller is rejected while `*` remains disabled.
 10. Email should not be written immediately. The agent should read it back and get a confirmation first; only then should it appear in the phone book.
 11. Check `./accounting/api_calls.csv` and `./accounting/call_totals.csv` for per-request and per-call token/cost accounting.
+    When local sherpa-onnx STT/TTS is active, the speech rows should show `local://sherpa-onnx/...` endpoints and zero API cost for those speech turns.
 
 ## Remote build
 
