@@ -1,0 +1,12 @@
+[project]
+name = "agent-voice-local-speech"
+version = "0.1.0"
+description = "Python runtime dependencies for local sherpa-onnx speech backends."
+requires-python = ">=3.10"
+dependencies = [
+  "sherpa-onnx==1.12.29",
+  "sherpa-onnx-bin==1.12.29",
+]
+
+[tool.uv]
+package = false
