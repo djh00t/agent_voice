@@ -28,13 +28,15 @@ use crate::phonebook::{
     CallerUpdate, PhoneBookStore, caller_id_display, is_valid_timezone, normalize_caller_id,
     normalize_email_candidate,
 };
+use crate::speech::{SpeechServices, SynthesisOutcome};
 
 #[derive(Clone)]
 /// The long-running SIP voice service used by the local agent API.
 pub struct VoiceAgentService {
     config: AppConfig,
     phone: Phone,
-    openai: OpenAiClients,
+    llm: OpenAiClients,
+    speech: SpeechServices,
     phone_book: Arc<PhoneBookStore>,
     accounting: Arc<AccountingStore>,
     state: Arc<ServiceState>,
@@ -44,19 +46,17 @@ impl VoiceAgentService {
     /// Constructs a new voice service from fully resolved configuration.
     pub async fn new(config: AppConfig) -> Result<Self> {
         let phone = Phone::new(config.phone_config());
-        let openai = OpenAiClients::new(config.openai.clone())?;
+        let llm = OpenAiClients::new(config.openai.clone())?;
+        let speech = SpeechServices::new(config.speech.clone(), config.openai.clone())?;
         let phone_book = Arc::new(PhoneBookStore::load(&config.behavior.phone_book_path)?);
         let accounting = Arc::new(AccountingStore::load(&config.accounting)?);
-        accounting.validate_required_models([
-            config.openai.transcription_model.as_str(),
-            config.openai.response_model.as_str(),
-            config.openai.tts_model.as_str(),
-        ])?;
+        speech.validate_required_models(&accounting, &config.openai)?;
         let state = Arc::new(ServiceState::default());
         Ok(Self {
             config,
             phone,
-            openai,
+            llm,
+            speech,
             phone_book,
             accounting,
             state,
@@ -103,6 +103,9 @@ impl VoiceAgentService {
     pub fn status(&self) -> ServiceStatus {
         ServiceStatus {
             phone_state: self.phone.state().to_string(),
+            stt_backend: self.speech.stt_backend_name().to_string(),
+            tts_backend: self.speech.tts_backend_name().to_string(),
+            tts_model: self.speech.tts_model_name(),
             calls: self
                 .state
                 .calls
@@ -167,9 +170,9 @@ impl VoiceAgentService {
             .cloned()
             .ok_or_else(|| anyhow!("unknown call id {}", call_id))?;
         let tts_started = Instant::now();
-        let pcm = self.openai.speak_text(&text, voice, instructions).await?;
+        let synthesis = self.speech.speak_text(&text, voice, instructions).await?;
         let tts_ms = tts_started.elapsed().as_millis();
-        let sample_count = pcm.len();
+        let sample_count = synthesis.pcm.len();
         let playback_ms = pcm_playback_ms(sample_count);
         let tx = call
             .speaker_tx
@@ -179,9 +182,9 @@ impl VoiceAgentService {
         call.suppress_input_for(StdDuration::from_millis(
             playback_ms.saturating_add(self.config.behavior.post_tts_input_suppression_ms),
         ));
-        tx.send(pcm)
+        self.record_tts_call(&call, "tts.manual", &text, &synthesis, tts_ms)?;
+        tx.send(synthesis.pcm)
             .map_err(|_| anyhow!("paced pcm channel closed"))?;
-        self.record_tts_call(&call, "tts.manual", &text, sample_count, tts_ms)?;
         call.record_assistant_text(text);
         Ok(())
     }
@@ -320,7 +323,8 @@ impl VoiceAgentService {
         });
 
         let runtime = tokio::runtime::Handle::current();
-        let openai_cfg = self.config.openai.clone();
+        let llm = self.llm.clone();
+        let speech = self.speech.clone();
         let behavior_cfg = self.config.behavior.clone();
         let phone_book = Arc::clone(&self.phone_book);
         let accounting = Arc::clone(&self.accounting);
@@ -328,7 +332,8 @@ impl VoiceAgentService {
         let record_for_media = Arc::clone(&record);
         call.on_media(move || {
             let runtime = runtime.clone();
-            let openai_cfg = openai_cfg.clone();
+            let llm = llm.clone();
+            let speech = speech.clone();
             let behavior_cfg = behavior_cfg.clone();
             let phone_book = Arc::clone(&phone_book);
             let accounting = Arc::clone(&accounting);
@@ -336,7 +341,8 @@ impl VoiceAgentService {
             let record = Arc::clone(&record_for_media);
             runtime.spawn(async move {
                 if let Err(error) = activate_media_bridge(
-                    openai_cfg,
+                    llm,
+                    speech,
                     behavior_cfg,
                     phone_book,
                     accounting,
@@ -351,7 +357,8 @@ impl VoiceAgentService {
         });
 
         activate_media_bridge(
-            self.config.openai.clone(),
+            self.llm.clone(),
+            self.speech.clone(),
             self.config.behavior.clone(),
             Arc::clone(&self.phone_book),
             Arc::clone(&self.accounting),
@@ -418,22 +425,10 @@ impl VoiceAgentService {
         call: &ManagedCall,
         operation: &str,
         text: &str,
-        sample_count: usize,
+        synthesis: &SynthesisOutcome,
         duration_ms: u128,
     ) -> Result<()> {
-        let usage = TokenUsage {
-            input_text_tokens: self
-                .accounting
-                .estimate_text_tokens(&self.config.openai.tts_model, text),
-            cached_input_text_tokens: 0,
-            output_text_tokens: 0,
-            input_audio_tokens: 0,
-            output_audio_tokens: self.accounting.estimate_output_audio_tokens(
-                &self.config.openai.tts_model,
-                sample_count,
-                TELEPHONY_RATE,
-            ),
-        };
+        let usage = tts_usage_for_outcome(&self.accounting, synthesis, text);
         let at = rfc3339_now();
         let entry = self.accounting.record_api_call(
             ApiCallContext {
@@ -442,11 +437,11 @@ impl VoiceAgentService {
                 direction: &call.direction,
                 peer: &call.peer,
                 operation,
-                endpoint: &self.config.openai.audio_api_url,
-                model: &self.config.openai.tts_model,
+                endpoint: &synthesis.endpoint,
+                model: &synthesis.model,
                 duration_ms,
-                usage_source: "estimated",
-                estimated: true,
+                usage_source: synthesis.usage_source,
+                estimated: synthesis.estimated,
             },
             usage,
         )?;
@@ -454,13 +449,14 @@ impl VoiceAgentService {
         info!(
             call_id = %call.call.call_id(),
             operation,
+            backend = synthesis.backend,
             model = %entry.model,
             estimated = entry.estimated,
             cost_usd = format_args!("{:.8}", entry.cost_usd),
             input_text_tokens = entry.input_text_tokens,
             output_audio_tokens = entry.output_audio_tokens,
             total_call_cost_usd = format_args!("{:.8}", call.accounting_summary().total_cost_usd),
-            "recorded OpenAI API accounting entry"
+            "recorded TTS accounting entry"
         );
         Ok(())
     }
@@ -476,6 +472,9 @@ struct ServiceState {
 /// A serialized snapshot of overall service state for the control API.
 pub struct ServiceStatus {
     pub phone_state: String,
+    pub stt_backend: String,
+    pub tts_backend: String,
+    pub tts_model: String,
     pub calls: Vec<CallSnapshot>,
 }
 
@@ -787,6 +786,15 @@ struct SanitizedCallerUpdate {
     pending_email_confirmation: Option<String>,
 }
 
+#[derive(Clone)]
+struct MediaBridgeContext {
+    llm: OpenAiClients,
+    speech: SpeechServices,
+    phone_book: Arc<PhoneBookStore>,
+    accounting: Arc<AccountingStore>,
+    behavior: BehaviorConfig,
+}
+
 impl TranscriptSink for ManagedCall {
     fn push_event(&self, event: TranscriptEvent) {
         self.transcript_events.write().push(event);
@@ -798,7 +806,8 @@ impl TranscriptSink for ManagedCall {
 }
 
 async fn activate_media_bridge(
-    openai_config: crate::config::OpenAiConfig,
+    llm: OpenAiClients,
+    speech: SpeechServices,
     behavior: BehaviorConfig,
     phone_book: Arc<PhoneBookStore>,
     accounting: Arc<AccountingStore>,
@@ -824,22 +833,30 @@ async fn activate_media_bridge(
         }
     };
 
-    let openai = OpenAiClients::new(openai_config)?;
     record.set_speaker_tx(speaker_tx.clone());
     record.set_status(call.state().to_string());
     info!(
         call_id = %record.call.call_id(),
+        stt_backend = speech.stt_backend_name(),
+        tts_backend = speech.tts_backend_name(),
         turn_silence_ms = behavior.turn_silence_ms,
         min_utterance_ms = behavior.min_utterance_ms,
         vad_threshold = behavior.vad_threshold,
         "started conversational media workflow"
     );
+    let bridge = MediaBridgeContext {
+        llm,
+        speech,
+        phone_book,
+        accounting,
+        behavior: behavior.clone(),
+    };
 
     let record_clone = Arc::clone(&record);
     let runtime = tokio::runtime::Handle::current();
     let speaker_tx_clone = speaker_tx.clone();
     std::thread::spawn(move || {
-        let mut turn_detector = TurnDetector::new(&behavior);
+        let mut turn_detector = TurnDetector::new(&bridge.behavior);
         while let Ok(frame) = pcm_rx.recv() {
             if record_clone.input_is_suppressed() {
                 turn_detector.reset();
@@ -847,10 +864,7 @@ async fn activate_media_bridge(
             }
             if let Some(utterance) = turn_detector.push_frame(&frame)
                 && let Err(error) = runtime.block_on(process_detected_utterance(
-                    &openai,
-                    Arc::clone(&phone_book),
-                    Arc::clone(&accounting),
-                    behavior.clone(),
+                    &bridge,
                     Arc::clone(&record_clone),
                     speaker_tx_clone.clone(),
                     utterance,
@@ -861,10 +875,7 @@ async fn activate_media_bridge(
         }
         if let Some(utterance) = turn_detector.finish()
             && let Err(error) = runtime.block_on(process_detected_utterance(
-                &openai,
-                Arc::clone(&phone_book),
-                Arc::clone(&accounting),
-                behavior.clone(),
+                &bridge,
                 Arc::clone(&record_clone),
                 speaker_tx_clone,
                 utterance,
@@ -878,10 +889,7 @@ async fn activate_media_bridge(
 }
 
 async fn process_detected_utterance(
-    openai: &OpenAiClients,
-    phone_book: Arc<PhoneBookStore>,
-    accounting: Arc<AccountingStore>,
-    behavior: BehaviorConfig,
+    bridge: &MediaBridgeContext,
     record: Arc<ManagedCall>,
     speaker_tx: crossbeam_channel::Sender<Vec<i16>>,
     utterance: Vec<i16>,
@@ -895,24 +903,25 @@ async fn process_detected_utterance(
     let turn_started = Instant::now();
     info!(
         call_id = %record.call.call_id(),
+        backend = bridge.speech.stt_backend_name(),
         samples = utterance.len(),
         gap_since_previous_turn_ms = ?gap_since_previous_turn_ms,
         "sending caller audio to STT"
     );
     let wav = encode_wav_mono_i16(&utterance, TELEPHONY_RATE)?;
     let stt_started = Instant::now();
-    let transcription = openai.transcribe_wav(wav).await?;
+    let transcription = bridge.speech.transcribe_wav(wav).await?;
     let stt_ms = stt_started.elapsed().as_millis();
     let stt_entry = record_api_call(
-        &accounting,
+        &bridge.accounting,
         &record,
         LoggedApiCall {
             operation: "transcription",
-            endpoint: &openai.config().transcription_api_url,
-            model: &openai.config().transcription_model,
+            endpoint: &transcription.endpoint,
+            model: &transcription.model,
             duration_ms: stt_ms,
-            usage_source: "api",
-            estimated: false,
+            usage_source: transcription.usage_source,
+            estimated: transcription.estimated,
             usage: transcription.usage.clone(),
         },
     )?;
@@ -932,17 +941,18 @@ async fn process_detected_utterance(
     record.note_activity();
     let transcript_history = record.transcript_history();
 
-    reconcile_pending_email_confirmation(&phone_book, &record, caller_text)?;
+    reconcile_pending_email_confirmation(&bridge.phone_book, &record, caller_text)?;
 
     let caller_profile = record
         .phone_book_key
         .as_deref()
-        .and_then(|key| phone_book.get(key));
+        .and_then(|key| bridge.phone_book.get(key));
 
     let extraction_started = Instant::now();
     if let Some(phone_book_key) = record.phone_book_key.as_deref()
         && should_extract_caller_update(&transcript_history, &record, caller_text)
-        && let Ok(update) = openai
+        && let Ok(update) = bridge
+            .llm
             .extract_caller_update(
                 &windowed_transcript(&transcript_history, 4),
                 caller_profile.as_ref(),
@@ -956,33 +966,36 @@ async fn process_detected_utterance(
         }
         let extraction_ms = extraction_started.elapsed().as_millis();
         let _ = record_api_call(
-            &accounting,
+            &bridge.accounting,
             &record,
             LoggedApiCall {
                 operation: "responses.contact_extraction",
-                endpoint: &openai.config().responses_api_url,
-                model: &openai.config().response_model,
+                endpoint: &bridge.llm.config().responses_api_url,
+                model: &bridge.llm.config().response_model,
                 duration_ms: extraction_ms,
                 usage_source: "api",
                 estimated: false,
                 usage: extraction_usage,
             },
         )?;
-        if let Err(error) = phone_book.merge_update(phone_book_key, sanitized_update.update) {
+        if let Err(error) = bridge
+            .phone_book
+            .merge_update(phone_book_key, sanitized_update.update)
+        {
             warn!(call_id = %record.call.call_id(), error = %error, "failed to persist caller update");
         }
     }
     let extraction_ms = extraction_started.elapsed().as_millis();
 
     let context = ConversationContext {
-        assistant_name: behavior.assistant_name.clone(),
+        assistant_name: bridge.behavior.assistant_name.clone(),
         caller_id: record.peer.clone(),
         phone_book_writable: record.phone_book_key.is_some(),
         time_of_day: time_of_day_label(
             caller_profile
                 .as_ref()
                 .and_then(|caller| caller.timezone.as_deref())
-                .unwrap_or(&behavior.default_timezone),
+                .unwrap_or(&bridge.behavior.default_timezone),
         ),
         missing_fields: caller_profile
             .as_ref()
@@ -1008,23 +1021,25 @@ async fn process_detected_utterance(
     info!(
         call_id = %record.call.call_id(),
         transcript_events = transcript_history.len(),
-        context_window_events = behavior.context_window_events,
+        context_window_events = bridge.behavior.context_window_events,
         "sending transcript history to LLM"
     );
-    let context_history = windowed_transcript(&transcript_history, behavior.context_window_events);
+    let context_history =
+        windowed_transcript(&transcript_history, bridge.behavior.context_window_events);
     let previous_response_id = record.last_reply_response_id();
     let llm_started = Instant::now();
-    let response = openai
+    let response = bridge
+        .llm
         .generate_response_with_context(&context_history, &context, previous_response_id.as_deref())
         .await?;
     let llm_ms = llm_started.elapsed().as_millis();
     let llm_entry = record_api_call(
-        &accounting,
+        &bridge.accounting,
         &record,
         LoggedApiCall {
             operation: "responses.reply",
-            endpoint: &openai.config().responses_api_url,
-            model: &openai.config().response_model,
+            endpoint: &bridge.llm.config().responses_api_url,
+            model: &bridge.llm.config().response_model,
             duration_ms: llm_ms,
             usage_source: "api",
             estimated: false,
@@ -1032,7 +1047,7 @@ async fn process_detected_utterance(
         },
     )?;
     let response_text = response.text.trim();
-    let should_end_call = response.end_call && behavior.auto_end_calls;
+    let should_end_call = response.end_call && bridge.behavior.auto_end_calls;
     if response_text.is_empty() {
         info!(call_id = %record.call.call_id(), "LLM returned empty assistant response");
         return Ok(());
@@ -1049,24 +1064,26 @@ async fn process_detected_utterance(
     );
     info!(
         call_id = %record.call.call_id(),
+        backend = bridge.speech.tts_backend_name(),
         chars = response_text.len(),
         "sending assistant text to TTS"
     );
     let (tts_ms, tts_entry, playback_ms, idle_generation) = queue_assistant_tts(
-        openai,
-        &accounting,
+        &bridge.speech,
+        &bridge.accounting,
         &record,
         &speaker_tx,
         response_text,
         "tts.reply",
-        behavior.post_tts_input_suppression_ms,
+        bridge.behavior.post_tts_input_suppression_ms,
     )
     .await?;
-    let suppression_ms = playback_ms.saturating_add(behavior.post_tts_input_suppression_ms);
+    let suppression_ms =
+        playback_ms.saturating_add(bridge.behavior.post_tts_input_suppression_ms);
     info!(
         call_id = %record.call.call_id(),
         playback_ms,
-        post_tts_input_suppression_ms = behavior.post_tts_input_suppression_ms,
+        post_tts_input_suppression_ms = bridge.behavior.post_tts_input_suppression_ms,
         suppression_ms,
         "suppressing inbound turn detection during assistant playback"
     );
@@ -1074,13 +1091,13 @@ async fn process_detected_utterance(
         schedule_end_call(
             Arc::clone(&record),
             playback_ms,
-            behavior.end_call_buffer_ms,
+            bridge.behavior.end_call_buffer_ms,
         );
     } else {
         schedule_idle_prompt(
-            openai.clone(),
-            Arc::clone(&accounting),
-            behavior.clone(),
+            bridge.speech.clone(),
+            Arc::clone(&bridge.accounting),
+            bridge.behavior.clone(),
             Arc::clone(&record),
             speaker_tx.clone(),
             playback_ms,
@@ -1123,7 +1140,7 @@ async fn process_detected_utterance(
 }
 
 async fn queue_assistant_tts(
-    openai: &OpenAiClients,
+    speech: &SpeechServices,
     accounting: &Arc<AccountingStore>,
     record: &Arc<ManagedCall>,
     speaker_tx: &crossbeam_channel::Sender<Vec<i16>>,
@@ -1132,45 +1149,56 @@ async fn queue_assistant_tts(
     post_tts_input_suppression_ms: u64,
 ) -> Result<(u128, ApiCallLogEntry, u64, u64)> {
     let tts_started = Instant::now();
-    let pcm = openai.speak_text(text, None, None).await?;
+    let synthesis = speech.speak_text(text, None, None).await?;
     let tts_ms = tts_started.elapsed().as_millis();
     let tts_entry = record_api_call(
         accounting,
         record,
         LoggedApiCall {
             operation,
-            endpoint: &openai.config().audio_api_url,
-            model: &openai.config().tts_model,
+            endpoint: &synthesis.endpoint,
+            model: &synthesis.model,
             duration_ms: tts_ms,
-            usage_source: "estimated",
-            estimated: true,
-            usage: TokenUsage {
-                input_text_tokens: accounting.estimate_text_tokens(&openai.config().tts_model, text),
-                cached_input_text_tokens: 0,
-                output_text_tokens: 0,
-                input_audio_tokens: 0,
-                output_audio_tokens: accounting.estimate_output_audio_tokens(
-                    &openai.config().tts_model,
-                    pcm.len(),
-                    TELEPHONY_RATE,
-                ),
-            },
+            usage_source: synthesis.usage_source,
+            estimated: synthesis.estimated,
+            usage: tts_usage_for_outcome(accounting, &synthesis, text),
         },
     )?;
-    let playback_ms = pcm_playback_ms(pcm.len());
+    let playback_ms = pcm_playback_ms(synthesis.pcm.len());
     record.suppress_input_for(StdDuration::from_millis(
         playback_ms.saturating_add(post_tts_input_suppression_ms),
     ));
     speaker_tx
-        .send(pcm)
+        .send(synthesis.pcm)
         .map_err(|_| anyhow!("paced pcm channel closed"))?;
     record.record_assistant_text(text.to_string());
     let idle_generation = record.note_activity();
     Ok((tts_ms, tts_entry, playback_ms, idle_generation))
 }
 
+fn tts_usage_for_outcome(
+    accounting: &AccountingStore,
+    synthesis: &SynthesisOutcome,
+    text: &str,
+) -> TokenUsage {
+    if synthesis.backend == "openai" {
+        return TokenUsage {
+            input_text_tokens: accounting.estimate_text_tokens(&synthesis.model, text),
+            cached_input_text_tokens: 0,
+            output_text_tokens: 0,
+            input_audio_tokens: 0,
+            output_audio_tokens: accounting.estimate_output_audio_tokens(
+                &synthesis.model,
+                synthesis.pcm.len(),
+                TELEPHONY_RATE,
+            ),
+        };
+    }
+    synthesis.usage.clone()
+}
+
 fn schedule_idle_prompt(
-    openai: OpenAiClients,
+    speech: SpeechServices,
     accounting: Arc<AccountingStore>,
     behavior: BehaviorConfig,
     record: Arc<ManagedCall>,
@@ -1189,7 +1217,8 @@ fn schedule_idle_prompt(
         ))
         .await;
 
-        if record.end_requested.load(Ordering::SeqCst) || record.idle_generation() != idle_generation
+        if record.end_requested.load(Ordering::SeqCst)
+            || record.idle_generation() != idle_generation
         {
             return;
         }
@@ -1200,7 +1229,7 @@ fn schedule_idle_prompt(
             "sending idle reprompt to keep call active"
         );
         if let Err(error) = queue_assistant_tts(
-            &openai,
+            &speech,
             &accounting,
             &record,
             &speaker_tx,
@@ -1273,6 +1302,7 @@ fn record_api_call(
     info!(
         call_id = %record.call.call_id(),
         operation = %entry.operation,
+        endpoint = %entry.endpoint,
         model = %entry.model,
         estimated = entry.estimated,
         usage_source = %entry.usage_source,
@@ -1285,7 +1315,7 @@ fn record_api_call(
         output_audio_tokens = entry.output_audio_tokens,
         total_tokens = entry.total_tokens,
         total_call_cost_usd = format_args!("{:.8}", record.accounting_summary().total_cost_usd),
-        "recorded OpenAI API accounting entry"
+        "recorded API accounting entry"
     );
     Ok(entry)
 }
@@ -1788,10 +1818,18 @@ mod tests {
 
     #[test]
     fn caller_text_indicates_profile_update_detects_contact_fields() {
-        assert!(caller_text_indicates_profile_update("My email is david@example.com"));
-        assert!(caller_text_indicates_profile_update("My last name is Hooton"));
-        assert!(caller_text_indicates_profile_update("I work at Example Corp"));
-        assert!(!caller_text_indicates_profile_update("Can you tell me a joke?"));
+        assert!(caller_text_indicates_profile_update(
+            "My email is david@example.com"
+        ));
+        assert!(caller_text_indicates_profile_update(
+            "My last name is Hooton"
+        ));
+        assert!(caller_text_indicates_profile_update(
+            "I work at Example Corp"
+        ));
+        assert!(!caller_text_indicates_profile_update(
+            "Can you tell me a joke?"
+        ));
     }
 
     #[test]
