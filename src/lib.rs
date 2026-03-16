@@ -4,6 +4,7 @@
 //!
 //! - SIP call control and media orchestration
 //! - telephony audio encoding and resampling helpers
+//! - local sherpa-onnx speech backends managed through uv
 //! - OpenAI STT, TTS, and responses integrations
 //! - a persistent caller phone book
 //! - per-call accounting and cost tracking
@@ -23,3 +24,7 @@ pub mod openai;
 pub mod phonebook;
 /// SIP call orchestration and runtime service state.
 pub mod service;
+/// Local sherpa-onnx speech bridge support.
+pub mod sherpa_onnx;
+/// Runtime speech backend dispatch and provider selection.
+pub mod speech;
