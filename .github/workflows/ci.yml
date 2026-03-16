@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - main
-      - fix/**
 
 permissions:
   contents: read
@@ -51,4 +50,4 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Validate Compose configuration
-        run: docker compose --env-file .env.example config
+        run: make compose-config
