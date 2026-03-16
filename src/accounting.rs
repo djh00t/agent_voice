@@ -364,7 +364,10 @@ impl AccountingStore {
     pub fn record_call_total(&self, entry: &CallTotalsLogEntry) -> Result<()> {
         let _guard = self.write_lock.lock();
         let call_totals_path = self.safe_log_path(&self.call_totals_csv_path)?;
-        ensure_parent_dir(&call_totals_path)?;
+        let call_totals_path_str = call_totals_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("call_totals_path is not valid UTF-8"))?;
+        ensure_parent_dir(call_totals_path_str)?;
         let file_exists = Path::new(&call_totals_path).exists();
         let mut file = OpenOptions::new()
             .create(true)
