@@ -317,20 +317,39 @@ impl AccountingStore {
     /// Resolve a potentially untrusted log path relative to the current directory
     /// and ensure it does not escape that base directory.
     fn safe_log_path<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
-        let base_dir = env::current_dir().context("failed to get current working directory")?;
-        let candidate = base_dir.join(path.as_ref());
-        let canonical = candidate
+        // Canonicalize the current directory as a trusted base.
+        let base_dir = env::current_dir()
+            .context("failed to get current working directory")?
             .canonicalize()
-            .or_else(|_| {
-                // If the file does not exist yet, ensure parent exists within base_dir,
-                // and use the joined path without canonicalization for the safety check.
-                Ok(candidate.clone())
-            })
-            .with_context(|| format!("failed to resolve log path {:?}", candidate))?;
-        if !canonical.starts_with(&base_dir) {
-            bail!("log path escapes base directory");
+            .context("failed to canonicalize current working directory")?;
+
+        // Lexically normalize the provided path relative to base_dir, rejecting
+        // any attempt to escape via `..` or use absolute paths.
+        let mut normalized = base_dir.clone();
+        for comp in path.as_ref().components() {
+            use std::path::Component;
+            match comp {
+                Component::Prefix(_) | Component::RootDir => {
+                    // Absolute paths are not allowed.
+                    bail!("absolute log paths are not allowed");
+                }
+                Component::CurDir => {
+                    // Ignore `.` components.
+                }
+                Component::Normal(segment) => {
+                    normalized.push(segment);
+                }
+                Component::ParentDir => {
+                    // Attempt to go up one level; ensure we don't escape base_dir.
+                    let popped = normalized.pop();
+                    if !popped || !normalized.starts_with(&base_dir) {
+                        bail!("log path escapes base directory");
+                    }
+                }
+            }
         }
-        Ok(canonical)
+
+        Ok(normalized)
     }
 
     pub fn record_api_call(
