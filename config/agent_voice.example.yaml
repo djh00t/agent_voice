@@ -23,6 +23,8 @@ openai:
   audio_api_url: "https://api.openai.com/v1/audio/speech"
   transcription_model: "gpt-4o-transcribe"
   transcription_api_url: "https://api.openai.com/v1/audio/transcriptions"
+  http_connect_timeout_ms: 5000
+  http_timeout_ms: 30000
   tts_model: "gpt-4o-mini-tts"
   tts_voice: "alloy"
   tts_instructions: "Speak in a cheerful, upbeat, warm, and helpful tone with a friendly Australian accent. Sound engaged and natural, not flat, stiff, or monotone."
@@ -35,6 +37,38 @@ openai:
 
 agent_api:
   listen: "127.0.0.1:8089"
+
+speech:
+  stt_provider: "openai"
+  tts_provider: "openai"
+  sherpa_onnx:
+    python_bin: "./.venv/bin/python"
+    bridge_script: "./python/sherpa_onnx_bridge.py"
+    provider: "cpu"
+    num_threads: 2
+    debug: false
+    stt:
+      model_family: "moonshine"
+      moonshine:
+        version: "v1"
+        preprocessor: "./models/stt/moonshine/preprocess.onnx"
+        encoder: "./models/stt/moonshine/encode.int8.onnx"
+        uncached_decoder: "./models/stt/moonshine/uncached_decode.int8.onnx"
+        cached_decoder: "./models/stt/moonshine/cached_decode.int8.onnx"
+        decoder: ""
+        tokens: "./models/stt/moonshine/tokens.txt"
+    tts:
+      model_family: "kokoro"
+      speed: 1.0
+      speaker_id: 2
+      kokoro:
+        model: "./models/tts/kokoro/model.onnx"
+        voices: "./models/tts/kokoro/voices.bin"
+        tokens: "./models/tts/kokoro/tokens.txt"
+        data_dir: "./models/tts/kokoro/espeak-ng-data"
+        lexicon: "./models/tts/kokoro/lexicon-gb-en.txt,./models/tts/kokoro/lexicon-zh.txt"
+        dict_dir: ""
+        lang: ""
 
 accounting:
   model_catalog_path: "./accounting/models.json"
