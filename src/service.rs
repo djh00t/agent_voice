@@ -47,7 +47,7 @@ impl VoiceAgentService {
     pub async fn new(config: AppConfig) -> Result<Self> {
         let phone = Phone::new(config.phone_config());
         let llm = OpenAiClients::new(config.openai.clone())?;
-        let speech = SpeechServices::new(config.speech.clone(), config.openai.clone())?;
+        let speech = SpeechServices::new(config.speech.clone(), config.openai.clone()).await?;
         let phone_book = Arc::new(PhoneBookStore::load(&config.behavior.phone_book_path)?);
         let accounting = Arc::new(AccountingStore::load(&config.accounting)?);
         speech.validate_required_models(&accounting, &config.openai)?;
@@ -1078,8 +1078,7 @@ async fn process_detected_utterance(
         bridge.behavior.post_tts_input_suppression_ms,
     )
     .await?;
-    let suppression_ms =
-        playback_ms.saturating_add(bridge.behavior.post_tts_input_suppression_ms);
+    let suppression_ms = playback_ms.saturating_add(bridge.behavior.post_tts_input_suppression_ms);
     info!(
         call_id = %record.call.call_id(),
         playback_ms,
