@@ -1,6 +1,6 @@
 //! Runtime SIP call orchestration, media handling, and local control surface.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1456,11 +1456,13 @@ fn record_api_call(
 
 struct TurnDetector {
     buffer: Vec<i16>,
+    pre_roll: VecDeque<Vec<i16>>,
     speaking: bool,
     silent_frames: usize,
     speech_frames: usize,
     silence_frames_needed: usize,
     min_frames: usize,
+    pre_roll_frames: usize,
     vad_threshold: i32,
 }
 
@@ -1470,13 +1472,16 @@ impl TurnDetector {
         let silence_frames_needed =
             behavior.turn_silence_ms.max(frame_ms).div_ceil(frame_ms) as usize;
         let min_frames = behavior.min_utterance_ms.max(frame_ms).div_ceil(frame_ms) as usize;
+        let pre_roll_frames = 250_u64.div_ceil(frame_ms) as usize;
         Self {
             buffer: Vec::new(),
+            pre_roll: VecDeque::with_capacity(pre_roll_frames),
             speaking: false,
             silent_frames: 0,
             speech_frames: 0,
             silence_frames_needed,
             min_frames,
+            pre_roll_frames,
             vad_threshold: i32::from(behavior.vad_threshold),
         }
     }
@@ -1485,6 +1490,12 @@ impl TurnDetector {
         let is_speech = frame_average_amplitude(frame) >= self.vad_threshold;
 
         if is_speech {
+            if !self.speaking {
+                self.speaking = true;
+                while let Some(history) = self.pre_roll.pop_front() {
+                    self.buffer.extend_from_slice(&history);
+                }
+            }
             self.speaking = true;
             self.silent_frames = 0;
             self.speech_frames += 1;
@@ -1498,6 +1509,8 @@ impl TurnDetector {
             if self.silent_frames >= self.silence_frames_needed {
                 return self.finish();
             }
+        } else {
+            self.remember_pre_roll(frame);
         }
 
         None
@@ -1508,6 +1521,7 @@ impl TurnDetector {
         self.speaking = false;
         self.silent_frames = 0;
         self.speech_frames = 0;
+        self.pre_roll.clear();
         if should_emit {
             Some(std::mem::take(&mut self.buffer))
         } else {
@@ -1521,6 +1535,14 @@ impl TurnDetector {
         self.silent_frames = 0;
         self.speech_frames = 0;
         self.buffer.clear();
+        self.pre_roll.clear();
+    }
+
+    fn remember_pre_roll(&mut self, frame: &[i16]) {
+        if self.pre_roll.len() == self.pre_roll_frames {
+            self.pre_roll.pop_front();
+        }
+        self.pre_roll.push_back(frame.to_vec());
     }
 }
 
@@ -2003,6 +2025,40 @@ mod tests {
 
         let utterance = utterance.expect("utterance after silence");
         assert!(utterance.len() >= TELEPHONY_FRAME_SAMPLES * 12);
+    }
+
+    #[test]
+    fn turn_detector_keeps_soft_leading_audio_before_threshold_crossing() {
+        let behavior = test_behavior();
+        let mut detector = TurnDetector::new(&behavior);
+
+        for _ in 0..4 {
+            assert!(
+                detector
+                    .push_frame(&vec![80; TELEPHONY_FRAME_SAMPLES])
+                    .is_none()
+            );
+        }
+
+        for _ in 0..12 {
+            assert!(
+                detector
+                    .push_frame(&vec![500; TELEPHONY_FRAME_SAMPLES])
+                    .is_none()
+            );
+        }
+
+        let mut utterance = None;
+        for _ in 0..20 {
+            utterance = detector.push_frame(&vec![0; TELEPHONY_FRAME_SAMPLES]);
+            if utterance.is_some() {
+                break;
+            }
+        }
+
+        let utterance = utterance.expect("utterance after silence");
+        assert_eq!(utterance.first().copied(), Some(80));
+        assert!(utterance.len() >= TELEPHONY_FRAME_SAMPLES * 16);
     }
 
     #[test]
