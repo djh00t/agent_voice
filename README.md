@@ -125,6 +125,8 @@ The current local implementation supports:
 
 - Moonshine for offline STT
 - Kokoro for offline TTS
+- persistent preloaded STT and TTS worker processes
+- startup warmup so the first real greeting or caller turn does not pay the full model-load cost
 - numeric `speaker_id` selection for built-in Kokoro voices
 
 True custom voice creation is not part of the current runtime path yet.
@@ -179,7 +181,7 @@ make docker-logs
 
 The container runs from environment variables by default. If you prefer a mounted YAML file, add a bind mount and set `AGENT_VOICE_CONFIG=/app/config/agent_voice.yaml`.
 The Makefile-backed Compose targets automatically use `.env` when present and fall back to `.env.example` for build and config rendering.
-`make docker-build` first compiles `target/release/agent_voice` on the host and then packages that binary into the runtime image, so the Docker build does not need cargo registry access.
+`make docker-build` first runs `cargo build` on the host and then packages `target/debug/agent_voice` into the runtime image, which avoids the release-build cross-device issue on this host.
 The bundled Compose file sets `AGENT_VOICE_CONFIG=/app/config/agent_voice.yaml` so the mounted YAML baseline is always readable inside the container, but environment variables still override that file on startup.
 Compose defaults the container user to `0:0` so it can refresh the mounted pricing catalog and append accounting CSV rows on bind-mounted host directories. Override `AGENT_VOICE_UID` and `AGENT_VOICE_GID` if you want a different runtime user.
 Inbound auto-answer delay is controlled with `INCOMING_ANSWER_DELAY_MS`. Set it to `2000` for a two-second delay before answering.
