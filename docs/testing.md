@@ -26,6 +26,7 @@ Then set these in `.env`:
 ```bash
 SPEECH_STT_PROVIDER=sherpa_onnx
 SPEECH_TTS_PROVIDER=sherpa_onnx
+SHERPA_ONNX_WARMUP_ON_STARTUP=true
 ```
 
 The default example paths assume:
@@ -45,10 +46,10 @@ The default example paths assume:
    Set `CALL_CONTEXT_WINDOW_EVENTS=8` to keep only a bounded recent window in LLM context.
    Leave `ACCOUNTING_REFRESH_PRICING_ON_STARTUP=true` if you want the container to refresh `./accounting/models.json` from the official OpenAI pricing page at boot.
    Set `SPEECH_STT_PROVIDER=sherpa_onnx` and `SPEECH_TTS_PROVIDER=sherpa_onnx` if you want local Moonshine STT plus local Kokoro TTS instead of OpenAI speech.
+   Leave `SHERPA_ONNX_WARMUP_ON_STARTUP=true` if you want the container to preload and warm the local speech workers at boot.
 3. Build and start:
 
 ```bash
-cargo build --release
 docker compose build
 docker compose up -d
 docker compose logs -f
@@ -62,6 +63,7 @@ curl -sS http://127.0.0.1:8089/v1/status | jq
 ```
 
    Confirm `/v1/status` reports the expected `stt_backend` and `tts_backend`.
+   Watch the startup logs for `persistent sherpa-onnx worker ready` so you know the local speech models are preloaded before the first call.
 
 5. Place or receive a SIP call.
 6. Confirm the call answers after two seconds and plays `Welcome`.
