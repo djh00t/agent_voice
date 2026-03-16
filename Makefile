@@ -9,7 +9,7 @@ SHERPA_MOONSHINE_DIR ?= sherpa-onnx-moonshine-tiny-en-int8
 SHERPA_KOKORO_URL ?= https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_1.tar.bz2
 SHERPA_KOKORO_DIR ?= kokoro-multi-lang-v1_1
 
-.PHONY: help fmt test lint doc uv-lock uv-sync local-speech-check sherpa-download-moonshine sherpa-download-kokoro sherpa-download-models release-bin docs-install docs-build docs-serve docs-audit check docker-build docker-up docker-logs docker-down compose-config release-check clean
+.PHONY: help fmt test lint doc uv-lock uv-sync local-speech-check sherpa-download-moonshine sherpa-download-kokoro sherpa-download-models build-bin release-bin docs-install docs-build docs-serve docs-audit check docker-build docker-up docker-logs docker-down compose-config release-check clean
 
 help:
 	@printf '%s\n' \
@@ -23,6 +23,7 @@ help:
 		'make sherpa-download-moonshine - download the example Moonshine STT model set' \
 		'make sherpa-download-kokoro - download the example Kokoro TTS model set' \
 		'make sherpa-download-models - download both example local speech model sets' \
+		'make build-bin      - build the host debug Rust binary used by docker-build' \
 		'make release-bin    - build the release Rust binary for Docker packaging' \
 		'make docs-install   - install Docusaurus dependencies' \
 		'make docs-build     - build the Docusaurus site' \
@@ -76,6 +77,9 @@ sherpa-download-kokoro:
 
 sherpa-download-models: sherpa-download-moonshine sherpa-download-kokoro
 
+build-bin:
+	cargo build
+
 release-bin:
 	cargo build --release
 
@@ -93,7 +97,7 @@ docs-audit:
 
 check: test lint doc docs-build
 
-docker-build: release-bin
+docker-build: build-bin
 	docker compose --env-file $(COMPOSE_ENV_FILE) build
 
 docker-up:
@@ -108,7 +112,7 @@ docker-down:
 compose-config:
 	docker compose --env-file $(COMPOSE_ENV_FILE) config
 
-release-check: local-speech-check docs-install test lint doc docs-build release-bin docker-build compose-config
+release-check: local-speech-check docs-install test lint doc docs-build docker-build compose-config
 
 clean:
 	rm -rf target $(DOCS_DIR)/build $(DOCS_DIR)/.docusaurus
