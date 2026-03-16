@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::env;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -130,17 +131,28 @@ impl OpenAiClients {
             return Err(anyhow!("invalid TTS endpoint scheme: {}", tts_url.scheme()));
         }
 
-        // Restrict TTS requests to a known set of allowed hosts.
-        let allowed_hosts = [
-            "api.openai.com",
-            "api.groq.com",
-            "api.anthropic.com",
-        ];
-        let host = tts_url
-            .host_str()
-            .ok_or_else(|| anyhow!("TTS endpoint is missing host"))?;
-        if !allowed_hosts.contains(&host) {
-            return Err(anyhow!("untrusted TTS endpoint host: {}", host));
+        // Optionally restrict TTS requests to a configured set of allowed hosts.
+        // If the OPENAI_AUDIO_ALLOWED_HOSTS env var is set (comma-separated list),
+        // only hosts in that list will be accepted. If it is unset or empty, any
+        // HTTPS host is allowed.
+        if let Ok(allowed_hosts_var) = env::var("OPENAI_AUDIO_ALLOWED_HOSTS") {
+            let allowed_hosts: Vec<&str> = allowed_hosts_var
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if !allowed_hosts.is_empty() {
+                let host = tts_url
+                    .host_str()
+                    .ok_or_else(|| anyhow!("TTS endpoint is missing host"))?;
+                let host_allowed = allowed_hosts
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(host));
+                if !host_allowed {
+                    return Err(anyhow!("untrusted TTS endpoint host: {}", host));
+                }
+            }
         }
 
         debug!(
