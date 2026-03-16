@@ -46,6 +46,9 @@ speech:
     bridge_script: "./python/sherpa_onnx_bridge.py"
     provider: "cpu"
     num_threads: 2
+    warmup_on_startup: true
+    startup_timeout_ms: 120000
+    request_timeout_ms: 60000
     debug: false
     stt:
       model_family: "moonshine"
