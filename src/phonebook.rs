@@ -167,23 +167,41 @@ pub struct PhoneBookStore {
 impl PhoneBookStore {
     /// Loads the phone book from disk, creating an empty store when absent.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
-        let mut phone_book = if path.exists() {
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read phone book {}", path.display()))?;
-            serde_json::from_str(&raw)
-                .with_context(|| format!("failed to parse phone book {}", path.display()))?
+        let relative = path.into();
+        // Constrain the phone book path to a subdirectory of the current working directory
+        // to avoid writing outside of a controlled location.
+        let base_dir = std::env::current_dir()
+            .context("failed to determine current working directory for phone book")?;
+        let full_path = base_dir.join(relative);
+        let full_path = full_path
+            .canonicalize()
+            .or_else(|_| Ok(full_path))
+            .context("failed to resolve phone book path")?;
+        if !full_path.starts_with(&base_dir) {
+            return Err(anyhow::anyhow!(
+                "phone book path must reside under {}",
+                base_dir.display()
+            ));
+        }
+
+        let mut phone_book = if full_path.exists() {
+            let raw = fs::read_to_string(&full_path).with_context(|| {
+                format!("failed to read phone book {}", full_path.display())
+            })?;
+            serde_json::from_str(&raw).with_context(|| {
+                format!("failed to parse phone book {}", full_path.display())
+            })?
         } else {
             PhoneBook::default()
         };
         let seeded_entries = seed_policy_entries(&mut phone_book);
         sanitize_phone_book(&mut phone_book);
         if seeded_entries {
-            persist_phone_book(&path, &phone_book)?;
+            persist_phone_book(&full_path, &phone_book)?;
         }
 
         Ok(Self {
-            path,
+            path: full_path,
             phone_book: RwLock::new(phone_book),
         })
     }
