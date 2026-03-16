@@ -1163,7 +1163,7 @@ const fn default_min_utterance_ms() -> u64 {
 }
 
 const fn default_post_tts_input_suppression_ms() -> u64 {
-    1200
+    250
 }
 
 const fn default_idle_prompt_after_ms() -> u64 {
@@ -1175,7 +1175,7 @@ fn default_idle_prompt_text() -> String {
 }
 
 const fn default_vad_threshold() -> u16 {
-    500
+    250
 }
 
 const fn default_auto_end_calls() -> bool {
