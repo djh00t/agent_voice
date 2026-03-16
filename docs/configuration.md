@@ -38,6 +38,9 @@ That makes the Docker and Compose workflow environment-first while still allowin
 - `SHERPA_ONNX_BRIDGE_SCRIPT`
 - `SHERPA_ONNX_PROVIDER`
 - `SHERPA_ONNX_NUM_THREADS`
+- `SHERPA_ONNX_WARMUP_ON_STARTUP`
+- `SHERPA_ONNX_STARTUP_TIMEOUT_MS`
+- `SHERPA_ONNX_REQUEST_TIMEOUT_MS`
 - `SHERPA_ONNX_DEBUG`
 - `SHERPA_ONNX_STT_MODEL_FAMILY`
 - `SHERPA_ONNX_STT_MOONSHINE_PREPROCESSOR`
@@ -84,6 +87,8 @@ That makes the Docker and Compose workflow environment-first while still allowin
 When `SPEECH_STT_PROVIDER=sherpa_onnx`, caller audio is transcribed locally with the repo-managed uv environment and the configured Moonshine model files.
 
 When `SPEECH_TTS_PROVIDER=sherpa_onnx`, assistant speech is synthesized locally with the configured sherpa-onnx TTS model files. The current implementation supports Kokoro for local TTS and uses `SHERPA_ONNX_TTS_SPEAKER_ID` to select a built-in voice.
+
+The runtime starts persistent preloaded sherpa-onnx workers for the enabled local backends. `SHERPA_ONNX_WARMUP_ON_STARTUP` controls whether those workers run a dummy inference during startup so the first real caller turn and greeting are hot. `SHERPA_ONNX_STARTUP_TIMEOUT_MS` and `SHERPA_ONNX_REQUEST_TIMEOUT_MS` control how long the Rust service will wait for worker readiness and individual synthesis/transcription requests.
 
 The Compose stack mounts `./models` at `/app/models`, so the default local model paths are expected to exist under:
 
