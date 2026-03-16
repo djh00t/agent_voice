@@ -41,9 +41,14 @@ pub struct SpeechServices {
 
 impl SpeechServices {
     /// Builds STT and TTS backends from the resolved app configuration.
-    pub fn new(speech: SpeechConfig, openai: OpenAiConfig) -> Result<Self> {
+    pub async fn new(speech: SpeechConfig, openai: OpenAiConfig) -> Result<Self> {
         let openai_clients = OpenAiClients::new(openai)?;
-        let sherpa = SherpaOnnxClient::new(speech.sherpa_onnx.clone());
+        let sherpa = SherpaOnnxClient::new(
+            speech.sherpa_onnx.clone(),
+            speech.uses_local_stt(),
+            speech.uses_local_tts(),
+        )
+        .await?;
         let stt = match speech.stt_provider {
             SpeechProvider::OpenAi => SttBackend::OpenAi(openai_clients.clone()),
             SpeechProvider::SherpaOnnx => SttBackend::SherpaOnnx(sherpa.clone()),
