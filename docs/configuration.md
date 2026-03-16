@@ -90,6 +90,8 @@ When `SPEECH_TTS_PROVIDER=sherpa_onnx`, assistant speech is synthesized locally 
 
 The runtime starts persistent preloaded sherpa-onnx workers for the enabled local backends. `SHERPA_ONNX_WARMUP_ON_STARTUP` controls whether those workers run a dummy inference during startup so the first real caller turn and greeting are hot. `SHERPA_ONNX_STARTUP_TIMEOUT_MS` and `SHERPA_ONNX_REQUEST_TIMEOUT_MS` control how long the Rust service will wait for worker readiness and individual synthesis/transcription requests.
 
+The default sherpa worker thread count now follows host CPU parallelism and caps at `8` threads unless you override `SHERPA_ONNX_NUM_THREADS`.
+
 The Compose stack mounts `./models` at `/app/models`, so the default local model paths are expected to exist under:
 
 - `/app/models/stt/moonshine`
