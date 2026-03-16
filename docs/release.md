@@ -2,6 +2,7 @@
 
 ## Code
 
+- `make uv-sync`
 - `make test`
 - `make lint`
 - `make doc`
@@ -32,3 +33,5 @@ The Makefile-backed Compose targets use `.env` when it exists and otherwise fall
 - email requires confirmation before it is saved
 - accounting CSVs append correctly
 - transcripts persist correctly
+- `/v1/status` reports the expected `stt_backend` and `tts_backend`
+- local sherpa-onnx speech rows report zero API cost when local STT/TTS is enabled
