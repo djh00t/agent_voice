@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -167,23 +168,26 @@ pub struct PhoneBookStore {
 impl PhoneBookStore {
     /// Loads the phone book from disk, creating an empty store when absent.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
-        let mut phone_book = if path.exists() {
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read phone book {}", path.display()))?;
-            serde_json::from_str(&raw)
-                .with_context(|| format!("failed to parse phone book {}", path.display()))?
+        let full_path = resolve_phone_book_path(path.into())?;
+
+        let mut phone_book = if full_path.exists() {
+            let raw = fs::read_to_string(&full_path).with_context(|| {
+                format!("failed to read phone book {}", full_path.display())
+            })?;
+            serde_json::from_str(&raw).with_context(|| {
+                format!("failed to parse phone book {}", full_path.display())
+            })?
         } else {
             PhoneBook::default()
         };
         let seeded_entries = seed_policy_entries(&mut phone_book);
         sanitize_phone_book(&mut phone_book);
         if seeded_entries {
-            persist_phone_book(&path, &phone_book)?;
+            persist_phone_book(&full_path, &phone_book)?;
         }
 
         Ok(Self {
-            path,
+            path: full_path,
             phone_book: RwLock::new(phone_book),
         })
     }
@@ -286,6 +290,90 @@ impl PhoneBookStore {
     fn persist(&self) -> Result<()> {
         persist_phone_book(&self.path, &self.phone_book.read())
     }
+}
+
+fn resolve_phone_book_path(configured: PathBuf) -> Result<PathBuf> {
+    if configured.as_os_str().is_empty() {
+        return Err(anyhow::anyhow!("phone book path must not be empty"));
+    }
+
+    reject_parent_dir_components(&configured)?;
+    if configured.is_absolute() {
+        return resolve_absolute_phone_book_path(&configured);
+    }
+
+    let base_dir = std::env::current_dir()
+        .context("failed to determine current working directory for phone book")?
+        .canonicalize()
+        .context("failed to resolve current working directory for phone book")?;
+    let full_path = base_dir.join(&configured);
+    if full_path.exists() {
+        let canonical = full_path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve phone book path {}", full_path.display()))?;
+        if !canonical.starts_with(&base_dir) {
+            return Err(anyhow::anyhow!(
+                "phone book path must reside under {}",
+                base_dir.display()
+            ));
+        }
+        Ok(canonical)
+    } else {
+        Ok(full_path)
+    }
+}
+
+fn resolve_absolute_phone_book_path(configured: &Path) -> Result<PathBuf> {
+    match configured.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let (canonical_parent, relative_tail) = canonical_existing_ancestor(configured)?;
+            Ok(canonical_parent.join(relative_tail))
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to resolve phone book path {}", configured.display())),
+    }
+}
+
+fn canonical_existing_ancestor(path: &Path) -> Result<(PathBuf, PathBuf)> {
+    let mut existing = path;
+    let mut tail = Vec::new();
+    while !existing.exists() {
+        let component = existing.file_name().with_context(|| {
+            format!(
+                "phone book path {} must include a file name",
+                path.display()
+            )
+        })?;
+        tail.push(component.to_os_string());
+        existing = existing.parent().with_context(|| {
+            format!(
+                "phone book path {} must include an existing parent directory",
+                path.display()
+            )
+        })?;
+    }
+
+    let canonical_parent = existing
+        .canonicalize()
+        .with_context(|| format!("failed to resolve phone book path {}", existing.display()))?;
+    let mut relative_tail = PathBuf::new();
+    for component in tail.into_iter().rev() {
+        relative_tail.push(component);
+    }
+    Ok((canonical_parent, relative_tail))
+}
+
+fn reject_parent_dir_components(path: &Path) -> Result<()> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(anyhow::anyhow!(
+            "phone book path must not contain parent directory traversal"
+        ));
+    }
+    Ok(())
 }
 
 fn persist_phone_book(path: &Path, phone_book: &PhoneBook) -> Result<()> {
@@ -624,5 +712,35 @@ mod tests {
         );
         assert_eq!(normalize_caller_id("anonymous"), None);
         assert_eq!(caller_id_display("anonymous"), NO_CALLER_ID_DISPLAY);
+    }
+
+    #[test]
+    fn load_rejects_parent_dir_traversal() {
+        let attempted = PathBuf::from("../agent_voice_phonebook_escape.json");
+        let error = match PhoneBookStore::load(attempted) {
+            Ok(_) => panic!("traversal should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("must not contain parent directory traversal")
+        );
+    }
+
+    #[test]
+    fn load_allows_absolute_paths_with_missing_leaf() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "agent_voice_phonebook_absolute_{}",
+            std::process::id()
+        ));
+        let nested_path = temp_root.join("nested").join("phone_book.json");
+        let _ = fs::remove_dir_all(&temp_root);
+
+        let store = PhoneBookStore::load(&nested_path).expect("absolute path should load");
+        store.touch_caller("61412345678").expect("touch");
+        assert!(nested_path.exists());
+
+        let _ = fs::remove_dir_all(&temp_root);
     }
 }
