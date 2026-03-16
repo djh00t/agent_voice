@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -509,6 +509,7 @@ struct ManagedCall {
     track_existing_caller: bool,
     bridge_started: AtomicBool,
     end_requested: AtomicBool,
+    idle_watch_generation: AtomicU64,
     input_suppressed_until: RwLock<Option<Instant>>,
     pending_email_confirmation: RwLock<Option<String>>,
     last_reply_response_id: RwLock<Option<String>>,
@@ -551,6 +552,7 @@ impl ManagedCall {
             track_existing_caller,
             bridge_started: AtomicBool::new(false),
             end_requested: AtomicBool::new(false),
+            idle_watch_generation: AtomicU64::new(0),
             input_suppressed_until: RwLock::new(None),
             pending_email_confirmation: RwLock::new(None),
             last_reply_response_id: RwLock::new(None),
@@ -680,6 +682,14 @@ impl ManagedCall {
 
     fn set_pending_email_confirmation(&self, email: Option<String>) {
         *self.pending_email_confirmation.write() = email;
+    }
+
+    fn note_activity(&self) -> u64 {
+        self.idle_watch_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn idle_generation(&self) -> u64 {
+        self.idle_watch_generation.load(Ordering::SeqCst)
     }
 
     fn last_reply_response_id(&self) -> Option<String> {
@@ -919,6 +929,7 @@ async fn process_detected_utterance(
         "caller utterance transcribed"
     );
     record.record_caller_text(caller_text.to_string());
+    record.note_activity();
     let transcript_history = record.transcript_history();
 
     reconcile_pending_email_confirmation(&phone_book, &record, caller_text)?;
@@ -1041,36 +1052,17 @@ async fn process_detected_utterance(
         chars = response_text.len(),
         "sending assistant text to TTS"
     );
-    let tts_started = Instant::now();
-    let pcm = openai.speak_text(response_text, None, None).await?;
-    let tts_ms = tts_started.elapsed().as_millis();
-    let tts_entry = record_api_call(
+    let (tts_ms, tts_entry, playback_ms, idle_generation) = queue_assistant_tts(
+        openai,
         &accounting,
         &record,
-        LoggedApiCall {
-            operation: "tts.reply",
-            endpoint: &openai.config().audio_api_url,
-            model: &openai.config().tts_model,
-            duration_ms: tts_ms,
-            usage_source: "estimated",
-            estimated: true,
-            usage: TokenUsage {
-                input_text_tokens: accounting
-                    .estimate_text_tokens(&openai.config().tts_model, response_text),
-                cached_input_text_tokens: 0,
-                output_text_tokens: 0,
-                input_audio_tokens: 0,
-                output_audio_tokens: accounting.estimate_output_audio_tokens(
-                    &openai.config().tts_model,
-                    pcm.len(),
-                    TELEPHONY_RATE,
-                ),
-            },
-        },
-    )?;
-    let playback_ms = pcm_playback_ms(pcm.len());
+        &speaker_tx,
+        response_text,
+        "tts.reply",
+        behavior.post_tts_input_suppression_ms,
+    )
+    .await?;
     let suppression_ms = playback_ms.saturating_add(behavior.post_tts_input_suppression_ms);
-    record.suppress_input_for(StdDuration::from_millis(suppression_ms));
     info!(
         call_id = %record.call.call_id(),
         playback_ms,
@@ -1078,14 +1070,21 @@ async fn process_detected_utterance(
         suppression_ms,
         "suppressing inbound turn detection during assistant playback"
     );
-    speaker_tx
-        .send(pcm)
-        .map_err(|_| anyhow!("paced pcm channel closed"))?;
     if should_end_call {
         schedule_end_call(
             Arc::clone(&record),
             playback_ms,
             behavior.end_call_buffer_ms,
+        );
+    } else {
+        schedule_idle_prompt(
+            openai.clone(),
+            Arc::clone(&accounting),
+            behavior.clone(),
+            Arc::clone(&record),
+            speaker_tx.clone(),
+            playback_ms,
+            idle_generation,
         );
     }
     let total_ms = turn_started.elapsed().as_millis();
@@ -1120,8 +1119,100 @@ async fn process_detected_utterance(
         total_call_cost_usd = format_args!("{:.8}", record.accounting_summary().total_cost_usd),
         "assistant audio queued for RTP playback"
     );
-    record.record_assistant_text(response_text.to_string());
     Ok(())
+}
+
+async fn queue_assistant_tts(
+    openai: &OpenAiClients,
+    accounting: &Arc<AccountingStore>,
+    record: &Arc<ManagedCall>,
+    speaker_tx: &crossbeam_channel::Sender<Vec<i16>>,
+    text: &str,
+    operation: &'static str,
+    post_tts_input_suppression_ms: u64,
+) -> Result<(u128, ApiCallLogEntry, u64, u64)> {
+    let tts_started = Instant::now();
+    let pcm = openai.speak_text(text, None, None).await?;
+    let tts_ms = tts_started.elapsed().as_millis();
+    let tts_entry = record_api_call(
+        accounting,
+        record,
+        LoggedApiCall {
+            operation,
+            endpoint: &openai.config().audio_api_url,
+            model: &openai.config().tts_model,
+            duration_ms: tts_ms,
+            usage_source: "estimated",
+            estimated: true,
+            usage: TokenUsage {
+                input_text_tokens: accounting.estimate_text_tokens(&openai.config().tts_model, text),
+                cached_input_text_tokens: 0,
+                output_text_tokens: 0,
+                input_audio_tokens: 0,
+                output_audio_tokens: accounting.estimate_output_audio_tokens(
+                    &openai.config().tts_model,
+                    pcm.len(),
+                    TELEPHONY_RATE,
+                ),
+            },
+        },
+    )?;
+    let playback_ms = pcm_playback_ms(pcm.len());
+    record.suppress_input_for(StdDuration::from_millis(
+        playback_ms.saturating_add(post_tts_input_suppression_ms),
+    ));
+    speaker_tx
+        .send(pcm)
+        .map_err(|_| anyhow!("paced pcm channel closed"))?;
+    record.record_assistant_text(text.to_string());
+    let idle_generation = record.note_activity();
+    Ok((tts_ms, tts_entry, playback_ms, idle_generation))
+}
+
+fn schedule_idle_prompt(
+    openai: OpenAiClients,
+    accounting: Arc<AccountingStore>,
+    behavior: BehaviorConfig,
+    record: Arc<ManagedCall>,
+    speaker_tx: crossbeam_channel::Sender<Vec<i16>>,
+    playback_ms: u64,
+    idle_generation: u64,
+) {
+    if behavior.idle_prompt_after_ms == 0 || behavior.idle_prompt_text.trim().is_empty() {
+        return;
+    }
+
+    let call_id = record.call.call_id();
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(
+            playback_ms.saturating_add(behavior.idle_prompt_after_ms),
+        ))
+        .await;
+
+        if record.end_requested.load(Ordering::SeqCst) || record.idle_generation() != idle_generation
+        {
+            return;
+        }
+
+        info!(
+            call_id = %call_id,
+            idle_prompt_after_ms = behavior.idle_prompt_after_ms,
+            "sending idle reprompt to keep call active"
+        );
+        if let Err(error) = queue_assistant_tts(
+            &openai,
+            &accounting,
+            &record,
+            &speaker_tx,
+            behavior.idle_prompt_text.trim(),
+            "tts.idle_prompt",
+            behavior.post_tts_input_suppression_ms,
+        )
+        .await
+        {
+            record.mark_error(format!("failed to send idle prompt: {error}"));
+        }
+    });
 }
 
 fn schedule_end_call(record: Arc<ManagedCall>, playback_ms: u64, buffer_ms: u64) {
@@ -1457,22 +1548,23 @@ fn assistant_prompt_requests_profile_field(text: &str) -> bool {
     }
 
     normalized.contains("what is it")
-        || normalized.contains("what's your")
-        || normalized.contains("what is your")
+        || normalized.contains("what's your first name")
+        || normalized.contains("what is your first name")
+        || normalized.contains("what's your last name")
+        || normalized.contains("what is your last name")
+        || normalized.contains("what's your surname")
+        || normalized.contains("what is your surname")
         || normalized.contains("who should i say is calling")
-        || normalized.contains("spell it")
+        || normalized.contains("could you spell")
+        || normalized.contains("can you spell")
         || normalized.contains("spell that")
-        || normalized.contains("confirm")
-        || normalized.contains("email")
-        || normalized.contains("first name")
-        || normalized.contains("last name")
-        || normalized.contains("surname")
-        || normalized.contains("company")
+        || normalized.contains("is that correct")
+        || normalized.contains("let me confirm")
+        || normalized.contains("just to confirm")
+        || normalized.contains("confirm whether")
         || normalized.contains("where are you calling from")
-        || normalized.contains("which city")
-        || normalized.contains("what city")
-        || normalized.contains("what fields")
-        || normalized.contains("fields are available")
+        || normalized.contains("which city are you in")
+        || normalized.contains("what city are you in")
 }
 
 fn reconcile_pending_email_confirmation(
@@ -1597,6 +1689,8 @@ mod tests {
             turn_silence_ms: 400,
             min_utterance_ms: 200,
             post_tts_input_suppression_ms: 1200,
+            idle_prompt_after_ms: 20_000,
+            idle_prompt_text: "Are you still there?".to_string(),
             vad_threshold: 100,
             auto_end_calls: true,
             end_call_buffer_ms: 750,
@@ -1707,6 +1801,9 @@ mod tests {
         ));
         assert!(assistant_prompt_requests_profile_field(
             "Could you spell that email address for me?"
+        ));
+        assert!(!assistant_prompt_requests_profile_field(
+            "The fields I can edit include your first name, last name, email, company, timezone, and preferred language. Is there something specific you need help with?"
         ));
         assert!(!assistant_prompt_requests_profile_field(
             "Anything else you need help with tonight?"

@@ -1,6 +1,7 @@
 //! OpenAI client integration for STT, TTS, and response generation.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -88,6 +89,8 @@ impl OpenAiClients {
     /// Builds a new OpenAI client set from the configured endpoints and models.
     pub fn new(config: OpenAiConfig) -> Result<Self> {
         let client = Client::builder()
+            .connect_timeout(Duration::from_millis(config.http_connect_timeout_ms))
+            .timeout(Duration::from_millis(config.http_timeout_ms))
             .build()
             .context("failed to build reqwest client")?;
         Ok(Self { config, client })
