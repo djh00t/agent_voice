@@ -2,6 +2,10 @@
 /.env
 /config/agent_voice.yaml
 /data/
+/models/
+/logs/
+/.venv/
+/python/__pycache__/
 /accounting/api_calls.csv
 /accounting/call_totals.csv
 /website/node_modules
