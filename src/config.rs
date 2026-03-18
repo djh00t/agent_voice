@@ -395,16 +395,34 @@ impl AppConfig {
 
     fn sync_legacy_openai_sections(&mut self) {
         let default_llm = OpenAiLlmConfig::default();
-        if self.llm.openai != default_llm {
+        let default_openai = OpenAiConfig::default();
+
+        // Sync responses_api_url
+        if self.llm.openai.responses_api_url != default_llm.responses_api_url {
+            // llm.openai has an explicit value; it takes precedence.
             self.openai.responses_api_url = self.llm.openai.responses_api_url.clone();
-            self.openai.response_model = self.llm.openai.model.clone();
-            self.openai.response_instructions = self.llm.openai.instructions.clone();
-            return;
+        } else if self.openai.responses_api_url != default_openai.responses_api_url {
+            // Legacy openai.responses_api_url is set and llm is default; propagate legacy value.
+            self.llm.openai.responses_api_url = self.openai.responses_api_url.clone();
         }
 
-        self.llm.openai.responses_api_url = self.openai.responses_api_url.clone();
-        self.llm.openai.model = self.openai.response_model.clone();
-        self.llm.openai.instructions = self.openai.response_instructions.clone();
+        // Sync model / response_model
+        if self.llm.openai.model != default_llm.model {
+            // llm.openai has an explicit value; it takes precedence.
+            self.openai.response_model = self.llm.openai.model.clone();
+        } else if self.openai.response_model != default_openai.response_model {
+            // Legacy openai.response_model is set and llm is default; propagate legacy value.
+            self.llm.openai.model = self.openai.response_model.clone();
+        }
+
+        // Sync instructions / response_instructions
+        if self.llm.openai.instructions != default_llm.instructions {
+            // llm.openai has an explicit value; it takes precedence.
+            self.openai.response_instructions = self.llm.openai.instructions.clone();
+        } else if self.openai.response_instructions != default_openai.response_instructions {
+            // Legacy openai.response_instructions is set and llm is default; propagate legacy value.
+            self.llm.openai.instructions = self.openai.response_instructions.clone();
+        }
     }
 
     fn validate(&self) -> Result<()> {
