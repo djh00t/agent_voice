@@ -1,7 +1,7 @@
 sip:
-  username: "000300001"
-  password: "vrQrIJPXV6x4"
-  host: "sydau.e164sip.com"
+  username: null
+  password: null
+  host: null
   port: 5060
   transport: "udp"
   local_ip: null
