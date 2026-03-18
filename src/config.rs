@@ -618,6 +618,7 @@ impl Default for OpenAiConfig {
 #[serde(rename_all = "snake_case")]
 /// Selects which backend handles STT or TTS at runtime.
 pub enum SpeechProvider {
+    #[serde(rename = "openai", alias = "open_ai")]
     #[default]
     OpenAi,
     SherpaOnnx,
@@ -638,6 +639,7 @@ impl SpeechProvider {
 #[serde(rename_all = "snake_case")]
 /// Selects which backend handles structured reply generation.
 pub enum LlmProvider {
+    #[serde(rename = "openai", alias = "open_ai")]
     #[default]
     OpenAi,
     None,
@@ -660,6 +662,7 @@ impl LlmProvider {
 pub enum VoiceProvider {
     #[default]
     Disabled,
+    #[serde(rename = "openai", alias = "open_ai")]
     OpenAi,
 }
 
