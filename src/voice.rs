@@ -55,6 +55,14 @@ impl VoiceService {
         }
     }
 
+    /// Returns whether the selected voice backend should use STT before generating a response.
+    pub fn requires_inbound_transcription(&self) -> bool {
+        match &self.backend {
+            VoiceBackend::OpenAi { config, .. } => config.input_transcription_model.is_some(),
+            VoiceBackend::Disabled => false,
+        }
+    }
+
     /// Sends a caller audio turn to the configured voice model.
     pub async fn respond_to_wav(
         &self,
