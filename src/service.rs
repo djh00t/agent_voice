@@ -1026,12 +1026,8 @@ async fn process_detected_utterance(
             usage: transcription.usage.clone(),
         },
     )?;
-    let caller_text = transcription.text.trim().to_string().trim().to_string();
-    let caller_text = if caller_text.is_empty() {
-        None
-    } else {
-        Some(caller_text)
-    };
+    let text = transcription.text.trim();
+    let caller_text = (!text.is_empty()).then(|| text.to_string());
     if let Some(caller_text) = caller_text.as_deref() {
         info!(
             call_id = %record.call.call_id(),
