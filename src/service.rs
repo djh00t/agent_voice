@@ -2052,51 +2052,15 @@ fn reconcile_pending_email_confirmation(
 }
 
 fn caller_confirmed_pending_value(text: &str) -> bool {
-    let normalized = text.to_ascii_lowercase();
-    normalized == "yes"
-        || normalized == "yep"
-        || normalized == "yeah"
-        || normalized == "correct"
-        || normalized == "that's right"
-        || normalized == "that is right"
-        || normalized == "that's correct"
-        || normalized == "that is correct"
+    crate::end_call_helpers::caller_confirmed_pending_value(text)
 }
 
 fn caller_rejected_pending_value(text: &str) -> bool {
-    let normalized = text.to_ascii_lowercase();
-    normalized == "no"
-        || normalized == "nope"
-        || normalized == "wrong"
-        || normalized == "incorrect"
-        || normalized == "not quite"
-        || normalized == "that's wrong"
-        || normalized == "that is wrong"
+    crate::end_call_helpers::caller_rejected_pending_value(text)
 }
 
 fn caller_requested_end_call(text: &str) -> bool {
-    let normalized = normalize_match_text(text);
-    [
-        "goodbye",
-        "good bye",
-        "bye",
-        "bye bye",
-        "see you",
-        "see ya",
-        "catch you later",
-        "talk to you later",
-        "that s all",
-        "that is all",
-        "nothing else",
-        "hang up",
-        "hanging up",
-        "hangup",
-        "disconnect",
-        "end the call",
-        "drop the call",
-    ]
-    .iter()
-    .any(|phrase| normalized.contains(phrase))
+    crate::end_call_helpers::caller_requested_end_call(text)
 }
 
 fn caller_requested_immediate_hangup(text: &str) -> bool {
