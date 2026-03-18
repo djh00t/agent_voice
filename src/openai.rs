@@ -244,10 +244,13 @@ impl OpenAiClients {
             .context("failed to read transcription response")?;
         debug!(
             status = %status,
-            response_body = %payload_text,
+            response_len = payload_text.len(),
             "received OpenAI transcription response"
         );
         if !status.is_success() {
+            if let Some(truncated_body) = payload_text.get(0..payload_text.len().min(1024)) {
+                debug!(response_body = %truncated_body, "OpenAI transcription error body");
+            }
             return Err(anyhow!("transcription request failed with status {status}"));
         }
         let payload: serde_json::Value = serde_json::from_str(&payload_text)
@@ -349,10 +352,13 @@ impl OpenAiClients {
             .context("failed to read agent response body")?;
         debug!(
             status = %status,
-            response_body = %payload_text,
+            response_len = payload_text.len(),
             "received OpenAI responses reply"
         );
         if !status.is_success() {
+            if let Some(truncated_body) = payload_text.get(0..payload_text.len().min(1024)) {
+                debug!(response_body = %truncated_body, "OpenAI responses error body");
+            }
             return Err(anyhow!(
                 "agent response request failed with status {status}"
             ));
@@ -412,10 +418,13 @@ impl OpenAiClients {
             .context("failed to read caller contact extraction body")?;
         debug!(
             status = %status,
-            response_body = %payload_text,
+            response_len = payload_text.len(),
             "received caller contact extraction reply"
         );
         if !status.is_success() {
+            if let Some(truncated_body) = payload_text.get(0..payload_text.len().min(1024)) {
+                debug!(response_body = %truncated_body, "OpenAI caller extraction error body");
+            }
             return Err(anyhow!(
                 "caller contact extraction failed with status {status}"
             ));
@@ -505,10 +514,13 @@ impl OpenAiClients {
             .context("failed to read voice-model completion body")?;
         debug!(
             status = %status,
-            response_body = %payload_text,
+            response_len = payload_text.len(),
             "received OpenAI voice-model chat completion reply"
         );
         if !status.is_success() {
+            if let Some(truncated_body) = payload_text.get(0..payload_text.len().min(1024)) {
+                debug!(response_body = %truncated_body, "OpenAI voice-model error body");
+            }
             return Err(anyhow!(
                 "voice-model completion request failed with status {status}"
             ));
