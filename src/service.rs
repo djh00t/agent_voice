@@ -860,6 +860,7 @@ impl TranscriptSink for ManagedCall {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn activate_media_bridge(
     llm: LlmService,
     stt: SttService,
@@ -886,6 +887,7 @@ async fn activate_media_bridge(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn activate_voice_bridge(
     stt: SttService,
     llm: LlmService,
