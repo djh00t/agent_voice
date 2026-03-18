@@ -19,7 +19,7 @@ use tracing::{debug, warn};
 
 use crate::accounting::TokenUsage;
 use crate::audio::{TELEPHONY_RATE, decode_wav_mono_i16, resample_linear_mono};
-use crate::config::OpenAiConfig;
+use crate::config::{OpenAiConfig, OpenAiVoiceConfig};
 use crate::phonebook::{CallerRecord, CallerUpdate, editable_field_names};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +57,14 @@ pub struct ResponseResult {
     pub end_call: bool,
     pub usage: TokenUsage,
     pub response_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+/// A completed audio-model response containing spoken audio and assistant transcript text.
+pub struct VoiceResponseResult {
+    pub text: String,
+    pub pcm: Vec<i16>,
+    pub usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,6 +393,116 @@ impl OpenAiClients {
         })
     }
 
+    /// Sends a caller audio turn to an OpenAI audio chat completion model.
+    pub async fn generate_voice_response(
+        &self,
+        config: &OpenAiVoiceConfig,
+        transcript: &[TranscriptEvent],
+        caller_text: Option<&str>,
+        wav_bytes: Vec<u8>,
+    ) -> Result<VoiceResponseResult> {
+        let mut messages = audio_chat_messages(transcript);
+        let mut content = Vec::new();
+        if let Some(caller_text) = caller_text.map(str::trim).filter(|text| !text.is_empty()) {
+            content.push(json!({
+                "type": "text",
+                "text": caller_text,
+            }));
+        }
+        content.push(json!({
+            "type": "input_audio",
+            "input_audio": {
+                "data": BASE64.encode(wav_bytes),
+                "format": "wav",
+            }
+        }));
+        messages.push(json!({
+            "role": "user",
+            "content": content,
+        }));
+
+        let mut body = json!({
+            "model": config.model,
+            "modalities": ["text", "audio"],
+            "audio": {
+                "voice": config.voice,
+                "format": "wav",
+            },
+            "messages": messages,
+        });
+        if let Some(instructions) = config.instructions.as_deref().map(str::trim)
+            && !instructions.is_empty()
+        {
+            body["messages"]
+                .as_array_mut()
+                .expect("messages array")
+                .insert(
+                    0,
+                    json!({
+                        "role": "system",
+                        "content": instructions,
+                    }),
+                );
+        }
+
+        debug!(
+            endpoint = %config.api_url,
+            model = %config.model,
+            message_count = body["messages"].as_array().map(|items| items.len()).unwrap_or(0),
+            request_body = %body,
+            "sending OpenAI voice-model chat completion request"
+        );
+        let response = self
+            .client
+            .post(&config.api_url)
+            .bearer_auth(self.config.api_key())
+            .json(&body)
+            .send()
+            .await
+            .context("failed to request voice-model completion")?;
+
+        let status = response.status();
+        let payload_text = response
+            .text()
+            .await
+            .context("failed to read voice-model completion body")?;
+        debug!(
+            status = %status,
+            response_body = %payload_text,
+            "received OpenAI voice-model chat completion reply"
+        );
+        if !status.is_success() {
+            return Err(anyhow!(
+                "voice-model completion request failed with status {status}"
+            ));
+        }
+        let payload: serde_json::Value = serde_json::from_str(&payload_text)
+            .context("failed to parse voice-model completion body")?;
+        let message = payload
+            .get("choices")
+            .and_then(|value| value.as_array())
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .ok_or_else(|| anyhow!("voice-model completion did not contain a message"))?;
+        let transcript = extract_chat_audio_transcript(message)
+            .or_else(|_| extract_chat_message_text(message))?;
+        let audio_base64 = message
+            .get("audio")
+            .and_then(|value| value.get("data"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow!("voice-model completion did not contain audio data"))?;
+        let audio_bytes = BASE64
+            .decode(audio_base64)
+            .context("failed to decode voice-model audio payload")?;
+        let (sample_rate, wav_samples) = decode_tts_audio("wav", Some("audio/wav"), &audio_bytes)?;
+
+        Ok(VoiceResponseResult {
+            text: transcript,
+            pcm: resample_linear_mono(&wav_samples, sample_rate, TELEPHONY_RATE),
+            usage: extract_usage(&payload),
+        })
+    }
+
     /// Starts the realtime transcription bridge in a background task.
     pub fn start_transcription_bridge(
         &self,
@@ -677,6 +795,26 @@ fn response_input(
         .collect::<Vec<_>>()
 }
 
+fn audio_chat_messages(transcript: &[TranscriptEvent]) -> Vec<serde_json::Value> {
+    transcript
+        .iter()
+        .filter(|event| {
+            event.kind == "assistant.tts" || event.kind == "caller.transcript.completed"
+        })
+        .map(|event| {
+            let role = if event.role == "caller" {
+                "user"
+            } else {
+                "assistant"
+            };
+            json!({
+                "role": role,
+                "content": event.text,
+            })
+        })
+        .collect()
+}
+
 fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
     let usage = payload
         .get("usage")
@@ -684,10 +822,12 @@ fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
     let input_details = usage
         .get("input_token_details")
-        .or_else(|| usage.get("input_tokens_details"));
+        .or_else(|| usage.get("input_tokens_details"))
+        .or_else(|| usage.get("prompt_tokens_details"));
     let output_details = usage
         .get("output_token_details")
-        .or_else(|| usage.get("output_tokens_details"));
+        .or_else(|| usage.get("output_tokens_details"))
+        .or_else(|| usage.get("completion_tokens_details"));
 
     let input_audio_tokens =
         value_u64(input_details.and_then(|details| details.get("audio_tokens")))
@@ -711,8 +851,12 @@ fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
             .unwrap_or(0);
     let input_text_tokens = value_u64(input_details.and_then(|details| details.get("text_tokens")))
         .or_else(|| {
-            value_u64(usage.get("input_tokens"))
-                .map(|tokens| tokens.saturating_sub(input_audio_tokens))
+            value_u64(
+                usage
+                    .get("input_tokens")
+                    .or_else(|| usage.get("prompt_tokens")),
+            )
+            .map(|tokens| tokens.saturating_sub(input_audio_tokens))
         })
         .unwrap_or(0);
     let cached_input_text_tokens =
@@ -728,8 +872,12 @@ fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
     let output_text_tokens =
         value_u64(output_details.and_then(|details| details.get("text_tokens")))
             .or_else(|| {
-                value_u64(usage.get("output_tokens"))
-                    .map(|tokens| tokens.saturating_sub(output_audio_tokens))
+                value_u64(
+                    usage
+                        .get("output_tokens")
+                        .or_else(|| usage.get("completion_tokens")),
+                )
+                .map(|tokens| tokens.saturating_sub(output_audio_tokens))
             })
             .unwrap_or(0);
 
@@ -740,6 +888,43 @@ fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
         input_audio_tokens,
         output_audio_tokens,
     }
+}
+
+fn extract_chat_audio_transcript(message: &serde_json::Value) -> Result<String> {
+    let transcript = message
+        .get("audio")
+        .and_then(|value| value.get("transcript"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| anyhow!("chat completion message did not contain audio transcript"))?;
+    Ok(transcript.to_string())
+}
+
+fn extract_chat_message_text(message: &serde_json::Value) -> Result<String> {
+    if let Some(text) = message.get("content").and_then(|value| value.as_str()) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    if let Some(items) = message.get("content").and_then(|value| value.as_array()) {
+        let mut text = String::new();
+        for item in items {
+            if let Some(value) = item.get("text").and_then(|value| value.as_str()) {
+                text.push_str(value);
+            }
+        }
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    Err(anyhow!(
+        "chat completion message did not contain assistant text"
+    ))
 }
 
 fn value_u64(value: Option<&serde_json::Value>) -> Option<u64> {
@@ -1248,6 +1433,43 @@ mod tests {
         });
         let text = extract_response_text(&payload).expect("response text");
         assert_eq!(text, "Hello there");
+    }
+
+    #[test]
+    fn extract_chat_audio_transcript_reads_message_audio() {
+        let message = json!({
+            "audio": {
+                "transcript": "Sure, here you go."
+            }
+        });
+
+        let transcript = extract_chat_audio_transcript(&message).expect("audio transcript");
+        assert_eq!(transcript, "Sure, here you go.");
+    }
+
+    #[test]
+    fn audio_chat_messages_replay_caller_and_assistant_turns() {
+        let transcript = vec![
+            TranscriptEvent {
+                role: "caller".to_string(),
+                kind: "caller.transcript.completed".to_string(),
+                text: "Hello".to_string(),
+                at: "2026-03-18T00:00:00Z".to_string(),
+            },
+            TranscriptEvent {
+                role: "assistant".to_string(),
+                kind: "assistant.tts".to_string(),
+                text: "Hi there".to_string(),
+                at: "2026-03-18T00:00:01Z".to_string(),
+            },
+        ];
+
+        let messages = audio_chat_messages(&transcript);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "Hello");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "Hi there");
     }
 
     #[test]
