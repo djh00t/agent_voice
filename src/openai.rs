@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 
 use crate::accounting::TokenUsage;
 use crate::audio::{TELEPHONY_RATE, decode_wav_mono_i16, resample_linear_mono};
-use crate::config::OpenAiConfig;
+use crate::config::{OpenAiConfig, OpenAiVoiceConfig};
 use crate::phonebook::{CallerRecord, CallerUpdate, editable_field_names};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +58,14 @@ pub struct ResponseResult {
     pub end_call: bool,
     pub usage: TokenUsage,
     pub response_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+/// A completed audio-model response containing spoken audio and assistant transcript text.
+pub struct VoiceResponseResult {
+    pub text: String,
+    pub pcm: Vec<i16>,
+    pub usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +293,8 @@ impl OpenAiClients {
         previous_response_id: Option<&str>,
     ) -> Result<ResponseResult> {
         let input = response_input(transcript, previous_response_id);
+        let instructions =
+            response_instructions(self.config.response_instructions.as_deref(), context);
 
         let mut body = json!({
             "model": self.config.response_model,
@@ -310,10 +320,7 @@ impl OpenAiClients {
                 }
             }
         });
-        body["instructions"] = json!(response_instructions(
-            self.config.response_instructions.as_deref(),
-            context,
-        ));
+        body["instructions"] = json!(instructions);
         if let Some(previous_response_id) = previous_response_id {
             body["previous_response_id"] = json!(previous_response_id);
         }
@@ -322,6 +329,7 @@ impl OpenAiClients {
             endpoint = %self.config.responses_api_url,
             previous_response_id = ?previous_response_id,
             input_items = body["input"].as_array().map(|items| items.len()).unwrap_or(0),
+            instruction_chars = body["instructions"].as_str().map(|text| text.len()).unwrap_or(0),
             request_body = %body,
             "sending OpenAI responses request"
         );
@@ -417,6 +425,117 @@ impl OpenAiClients {
         let text = extract_response_text(&payload)?;
         Ok(CallerUpdateResult {
             update: parse_caller_update(&text)?,
+            usage: extract_usage(&payload),
+        })
+    }
+
+    /// Sends a caller audio turn to an OpenAI audio chat completion model.
+    pub async fn generate_voice_response(
+        &self,
+        config: &OpenAiVoiceConfig,
+        transcript: &[TranscriptEvent],
+        caller_text: Option<&str>,
+        wav_bytes: Vec<u8>,
+    ) -> Result<VoiceResponseResult> {
+        let audio_byte_len = wav_bytes.len();
+        let mut messages = audio_chat_messages(transcript);
+        let mut content = Vec::new();
+        if let Some(caller_text) = caller_text.map(str::trim).filter(|text| !text.is_empty()) {
+            content.push(json!({
+                "type": "text",
+                "text": caller_text,
+            }));
+        }
+        content.push(json!({
+            "type": "input_audio",
+            "input_audio": {
+                "data": BASE64.encode(wav_bytes),
+                "format": "wav",
+            }
+        }));
+        messages.push(json!({
+            "role": "user",
+            "content": content,
+        }));
+
+        let mut body = json!({
+            "model": config.model,
+            "modalities": ["text", "audio"],
+            "audio": {
+                "voice": config.voice,
+                "format": "wav",
+            },
+            "messages": messages,
+        });
+        if let Some(instructions) = config.instructions.as_deref().map(str::trim)
+            && !instructions.is_empty()
+        {
+            body["messages"]
+                .as_array_mut()
+                .expect("messages array")
+                .insert(
+                    0,
+                    json!({
+                        "role": "system",
+                        "content": instructions,
+                    }),
+                );
+        }
+
+        debug!(
+            endpoint = %config.api_url,
+            model = %config.model,
+            message_count = body["messages"].as_array().map(|items| items.len()).unwrap_or(0),
+            audio_byte_len,
+            "sending OpenAI voice-model chat completion request"
+        );
+        let response = self
+            .client
+            .post(&config.api_url)
+            .bearer_auth(self.config.api_key())
+            .json(&body)
+            .send()
+            .await
+            .context("failed to request voice-model completion")?;
+
+        let status = response.status();
+        let payload_text = response
+            .text()
+            .await
+            .context("failed to read voice-model completion body")?;
+        debug!(
+            status = %status,
+            response_body = %payload_text,
+            "received OpenAI voice-model chat completion reply"
+        );
+        if !status.is_success() {
+            return Err(anyhow!(
+                "voice-model completion request failed with status {status}"
+            ));
+        }
+        let payload: serde_json::Value = serde_json::from_str(&payload_text)
+            .context("failed to parse voice-model completion body")?;
+        let message = payload
+            .get("choices")
+            .and_then(|value| value.as_array())
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .ok_or_else(|| anyhow!("voice-model completion did not contain a message"))?;
+        let transcript = extract_chat_audio_transcript(message)
+            .or_else(|_| extract_chat_message_text(message))?;
+        let audio_base64 = message
+            .get("audio")
+            .and_then(|value| value.get("data"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow!("voice-model completion did not contain audio data"))?;
+        let audio_bytes = BASE64
+            .decode(audio_base64)
+            .context("failed to decode voice-model audio payload")?;
+        let (sample_rate, wav_samples) = decode_tts_audio("wav", Some("audio/wav"), &audio_bytes)?;
+
+        Ok(VoiceResponseResult {
+            text: transcript,
+            pcm: resample_linear_mono(&wav_samples, sample_rate, TELEPHONY_RATE),
             usage: extract_usage(&payload),
         })
     }
@@ -683,9 +802,10 @@ fn response_input(
     previous_response_id: Option<&str>,
 ) -> Vec<serde_json::Value> {
     if previous_response_id.is_some()
-        && let Some(latest_caller) = transcript.iter().rev().find(|event| {
-            event.role == "caller" && event.kind == "caller.transcript.completed"
-        })
+        && let Some(latest_caller) = transcript
+            .iter()
+            .rev()
+            .find(|event| event.role == "caller" && event.kind == "caller.transcript.completed")
     {
         return vec![json!({
             "role": "user",
@@ -695,7 +815,9 @@ fn response_input(
 
     transcript
         .iter()
-        .filter(|event| event.kind == "assistant.tts" || event.kind == "caller.transcript.completed")
+        .filter(|event| {
+            event.kind == "assistant.tts" || event.kind == "caller.transcript.completed"
+        })
         .map(|event| {
             let role = if event.role == "caller" {
                 "user"
@@ -710,6 +832,26 @@ fn response_input(
         .collect::<Vec<_>>()
 }
 
+fn audio_chat_messages(transcript: &[TranscriptEvent]) -> Vec<serde_json::Value> {
+    transcript
+        .iter()
+        .filter(|event| {
+            event.kind == "assistant.tts" || event.kind == "caller.transcript.completed"
+        })
+        .map(|event| {
+            let role = if event.role == "caller" {
+                "user"
+            } else {
+                "assistant"
+            };
+            json!({
+                "role": role,
+                "content": event.text,
+            })
+        })
+        .collect()
+}
+
 fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
     let usage = payload
         .get("usage")
@@ -717,10 +859,12 @@ fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
     let input_details = usage
         .get("input_token_details")
-        .or_else(|| usage.get("input_tokens_details"));
+        .or_else(|| usage.get("input_tokens_details"))
+        .or_else(|| usage.get("prompt_tokens_details"));
     let output_details = usage
         .get("output_token_details")
-        .or_else(|| usage.get("output_tokens_details"));
+        .or_else(|| usage.get("output_tokens_details"))
+        .or_else(|| usage.get("completion_tokens_details"));
 
     let input_audio_tokens =
         value_u64(input_details.and_then(|details| details.get("audio_tokens")))
@@ -744,8 +888,12 @@ fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
             .unwrap_or(0);
     let input_text_tokens = value_u64(input_details.and_then(|details| details.get("text_tokens")))
         .or_else(|| {
-            value_u64(usage.get("input_tokens"))
-                .map(|tokens| tokens.saturating_sub(input_audio_tokens))
+            value_u64(
+                usage
+                    .get("input_tokens")
+                    .or_else(|| usage.get("prompt_tokens")),
+            )
+            .map(|tokens| tokens.saturating_sub(input_audio_tokens))
         })
         .unwrap_or(0);
     let cached_input_text_tokens =
@@ -761,8 +909,12 @@ fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
     let output_text_tokens =
         value_u64(output_details.and_then(|details| details.get("text_tokens")))
             .or_else(|| {
-                value_u64(usage.get("output_tokens"))
-                    .map(|tokens| tokens.saturating_sub(output_audio_tokens))
+                value_u64(
+                    usage
+                        .get("output_tokens")
+                        .or_else(|| usage.get("completion_tokens")),
+                )
+                .map(|tokens| tokens.saturating_sub(output_audio_tokens))
             })
             .unwrap_or(0);
 
@@ -773,6 +925,43 @@ fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
         input_audio_tokens,
         output_audio_tokens,
     }
+}
+
+fn extract_chat_audio_transcript(message: &serde_json::Value) -> Result<String> {
+    let transcript = message
+        .get("audio")
+        .and_then(|value| value.get("transcript"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| anyhow!("chat completion message did not contain audio transcript"))?;
+    Ok(transcript.to_string())
+}
+
+fn extract_chat_message_text(message: &serde_json::Value) -> Result<String> {
+    if let Some(text) = message.get("content").and_then(|value| value.as_str()) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    if let Some(items) = message.get("content").and_then(|value| value.as_array()) {
+        let mut text = String::new();
+        for item in items {
+            if let Some(value) = item.get("text").and_then(|value| value.as_str()) {
+                text.push_str(value);
+            }
+        }
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    Err(anyhow!(
+        "chat completion message did not contain assistant text"
+    ))
 }
 
 fn value_u64(value: Option<&serde_json::Value>) -> Option<u64> {
@@ -792,71 +981,103 @@ fn response_instructions(base: Option<&str>, context: &ConversationContext) -> S
         )
         .to_string(),
     );
-    sections.push(format!(
-        "You are answering phone calls as {}.",
-        context.assistant_name
-    ));
-    sections.push(format!(
-        "Current time of day for the caller greeting: {}.",
-        context.time_of_day
-    ));
     sections.push(
-        "Speak English by default. Do not switch languages based on caller history or notes alone. Only use another language if the caller speaks that language in the current call or explicitly asks you to.".to_string(),
+        format!(
+            "You are {} on a phone call. Keep replies brief, natural, and helpful. It is currently {} for the caller.",
+            context.assistant_name, context.time_of_day
+        ),
     );
     sections.push(
-        "Never say that the caller seems to be switching languages and never comment on language detection. If the latest caller utterance is unclear, garbled, or not actionable, briefly ask them to repeat or clarify what they need in English.".to_string(),
+        "Speak English unless the caller explicitly asks for another language in this call. Never comment on language detection; if audio is unclear, briefly ask them to repeat.".to_string(),
     );
-    sections.push(format!("Caller ID: {}.", context.caller_id));
-    if let Some(caller) = &context.known_caller {
-        sections.push(format!(
-            "Known caller profile: {}",
-            prompt_safe_caller_json(caller)
-        ));
-    } else {
-        sections.push("This caller is not known yet.".to_string());
+    if let Some(summary) = context
+        .known_caller
+        .as_ref()
+        .and_then(compact_caller_summary)
+    {
+        sections.push(format!("Known caller profile: {}.", summary));
     }
     if !context.missing_fields.is_empty() {
         sections.push(format!(
-            "Missing caller fields: {}. Try to gather these naturally over time without making the conversation awkward. Prefer one lightweight question at a time.",
+            "Missing profile fields: {}. Gather them naturally, at most one lightweight question at a time, only when helpful.",
             context.missing_fields.join(", ")
         ));
     }
     if context.phone_book_writable {
         sections.push(format!(
-            "Phone book tool: you may only discuss or update the active caller record for caller ID {}. Available editable fields are: {}. If the caller asks what fields are available, answer with that list plainly.",
+            "Only discuss or update the active caller record for caller ID {}. Editable fields: {}. If asked what can be updated, answer with that list plainly.",
             context.caller_id, editable_fields
         ));
     } else {
         sections.push(
-            "Phone book writes are unavailable for this call because the caller did not present usable caller ID. You may answer questions generally, but do not claim to save, update, or confirm caller profile details for this call."
+            "Phone book writes are unavailable because the caller did not present usable caller ID. Answer generally, but do not claim to save or confirm profile details for this call."
                 .to_string(),
         );
     }
     sections.push(
-        "Never let the caller set, overwrite, or confirm contact details for another person's record. If they mention someone else, treat that as conversation only and do not store it.".to_string(),
+        "Never save, overwrite, or confirm details for another person's record. If they mention someone else, treat it as conversation only.".to_string(),
     );
     sections.push(
-        "Caller notes are low-priority memory only. Use them only when directly relevant, and do not steer the conversation back to old notes unless the caller brings them up.".to_string(),
+        "Do not rely on old notes to steer the conversation. Use saved profile details only when directly relevant.".to_string(),
     );
     sections.push(
-        "Validation rules: first_name and last_name must be clearly given as the caller's own name; company must be clearly described as the caller's own company or workplace; timezone may be inferred only from the caller's own explicit location; preferred_language may be stored only when the caller explicitly says they prefer or want a language.".to_string(),
+        "Validation: first_name and last_name must be the caller's own name; company must be the caller's own workplace; infer timezone only from the caller's explicit location; set preferred_language only when explicitly requested.".to_string(),
     );
     sections.push(
-        "Do not store an email address until it has been repeated back and confirmed. If the caller asks to update their email or gives an email, ask them to spell it carefully and confirm it before treating it as saved.".to_string(),
+        "Do not treat an email as saved until it has been spelled back and confirmed.".to_string(),
     );
     if let Some(email) = &context.pending_email_confirmation {
         sections.push(format!(
-            "Pending email confirmation: {}. Before treating it as saved, ask the caller to confirm whether that exact email is correct unless they have already just confirmed it.",
+            "Pending email confirmation: {}. Confirm that exact spelling before treating it as saved.",
             email
         ));
     }
     sections.push(
-        "If the caller is known by first name, greet them naturally by that name. If you know the first name but not the last name, ask casually for the last name when it fits. If you do not know their name yet, ask naturally who is calling when appropriate. Do not interrogate them.".to_string(),
+        "If you know the caller's first name, use it naturally. If you still need their name, ask casually when it fits.".to_string(),
     );
     sections.push(
-        "Return only a JSON object with keys `say` and `end_call`. `say` must contain exactly what you want spoken to the caller. Set `end_call` to true only when your spoken reply is a final closing farewell and the phone should hang up immediately after playback. If the caller says goodbye but it is still appropriate to ask whether they need anything else, keep `end_call` false for that turn.".to_string(),
+        "Return only JSON with keys `say` and `end_call`. `say` is exactly what will be spoken. Set `end_call` true only for a final closing farewell. If the caller asks to hang up after a simple final action, do that action first in the same reply, then close. Never set `end_call` true on clarifications or other non-final replies.".to_string(),
     );
     sections.join("\n")
+}
+
+fn compact_caller_summary(caller: &CallerRecord) -> Option<String> {
+    let mut fields = Vec::new();
+    if let Some(first_name) = caller.first_name.as_deref()
+        && !first_name.trim().is_empty()
+    {
+        fields.push(format!("first_name={}", first_name.trim()));
+    }
+    if let Some(last_name) = caller.last_name.as_deref()
+        && !last_name.trim().is_empty()
+    {
+        fields.push(format!("last_name={}", last_name.trim()));
+    }
+    if let Some(email) = caller.email.as_deref()
+        && !email.trim().is_empty()
+    {
+        fields.push(format!("email={}", email.trim()));
+    }
+    if let Some(company) = caller.company.as_deref()
+        && !company.trim().is_empty()
+    {
+        fields.push(format!("company={}", company.trim()));
+    }
+    if let Some(timezone) = caller.timezone.as_deref()
+        && !timezone.trim().is_empty()
+    {
+        fields.push(format!("timezone={}", timezone.trim()));
+    }
+    if let Some(preferred_language) = caller.preferred_language.as_deref()
+        && !preferred_language.trim().is_empty()
+    {
+        fields.push(format!("preferred_language={}", preferred_language.trim()));
+    }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(fields.join("; "))
+    }
 }
 
 fn contact_extraction_instructions(caller: Option<&CallerRecord>) -> String {
@@ -925,24 +1146,51 @@ fn extract_turn_plan(payload: &serde_json::Value) -> Result<TurnPlan> {
 }
 
 fn sanitize_turn_plan(plan: TurnPlan, transcript: &[TranscriptEvent]) -> TurnPlan {
-    if !looks_like_language_comment(&plan.say) {
-        return plan;
+    let latest_caller_text = latest_caller_text(transcript);
+    if looks_like_language_comment(&plan.say) {
+        if caller_explicitly_discussed_language(latest_caller_text) {
+            return plan;
+        }
+
+        return TurnPlan {
+            say: "Sorry, I didn't quite catch that. Could you say that again?".to_string(),
+            end_call: false,
+        };
     }
 
-    let latest_caller_text = transcript
+    let caller_requested_end_call = caller_requested_end_call(latest_caller_text);
+    let say = plan.say.trim();
+    if caller_requested_end_call {
+        if let Some(limit) = requested_count_before_hangup(latest_caller_text)
+            && !response_mentions_requested_count(say, limit)
+        {
+            return TurnPlan {
+                say: counted_final_farewell(limit),
+                end_call: true,
+            };
+        }
+        return TurnPlan {
+            say: finalize_end_call_response(say),
+            end_call: true,
+        };
+    }
+    if plan.end_call && !looks_like_final_farewell(say) {
+        return TurnPlan {
+            say: say.to_string(),
+            end_call: false,
+        };
+    }
+
+    plan
+}
+
+fn latest_caller_text(transcript: &[TranscriptEvent]) -> &str {
+    transcript
         .iter()
         .rev()
         .find(|event| event.role == "caller" && event.kind == "caller.transcript.completed")
         .map(|event| event.text.as_str())
-        .unwrap_or_default();
-    if caller_explicitly_discussed_language(latest_caller_text) {
-        return plan;
-    }
-
-    TurnPlan {
-        say: "Sorry, I didn't quite catch that. Could you say that again?".to_string(),
-        end_call: false,
-    }
+        .unwrap_or_default()
 }
 
 fn looks_like_language_comment(text: &str) -> bool {
@@ -974,6 +1222,173 @@ fn caller_explicitly_discussed_language(text: &str) -> bool {
         || normalized.contains("thai")
         || normalized.contains("speak ")
         || normalized.contains("translation")
+}
+
+fn caller_requested_end_call(text: &str) -> bool {
+    let normalized = normalize_match_text(text);
+    [
+        "goodbye",
+        "good bye",
+        "bye",
+        "bye bye",
+        "see you",
+        "see ya",
+        "catch you later",
+        "talk to you later",
+        "that s all",
+        "that is all",
+        "nothing else",
+        "hang up",
+        "hanging up",
+        "hangup",
+        "disconnect",
+        "end the call",
+        "drop the call",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn looks_like_final_farewell(text: &str) -> bool {
+    let normalized = normalize_match_text(text);
+    [
+        "goodbye",
+        "good bye",
+        "bye",
+        "see you",
+        "see ya",
+        "take care",
+        "have a good",
+        "have a great",
+        "talk soon",
+        "catch you later",
+        "call back",
+        "thanks for calling",
+        "no worries bye",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn finalize_end_call_response(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || looks_like_clarification_request(trimmed) {
+        return "Okay, no worries. See you later.".to_string();
+    }
+    if looks_like_final_farewell(trimmed) {
+        return trimmed.to_string();
+    }
+    let suffix = " See you later.";
+    if trimmed.ends_with(['.', '!', '?']) {
+        format!("{trimmed}{suffix}")
+    } else {
+        format!("{trimmed}.{suffix}")
+    }
+}
+
+fn looks_like_clarification_request(text: &str) -> bool {
+    let normalized = normalize_match_text(text);
+    [
+        "could you say that again",
+        "can you say that again",
+        "could you repeat that",
+        "can you repeat that",
+        "i didn t catch that",
+        "i did not catch that",
+        "pardon",
+        "sorry",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn normalize_match_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut last_was_space = true;
+    for ch in text.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            ' '
+        };
+        if mapped == ' ' {
+            if !last_was_space {
+                normalized.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            normalized.push(mapped);
+            last_was_space = false;
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn requested_count_before_hangup(text: &str) -> Option<u8> {
+    let normalized = normalize_match_text(text);
+    if !(normalized.contains("count to") && caller_requested_end_call(&normalized)) {
+        return None;
+    }
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    for window in tokens.windows(3) {
+        if window[0] == "count"
+            && window[1] == "to"
+            && let Some(limit) = parse_small_count(window[2])
+        {
+            return Some(limit);
+        }
+    }
+    None
+}
+
+fn parse_small_count(token: &str) -> Option<u8> {
+    match token {
+        "1" | "one" => Some(1),
+        "2" | "two" => Some(2),
+        "3" | "three" => Some(3),
+        "4" | "four" => Some(4),
+        "5" | "five" => Some(5),
+        "6" | "six" => Some(6),
+        "7" | "seven" => Some(7),
+        "8" | "eight" => Some(8),
+        "9" | "nine" => Some(9),
+        "10" | "ten" => Some(10),
+        _ => None,
+    }
+}
+
+fn response_mentions_requested_count(text: &str, limit: u8) -> bool {
+    let normalized = normalize_match_text(text);
+    let spoken = count_tokens(limit).join(" ");
+    let numeric = (1..=limit)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalized.contains(&spoken) || normalized.contains(&numeric)
+}
+
+fn counted_final_farewell(limit: u8) -> String {
+    format!("{}, see you later.", count_tokens(limit).join(", "))
+}
+
+fn count_tokens(limit: u8) -> Vec<&'static str> {
+    let mut tokens = Vec::new();
+    for value in 1..=limit {
+        tokens.push(match value {
+            1 => "one",
+            2 => "two",
+            3 => "three",
+            4 => "four",
+            5 => "five",
+            6 => "six",
+            7 => "seven",
+            8 => "eight",
+            9 => "nine",
+            10 => "ten",
+            _ => break,
+        });
+    }
+    tokens
 }
 
 fn parse_caller_update(text: &str) -> Result<CallerUpdate> {
@@ -1055,6 +1470,43 @@ mod tests {
         });
         let text = extract_response_text(&payload).expect("response text");
         assert_eq!(text, "Hello there");
+    }
+
+    #[test]
+    fn extract_chat_audio_transcript_reads_message_audio() {
+        let message = json!({
+            "audio": {
+                "transcript": "Sure, here you go."
+            }
+        });
+
+        let transcript = extract_chat_audio_transcript(&message).expect("audio transcript");
+        assert_eq!(transcript, "Sure, here you go.");
+    }
+
+    #[test]
+    fn audio_chat_messages_replay_caller_and_assistant_turns() {
+        let transcript = vec![
+            TranscriptEvent {
+                role: "caller".to_string(),
+                kind: "caller.transcript.completed".to_string(),
+                text: "Hello".to_string(),
+                at: "2026-03-18T00:00:00Z".to_string(),
+            },
+            TranscriptEvent {
+                role: "assistant".to_string(),
+                kind: "assistant.tts".to_string(),
+                text: "Hi there".to_string(),
+                at: "2026-03-18T00:00:01Z".to_string(),
+            },
+        ];
+
+        let messages = audio_chat_messages(&transcript);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "Hello");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "Hi there");
     }
 
     #[test]
@@ -1188,6 +1640,94 @@ mod tests {
 
         assert_eq!(sanitized.say, original.say);
         assert_eq!(sanitized.end_call, original.end_call);
+    }
+
+    #[test]
+    fn sanitize_turn_plan_promotes_explicit_hangup_request_to_final_closing() {
+        let transcript = vec![TranscriptEvent {
+            role: "caller".to_string(),
+            kind: "caller.transcript.completed".to_string(),
+            text: "Please count to three and hang up.".to_string(),
+            at: "2026-03-16T00:00:00Z".to_string(),
+        }];
+
+        let sanitized = sanitize_turn_plan(
+            TurnPlan {
+                say: "One, two, three.".to_string(),
+                end_call: false,
+            },
+            &transcript,
+        );
+
+        assert_eq!(sanitized.say, "One, two, three. See you later.");
+        assert!(sanitized.end_call);
+    }
+
+    #[test]
+    fn sanitize_turn_plan_fulfills_count_then_hangup_request_when_model_skips_count() {
+        let transcript = vec![TranscriptEvent {
+            role: "caller".to_string(),
+            kind: "caller.transcript.completed".to_string(),
+            text: "Count to 3 and hang up.".to_string(),
+            at: "2026-03-16T00:00:00Z".to_string(),
+        }];
+
+        let sanitized = sanitize_turn_plan(
+            TurnPlan {
+                say: "Okay, no worries. See you later.".to_string(),
+                end_call: true,
+            },
+            &transcript,
+        );
+
+        assert_eq!(sanitized.say, "one, two, three, see you later.");
+        assert!(sanitized.end_call);
+    }
+
+    #[test]
+    fn sanitize_turn_plan_clears_end_call_for_non_closing_reply() {
+        let transcript = vec![TranscriptEvent {
+            role: "caller".to_string(),
+            kind: "caller.transcript.completed".to_string(),
+            text: "Tell me a joke.".to_string(),
+            at: "2026-03-16T00:00:00Z".to_string(),
+        }];
+
+        let sanitized = sanitize_turn_plan(
+            TurnPlan {
+                say: "I didn't catch that, could you repeat it?".to_string(),
+                end_call: true,
+            },
+            &transcript,
+        );
+
+        assert_eq!(sanitized.say, "I didn't catch that, could you repeat it?");
+        assert!(!sanitized.end_call);
+    }
+
+    #[test]
+    fn compact_caller_summary_omits_notes_and_empty_fields() {
+        let caller = CallerRecord {
+            caller_id: "61400000000".to_string(),
+            first_seen_at: "2026-03-16T00:00:00Z".to_string(),
+            last_seen_at: "2026-03-16T00:00:00Z".to_string(),
+            call_count: 3,
+            system_entry: false,
+            first_name: Some("Dave".to_string()),
+            last_name: None,
+            email: None,
+            company: Some("Example".to_string()),
+            timezone: Some("Australia/Sydney".to_string()),
+            preferred_language: None,
+            notes: vec!["likes rugby".to_string()],
+            disabled: false,
+        };
+
+        let summary = compact_caller_summary(&caller).expect("summary");
+        assert_eq!(
+            summary,
+            "first_name=Dave; company=Example; timezone=Australia/Sydney"
+        );
     }
 
     #[test]

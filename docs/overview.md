@@ -2,13 +2,14 @@
 
 `agent_voice` is a Rust SIP bridge for agent workflows.
 
-It registers a SIP endpoint with `xphone`, exposes a localhost HTTP API for agents, turns inbound RTP into caller utterances, sends those turns to OpenAI speech-to-text and responses APIs, and sends outbound OpenAI TTS audio back into the SIP/RTP stream.
+It registers a SIP endpoint with `xphone`, exposes a localhost HTTP API for agents, turns inbound RTP into caller utterances, sends those turns to the configured speech backend, calls OpenAI Responses for reasoning, and sends outbound speech back into the SIP/RTP stream.
 
 ## Core capabilities
 
 - SIP registration plus inbound and outbound call handling
 - RTP audio ingestion and telephony turn detection
-- OpenAI STT, responses, and TTS integration
+- Selectable OpenAI or local sherpa-onnx speech backends
+- OpenAI Responses integration for reasoning
 - Persistent caller phone book keyed by caller ID
 - Per-call accounting, token tracking, and cost logging
 - Local control API for agents on `127.0.0.1`

@@ -24,11 +24,62 @@ That makes the Docker and Compose workflow environment-first while still allowin
 
 - `OPENAI_API_KEY`
 - `OPENAI_TRANSCRIPTION_MODEL`
-- `OPENAI_RESPONSE_MODEL`
 - `OPENAI_TTS_MODEL`
 - `OPENAI_TTS_VOICE`
 - `OPENAI_TTS_INSTRUCTIONS`
+- `OPENAI_LLM_MODEL`
+- `OPENAI_LLM_INSTRUCTIONS`
+- `OPENAI_VOICE_API_URL`
+- `OPENAI_VOICE_MODEL`
+- `OPENAI_VOICE_NAME`
+- `OPENAI_VOICE_INSTRUCTIONS`
+
+### Speech backends
+
+- `SPEECH_STT_PROVIDER`
+- `SPEECH_TTS_PROVIDER`
+- `SHERPA_ONNX_PYTHON_BIN`
+- `SHERPA_ONNX_BRIDGE_SCRIPT`
+- `SHERPA_ONNX_PROVIDER`
+- `SHERPA_ONNX_NUM_THREADS`
+- `SHERPA_ONNX_WARMUP_ON_STARTUP`
+- `SHERPA_ONNX_STARTUP_TIMEOUT_MS`
+- `SHERPA_ONNX_REQUEST_TIMEOUT_MS`
+- `SHERPA_ONNX_DEBUG`
+- `SHERPA_ONNX_STT_MODEL_FAMILY`
+- `SHERPA_ONNX_STT_MOONSHINE_PREPROCESSOR`
+- `SHERPA_ONNX_STT_MOONSHINE_ENCODER`
+- `SHERPA_ONNX_STT_MOONSHINE_UNCACHED_DECODER`
+- `SHERPA_ONNX_STT_MOONSHINE_CACHED_DECODER`
+- `SHERPA_ONNX_STT_MOONSHINE_DECODER`
+- `SHERPA_ONNX_STT_MOONSHINE_TOKENS`
+- `SHERPA_ONNX_TTS_MODEL_FAMILY`
+- `SHERPA_ONNX_TTS_SPEED`
+- `SHERPA_ONNX_TTS_SPEAKER_ID`
+- `SHERPA_ONNX_TTS_KOKORO_MODEL`
+- `SHERPA_ONNX_TTS_KOKORO_VOICES`
+- `SHERPA_ONNX_TTS_KOKORO_TOKENS`
+- `SHERPA_ONNX_TTS_KOKORO_DATA_DIR`
+- `SHERPA_ONNX_TTS_KOKORO_LANG`
+
+### Standalone LLM
+
+- `LLM_PROVIDER`
+- `OPENAI_RESPONSES_API_URL`
+- `OPENAI_LLM_API_URL`
+- `OPENAI_RESPONSE_MODEL`
+- `OPENAI_LLM_MODEL`
 - `OPENAI_RESPONSE_INSTRUCTIONS`
+- `OPENAI_LLM_INSTRUCTIONS`
+
+### Unified voice model
+
+- `VOICE_PROVIDER`
+- `OPENAI_VOICE_API_URL`
+- `OPENAI_VOICE_MODEL`
+- `OPENAI_VOICE_NAME`
+- `OPENAI_VOICE_INSTRUCTIONS`
+- `OPENAI_VOICE_INPUT_TRANSCRIPTION_MODEL`
 
 ### Call behavior
 
@@ -53,6 +104,41 @@ That makes the Docker and Compose workflow environment-first while still allowin
 - `ACCOUNTING_CALL_TOTALS_CSV_PATH`
 - `ACCOUNTING_PRICING_PAGE_URL`
 - `ACCOUNTING_REFRESH_PRICING_ON_STARTUP`
+
+## Local sherpa-onnx speech
+
+When `SPEECH_STT_PROVIDER=sherpa_onnx`, caller audio is transcribed locally with the repo-managed uv environment and the configured Moonshine model files.
+
+When `SPEECH_TTS_PROVIDER=sherpa_onnx`, assistant speech is synthesized locally with the configured sherpa-onnx TTS model files. The current implementation supports Kokoro for local TTS and uses `SHERPA_ONNX_TTS_SPEAKER_ID` to select a built-in voice.
+
+The runtime starts persistent preloaded sherpa-onnx workers for the enabled local backends. `SHERPA_ONNX_WARMUP_ON_STARTUP` controls whether those workers run a dummy inference during startup so the first real caller turn and greeting are hot. `SHERPA_ONNX_STARTUP_TIMEOUT_MS` and `SHERPA_ONNX_REQUEST_TIMEOUT_MS` control how long the Rust service will wait for worker readiness and individual synthesis/transcription requests.
+
+The default sherpa worker thread count now follows host CPU parallelism and caps at `8` threads unless you override `SHERPA_ONNX_NUM_THREADS`.
+
+The Compose stack mounts `./models` at `/app/models`, so the default local model paths are expected to exist under:
+
+- `/app/models/stt/moonshine`
+- `/app/models/tts/kokoro`
+
+The repo-managed Python environment is expected at `./.venv` on the host and `/app/.venv` in Docker. Use `make uv-sync` to create it.
+
+## Split vs voice-model modes
+
+The default runtime is the split pipeline:
+
+- configured STT backend transcribes caller audio
+- configured LLM backend generates the reply text
+- configured TTS backend generates assistant audio
+
+Set `VOICE_PROVIDER=openai` to switch assistant reply generation to an OpenAI audio chat-completions model such as `gpt-audio-1.5`.
+
+In voice-model mode:
+
+- the configured STT backend still runs for transcript bookkeeping, caller-history context, and phone-book flows
+- the standalone `llm` backend is optional and can be set to `none`
+- assistant reply text and audio come from the voice model in one API call
+
+If `VOICE_PROVIDER=disabled`, `LLM_PROVIDER` must remain enabled.
 
 ## Phone-book rules
 

@@ -14,7 +14,13 @@ use xphone::{Codec, Config as PhoneConfig};
 pub struct AppConfig {
     pub sip: SipConfig,
     pub openai: OpenAiConfig,
+    #[serde(default)]
+    pub llm: LlmConfig,
+    #[serde(default)]
+    pub voice: VoiceConfig,
     pub agent_api: AgentApiConfig,
+    #[serde(default)]
+    pub speech: SpeechConfig,
     #[serde(default)]
     pub behavior: BehaviorConfig,
     #[serde(default)]
@@ -38,6 +44,7 @@ impl AppConfig {
             None => Self::default(),
         };
         config.apply_env_overrides_from_map(&std::env::vars().collect());
+        config.sync_legacy_openai_sections();
         config.validate()?;
         Ok(config)
     }
@@ -145,6 +152,156 @@ impl AppConfig {
             "OPENAI_RESPONSE_INSTRUCTIONS",
             &mut self.openai.response_instructions,
         );
+        apply_llm_provider(env, "LLM_PROVIDER", &mut self.llm.provider);
+        apply_string(
+            env,
+            "OPENAI_LLM_API_URL",
+            &mut self.llm.openai.responses_api_url,
+        );
+        apply_string(env, "OPENAI_LLM_MODEL", &mut self.llm.openai.model);
+        apply_optional_string(
+            env,
+            "OPENAI_LLM_INSTRUCTIONS",
+            &mut self.llm.openai.instructions,
+        );
+        apply_voice_provider(env, "VOICE_PROVIDER", &mut self.voice.provider);
+        apply_string(env, "OPENAI_VOICE_API_URL", &mut self.voice.openai.api_url);
+        apply_string(env, "OPENAI_VOICE_MODEL", &mut self.voice.openai.model);
+        apply_string(env, "OPENAI_VOICE_NAME", &mut self.voice.openai.voice);
+        apply_optional_string(
+            env,
+            "OPENAI_VOICE_INSTRUCTIONS",
+            &mut self.voice.openai.instructions,
+        );
+        apply_optional_string(
+            env,
+            "OPENAI_VOICE_INPUT_TRANSCRIPTION_MODEL",
+            &mut self.voice.openai.input_transcription_model,
+        );
+
+        apply_speech_provider(env, "SPEECH_STT_PROVIDER", &mut self.speech.stt_provider);
+        apply_speech_provider(env, "SPEECH_TTS_PROVIDER", &mut self.speech.tts_provider);
+        apply_string(
+            env,
+            "SHERPA_ONNX_PYTHON_BIN",
+            &mut self.speech.sherpa_onnx.python_bin,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_BRIDGE_SCRIPT",
+            &mut self.speech.sherpa_onnx.bridge_script,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_PROVIDER",
+            &mut self.speech.sherpa_onnx.provider,
+        );
+        apply_u32(
+            env,
+            "SHERPA_ONNX_NUM_THREADS",
+            &mut self.speech.sherpa_onnx.num_threads,
+        );
+        apply_bool(
+            env,
+            "SHERPA_ONNX_WARMUP_ON_STARTUP",
+            &mut self.speech.sherpa_onnx.warmup_on_startup,
+        );
+        apply_u64(
+            env,
+            "SHERPA_ONNX_STARTUP_TIMEOUT_MS",
+            &mut self.speech.sherpa_onnx.startup_timeout_ms,
+        );
+        apply_u64(
+            env,
+            "SHERPA_ONNX_REQUEST_TIMEOUT_MS",
+            &mut self.speech.sherpa_onnx.request_timeout_ms,
+        );
+        apply_bool(env, "SHERPA_ONNX_DEBUG", &mut self.speech.sherpa_onnx.debug);
+        apply_string(
+            env,
+            "SHERPA_ONNX_STT_MODEL_FAMILY",
+            &mut self.speech.sherpa_onnx.stt.model_family,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_STT_MOONSHINE_PREPROCESSOR",
+            &mut self.speech.sherpa_onnx.stt.moonshine.preprocessor,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_STT_MOONSHINE_ENCODER",
+            &mut self.speech.sherpa_onnx.stt.moonshine.encoder,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_STT_MOONSHINE_UNCACHED_DECODER",
+            &mut self.speech.sherpa_onnx.stt.moonshine.uncached_decoder,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_STT_MOONSHINE_CACHED_DECODER",
+            &mut self.speech.sherpa_onnx.stt.moonshine.cached_decoder,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_STT_MOONSHINE_DECODER",
+            &mut self.speech.sherpa_onnx.stt.moonshine.decoder,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_STT_MOONSHINE_TOKENS",
+            &mut self.speech.sherpa_onnx.stt.moonshine.tokens,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_TTS_MODEL_FAMILY",
+            &mut self.speech.sherpa_onnx.tts.model_family,
+        );
+        apply_f32(
+            env,
+            "SHERPA_ONNX_TTS_SPEED",
+            &mut self.speech.sherpa_onnx.tts.speed,
+        );
+        apply_u32(
+            env,
+            "SHERPA_ONNX_TTS_SPEAKER_ID",
+            &mut self.speech.sherpa_onnx.tts.speaker_id,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_TTS_KOKORO_MODEL",
+            &mut self.speech.sherpa_onnx.tts.kokoro.model,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_TTS_KOKORO_VOICES",
+            &mut self.speech.sherpa_onnx.tts.kokoro.voices,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_TTS_KOKORO_TOKENS",
+            &mut self.speech.sherpa_onnx.tts.kokoro.tokens,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_TTS_KOKORO_DATA_DIR",
+            &mut self.speech.sherpa_onnx.tts.kokoro.data_dir,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_TTS_KOKORO_LEXICON",
+            &mut self.speech.sherpa_onnx.tts.kokoro.lexicon,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_TTS_KOKORO_DICT_DIR",
+            &mut self.speech.sherpa_onnx.tts.kokoro.dict_dir,
+        );
+        apply_string(
+            env,
+            "SHERPA_ONNX_TTS_KOKORO_LANG",
+            &mut self.speech.sherpa_onnx.tts.kokoro.lang,
+        );
 
         apply_string(env, "AGENT_API_LISTEN", &mut self.agent_api.listen);
         apply_bool(
@@ -231,13 +388,50 @@ impl AppConfig {
         apply_string(env, "AGENT_VOICE_LOG_LEVEL", &mut self.logging.level);
     }
 
+    fn sync_legacy_openai_sections(&mut self) {
+        let default_llm = OpenAiLlmConfig::default();
+        let default_openai = OpenAiConfig::default();
+
+        // Sync responses_api_url
+        if self.llm.openai.responses_api_url != default_llm.responses_api_url {
+            // llm.openai has an explicit value; it takes precedence.
+            self.openai.responses_api_url = self.llm.openai.responses_api_url.clone();
+        } else if self.openai.responses_api_url != default_openai.responses_api_url {
+            // Legacy openai.responses_api_url is set and llm is default; propagate legacy value.
+            self.llm.openai.responses_api_url = self.openai.responses_api_url.clone();
+        }
+
+        // Sync model / response_model
+        if self.llm.openai.model != default_llm.model {
+            // llm.openai has an explicit value; it takes precedence.
+            self.openai.response_model = self.llm.openai.model.clone();
+        } else if self.openai.response_model != default_openai.response_model {
+            // Legacy openai.response_model is set and llm is default; propagate legacy value.
+            self.llm.openai.model = self.openai.response_model.clone();
+        }
+
+        // Sync instructions / response_instructions
+        if self.llm.openai.instructions != default_llm.instructions {
+            // llm.openai has an explicit value; it takes precedence.
+            self.openai.response_instructions = self.llm.openai.instructions.clone();
+        } else if self.openai.response_instructions != default_openai.response_instructions {
+            // Legacy openai.response_instructions is set and llm is default; propagate legacy value.
+            self.llm.openai.instructions = self.openai.response_instructions.clone();
+        }
+    }
+
     fn validate(&self) -> Result<()> {
-        if self
-            .openai
-            .api_key
-            .as_deref()
-            .unwrap_or_default()
-            .is_empty()
+        let requires_openai = self.speech.uses_openai_stt()
+            || self.speech.uses_openai_tts()
+            || self.llm.uses_openai()
+            || self.voice.uses_openai();
+        if requires_openai
+            && self
+                .openai
+                .api_key
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
         {
             bail!("OpenAI API key is required via config or OPENAI_API_KEY");
         }
@@ -252,6 +446,12 @@ impl AppConfig {
         }
         if self.agent_api.listen.is_empty() {
             bail!("agent_api.listen must not be empty");
+        }
+        self.speech.validate()?;
+        self.llm.validate()?;
+        self.voice.validate()?;
+        if !self.voice.is_enabled() && !self.llm.is_enabled() {
+            bail!("llm.provider must be configured when voice.provider is disabled");
         }
         Ok(())
     }
@@ -425,6 +625,440 @@ impl Default for OpenAiConfig {
             response_instructions: default_response_instructions(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Selects which backend handles STT or TTS at runtime.
+pub enum SpeechProvider {
+    #[serde(rename = "openai", alias = "open_ai")]
+    #[default]
+    OpenAi,
+    SherpaOnnx,
+}
+
+impl SpeechProvider {
+    /// Parses a provider from a config or environment string.
+    pub fn parse(value: &str) -> Option<Self> {
+        match normalize_env_value(value).to_ascii_lowercase().as_str() {
+            "openai" => Some(Self::OpenAi),
+            "sherpa_onnx" | "sherpa-onnx" | "sherpa" => Some(Self::SherpaOnnx),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Selects which backend handles structured reply generation.
+pub enum LlmProvider {
+    #[serde(rename = "openai", alias = "open_ai")]
+    #[default]
+    OpenAi,
+    None,
+}
+
+impl LlmProvider {
+    /// Parses an LLM provider from a config or environment string.
+    pub fn parse(value: &str) -> Option<Self> {
+        match normalize_env_value(value).to_ascii_lowercase().as_str() {
+            "openai" => Some(Self::OpenAi),
+            "none" | "disabled" | "off" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Selects whether calls use the split STT/LLM/TTS path or a unified voice model.
+pub enum VoiceProvider {
+    #[default]
+    Disabled,
+    #[serde(rename = "openai", alias = "open_ai")]
+    OpenAi,
+}
+
+impl VoiceProvider {
+    /// Parses a voice provider from a config or environment string.
+    pub fn parse(value: &str) -> Option<Self> {
+        match normalize_env_value(value).to_ascii_lowercase().as_str() {
+            "openai" => Some(Self::OpenAi),
+            "none" | "disabled" | "off" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// Runtime LLM backend selection and provider-specific settings.
+pub struct LlmConfig {
+    #[serde(default)]
+    pub provider: LlmProvider,
+    #[serde(default)]
+    pub openai: OpenAiLlmConfig,
+}
+
+impl LlmConfig {
+    fn validate(&self) -> Result<()> {
+        if self.uses_openai() && self.openai.model.trim().is_empty() {
+            bail!("llm.openai.model must not be empty");
+        }
+        Ok(())
+    }
+
+    /// Returns true when OpenAI handles LLM calls.
+    pub fn uses_openai(&self) -> bool {
+        self.provider == LlmProvider::OpenAi
+    }
+
+    /// Returns true when a standalone LLM backend is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.provider != LlmProvider::None
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+/// OpenAI Responses settings for standalone LLM turns.
+pub struct OpenAiLlmConfig {
+    #[serde(default = "default_responses_api_url")]
+    pub responses_api_url: String,
+    #[serde(default = "default_response_model")]
+    pub model: String,
+    #[serde(default = "default_response_instructions")]
+    pub instructions: Option<String>,
+}
+
+impl Default for OpenAiLlmConfig {
+    fn default() -> Self {
+        Self {
+            responses_api_url: default_responses_api_url(),
+            model: default_response_model(),
+            instructions: default_response_instructions(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// Runtime unified voice-model selection and provider-specific settings.
+pub struct VoiceConfig {
+    #[serde(default)]
+    pub provider: VoiceProvider,
+    #[serde(default)]
+    pub openai: OpenAiVoiceConfig,
+}
+
+impl VoiceConfig {
+    fn validate(&self) -> Result<()> {
+        if self.uses_openai() && self.openai.model.trim().is_empty() {
+            bail!("voice.openai.model must not be empty");
+        }
+        Ok(())
+    }
+
+    /// Returns true when a unified voice model is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.provider != VoiceProvider::Disabled
+    }
+
+    /// Returns true when OpenAI handles full duplex voice turns.
+    pub fn uses_openai(&self) -> bool {
+        self.provider == VoiceProvider::OpenAi
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+/// OpenAI Realtime voice-model settings for full audio-in/audio-out calls.
+pub struct OpenAiVoiceConfig {
+    #[serde(default = "default_openai_voice_api_url")]
+    pub api_url: String,
+    #[serde(default = "default_openai_voice_model")]
+    pub model: String,
+    #[serde(default = "default_openai_voice_name")]
+    pub voice: String,
+    #[serde(default = "default_openai_voice_instructions")]
+    pub instructions: Option<String>,
+    #[serde(default = "default_openai_voice_input_transcription_model")]
+    pub input_transcription_model: Option<String>,
+}
+
+impl Default for OpenAiVoiceConfig {
+    fn default() -> Self {
+        Self {
+            api_url: default_openai_voice_api_url(),
+            model: default_openai_voice_model(),
+            voice: default_openai_voice_name(),
+            instructions: default_openai_voice_instructions(),
+            input_transcription_model: default_openai_voice_input_transcription_model(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// Runtime speech backend selection and local sherpa-onnx settings.
+pub struct SpeechConfig {
+    #[serde(default)]
+    pub stt_provider: SpeechProvider,
+    #[serde(default)]
+    pub tts_provider: SpeechProvider,
+    #[serde(default)]
+    pub sherpa_onnx: SherpaOnnxConfig,
+}
+
+impl SpeechConfig {
+    fn validate(&self) -> Result<()> {
+        if self.uses_local_stt() {
+            self.sherpa_onnx.validate_stt()?;
+        }
+        if self.uses_local_tts() {
+            self.sherpa_onnx.validate_tts()?;
+        }
+        Ok(())
+    }
+
+    /// Returns true when local sherpa-onnx STT is selected.
+    pub fn uses_local_stt(&self) -> bool {
+        self.stt_provider == SpeechProvider::SherpaOnnx
+    }
+
+    /// Returns true when local sherpa-onnx TTS is selected.
+    pub fn uses_local_tts(&self) -> bool {
+        self.tts_provider == SpeechProvider::SherpaOnnx
+    }
+
+    /// Returns true when OpenAI transcription is selected.
+    pub fn uses_openai_stt(&self) -> bool {
+        self.stt_provider == SpeechProvider::OpenAi
+    }
+
+    /// Returns true when OpenAI TTS is selected.
+    pub fn uses_openai_tts(&self) -> bool {
+        self.tts_provider == SpeechProvider::OpenAi
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Local sherpa-onnx runtime paths and model selections.
+pub struct SherpaOnnxConfig {
+    #[serde(default = "default_sherpa_python_bin")]
+    pub python_bin: String,
+    #[serde(default = "default_sherpa_bridge_script")]
+    pub bridge_script: String,
+    #[serde(default = "default_sherpa_provider")]
+    pub provider: String,
+    #[serde(default = "default_sherpa_num_threads")]
+    pub num_threads: u32,
+    #[serde(default = "default_sherpa_warmup_on_startup")]
+    pub warmup_on_startup: bool,
+    #[serde(default = "default_sherpa_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+    #[serde(default = "default_sherpa_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    #[serde(default)]
+    pub debug: bool,
+    #[serde(default)]
+    pub stt: SherpaOnnxSttConfig,
+    #[serde(default)]
+    pub tts: SherpaOnnxTtsConfig,
+}
+
+impl SherpaOnnxConfig {
+    fn validate_stt(&self) -> Result<()> {
+        require_non_empty("speech.sherpa_onnx.python_bin", &self.python_bin)?;
+        require_existing_path("speech.sherpa_onnx.python_bin", &self.python_bin)?;
+        require_non_empty("speech.sherpa_onnx.bridge_script", &self.bridge_script)?;
+        require_existing_path("speech.sherpa_onnx.bridge_script", &self.bridge_script)?;
+
+        match normalized_model_family(&self.stt.model_family).as_str() {
+            "moonshine" | "moonshine_v1" => {
+                require_existing_path(
+                    "speech.sherpa_onnx.stt.moonshine.preprocessor",
+                    &self.stt.moonshine.preprocessor,
+                )?;
+                require_existing_path(
+                    "speech.sherpa_onnx.stt.moonshine.encoder",
+                    &self.stt.moonshine.encoder,
+                )?;
+                require_existing_path(
+                    "speech.sherpa_onnx.stt.moonshine.uncached_decoder",
+                    &self.stt.moonshine.uncached_decoder,
+                )?;
+                require_existing_path(
+                    "speech.sherpa_onnx.stt.moonshine.cached_decoder",
+                    &self.stt.moonshine.cached_decoder,
+                )?;
+                require_existing_path(
+                    "speech.sherpa_onnx.stt.moonshine.tokens",
+                    &self.stt.moonshine.tokens,
+                )?;
+            }
+            "moonshine_v2" => {
+                require_existing_path(
+                    "speech.sherpa_onnx.stt.moonshine.encoder",
+                    &self.stt.moonshine.encoder,
+                )?;
+                require_existing_path(
+                    "speech.sherpa_onnx.stt.moonshine.decoder",
+                    &self.stt.moonshine.decoder,
+                )?;
+                require_existing_path(
+                    "speech.sherpa_onnx.stt.moonshine.tokens",
+                    &self.stt.moonshine.tokens,
+                )?;
+            }
+            other => bail!("unsupported sherpa-onnx STT model family {}", other),
+        }
+        Ok(())
+    }
+
+    fn validate_tts(&self) -> Result<()> {
+        require_non_empty("speech.sherpa_onnx.python_bin", &self.python_bin)?;
+        require_existing_path("speech.sherpa_onnx.python_bin", &self.python_bin)?;
+        require_non_empty("speech.sherpa_onnx.bridge_script", &self.bridge_script)?;
+        require_existing_path("speech.sherpa_onnx.bridge_script", &self.bridge_script)?;
+
+        match normalized_model_family(&self.tts.model_family).as_str() {
+            "kokoro" => {
+                require_existing_path(
+                    "speech.sherpa_onnx.tts.kokoro.model",
+                    &self.tts.kokoro.model,
+                )?;
+                require_existing_path(
+                    "speech.sherpa_onnx.tts.kokoro.voices",
+                    &self.tts.kokoro.voices,
+                )?;
+                require_existing_path(
+                    "speech.sherpa_onnx.tts.kokoro.tokens",
+                    &self.tts.kokoro.tokens,
+                )?;
+                require_existing_path(
+                    "speech.sherpa_onnx.tts.kokoro.data_dir",
+                    &self.tts.kokoro.data_dir,
+                )?;
+                require_optional_existing_paths(
+                    "speech.sherpa_onnx.tts.kokoro.lexicon",
+                    &self.tts.kokoro.lexicon,
+                )?;
+                require_optional_existing_path(
+                    "speech.sherpa_onnx.tts.kokoro.dict_dir",
+                    &self.tts.kokoro.dict_dir,
+                )?;
+            }
+            other => bail!("unsupported sherpa-onnx TTS model family {}", other),
+        }
+        Ok(())
+    }
+}
+
+impl Default for SherpaOnnxConfig {
+    fn default() -> Self {
+        Self {
+            python_bin: default_sherpa_python_bin(),
+            bridge_script: default_sherpa_bridge_script(),
+            provider: default_sherpa_provider(),
+            num_threads: default_sherpa_num_threads(),
+            warmup_on_startup: default_sherpa_warmup_on_startup(),
+            startup_timeout_ms: default_sherpa_startup_timeout_ms(),
+            request_timeout_ms: default_sherpa_request_timeout_ms(),
+            debug: false,
+            stt: SherpaOnnxSttConfig::default(),
+            tts: SherpaOnnxTtsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Local sherpa-onnx STT model selection.
+pub struct SherpaOnnxSttConfig {
+    #[serde(default = "default_sherpa_stt_model_family")]
+    pub model_family: String,
+    #[serde(default)]
+    pub moonshine: MoonshineConfig,
+}
+
+impl Default for SherpaOnnxSttConfig {
+    fn default() -> Self {
+        Self {
+            model_family: default_sherpa_stt_model_family(),
+            moonshine: MoonshineConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Moonshine model paths for local offline transcription.
+pub struct MoonshineConfig {
+    #[serde(default = "default_moonshine_version")]
+    pub version: String,
+    #[serde(default)]
+    pub preprocessor: String,
+    #[serde(default)]
+    pub encoder: String,
+    #[serde(default)]
+    pub uncached_decoder: String,
+    #[serde(default)]
+    pub cached_decoder: String,
+    #[serde(default)]
+    pub decoder: String,
+    #[serde(default)]
+    pub tokens: String,
+}
+
+impl Default for MoonshineConfig {
+    fn default() -> Self {
+        Self {
+            version: default_moonshine_version(),
+            preprocessor: String::new(),
+            encoder: String::new(),
+            uncached_decoder: String::new(),
+            cached_decoder: String::new(),
+            decoder: String::new(),
+            tokens: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Local sherpa-onnx TTS model selection.
+pub struct SherpaOnnxTtsConfig {
+    #[serde(default = "default_sherpa_tts_model_family")]
+    pub model_family: String,
+    #[serde(default = "default_sherpa_tts_speed")]
+    pub speed: f32,
+    #[serde(default)]
+    pub speaker_id: u32,
+    #[serde(default)]
+    pub kokoro: SherpaOnnxKokoroConfig,
+}
+
+impl Default for SherpaOnnxTtsConfig {
+    fn default() -> Self {
+        Self {
+            model_family: default_sherpa_tts_model_family(),
+            speed: default_sherpa_tts_speed(),
+            speaker_id: default_sherpa_tts_speaker_id(),
+            kokoro: SherpaOnnxKokoroConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// Kokoro model paths for local multi-speaker TTS.
+pub struct SherpaOnnxKokoroConfig {
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub voices: String,
+    #[serde(default)]
+    pub tokens: String,
+    #[serde(default)]
+    pub data_dir: String,
+    #[serde(default)]
+    pub lexicon: String,
+    #[serde(default)]
+    pub dict_dir: String,
+    #[serde(default)]
+    pub lang: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -622,6 +1256,26 @@ fn default_response_model() -> String {
     "gpt-4o-mini".to_string()
 }
 
+fn default_openai_voice_api_url() -> String {
+    "https://api.openai.com/v1/chat/completions".to_string()
+}
+
+fn default_openai_voice_model() -> String {
+    "gpt-audio-1.5".to_string()
+}
+
+fn default_openai_voice_name() -> String {
+    "alloy".to_string()
+}
+
+fn default_openai_voice_instructions() -> Option<String> {
+    default_response_instructions()
+}
+
+fn default_openai_voice_input_transcription_model() -> Option<String> {
+    Some(default_transcription_model())
+}
+
 fn default_tts_format() -> String {
     "wav".to_string()
 }
@@ -685,6 +1339,56 @@ fn default_response_instructions() -> Option<String> {
     )
 }
 
+fn default_sherpa_python_bin() -> String {
+    "./.venv/bin/python".to_string()
+}
+
+fn default_sherpa_bridge_script() -> String {
+    "./python/sherpa_onnx_bridge.py".to_string()
+}
+
+fn default_sherpa_provider() -> String {
+    "cpu".to_string()
+}
+
+fn default_sherpa_num_threads() -> u32 {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().clamp(2, 8) as u32)
+        .unwrap_or(4)
+}
+
+const fn default_sherpa_warmup_on_startup() -> bool {
+    true
+}
+
+const fn default_sherpa_startup_timeout_ms() -> u64 {
+    120_000
+}
+
+const fn default_sherpa_request_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_sherpa_stt_model_family() -> String {
+    "moonshine".to_string()
+}
+
+fn default_moonshine_version() -> String {
+    "v1".to_string()
+}
+
+fn default_sherpa_tts_model_family() -> String {
+    "kokoro".to_string()
+}
+
+const fn default_sherpa_tts_speed() -> f32 {
+    1.0
+}
+
+const fn default_sherpa_tts_speaker_id() -> u32 {
+    2
+}
+
 const fn default_turn_silence_ms() -> u64 {
     1200
 }
@@ -694,7 +1398,7 @@ const fn default_min_utterance_ms() -> u64 {
 }
 
 const fn default_post_tts_input_suppression_ms() -> u64 {
-    1200
+    250
 }
 
 const fn default_idle_prompt_after_ms() -> u64 {
@@ -706,7 +1410,7 @@ fn default_idle_prompt_text() -> String {
 }
 
 const fn default_vad_threshold() -> u16 {
-    500
+    250
 }
 
 const fn default_auto_end_calls() -> bool {
@@ -762,6 +1466,12 @@ fn apply_u64(env: &std::collections::HashMap<String, String>, key: &str, target:
     }
 }
 
+fn apply_f32(env: &std::collections::HashMap<String, String>, key: &str, target: &mut f32) {
+    if let Some(value) = parse_number::<f32>(env, key) {
+        *target = value;
+    }
+}
+
 fn apply_optional_u64(
     env: &std::collections::HashMap<String, String>,
     key: &str,
@@ -779,6 +1489,36 @@ fn apply_optional_u64(
 
 fn apply_bool(env: &std::collections::HashMap<String, String>, key: &str, target: &mut bool) {
     if let Some(value) = env.get(key).and_then(|value| parse_bool(value)) {
+        *target = value;
+    }
+}
+
+fn apply_speech_provider(
+    env: &std::collections::HashMap<String, String>,
+    key: &str,
+    target: &mut SpeechProvider,
+) {
+    if let Some(value) = env.get(key).and_then(|value| SpeechProvider::parse(value)) {
+        *target = value;
+    }
+}
+
+fn apply_llm_provider(
+    env: &std::collections::HashMap<String, String>,
+    key: &str,
+    target: &mut LlmProvider,
+) {
+    if let Some(value) = env.get(key).and_then(|value| LlmProvider::parse(value)) {
+        *target = value;
+    }
+}
+
+fn apply_voice_provider(
+    env: &std::collections::HashMap<String, String>,
+    key: &str,
+    target: &mut VoiceProvider,
+) {
+    if let Some(value) = env.get(key).and_then(|value| VoiceProvider::parse(value)) {
         *target = value;
     }
 }
@@ -830,6 +1570,53 @@ fn normalize_env_value(value: &str) -> &str {
         }
     }
     trimmed
+}
+
+fn require_non_empty(field: &str, value: &str) -> Result<()> {
+    if normalize_env_value(value).is_empty() {
+        bail!("{} must not be empty", field);
+    }
+    Ok(())
+}
+
+fn require_existing_path(field: &str, value: &str) -> Result<()> {
+    require_non_empty(field, value)?;
+    if !Path::new(value).exists() {
+        bail!("{} does not exist: {}", field, value);
+    }
+    Ok(())
+}
+
+fn require_optional_existing_path(field: &str, value: &str) -> Result<()> {
+    if normalize_env_value(value).is_empty() {
+        return Ok(());
+    }
+    if !Path::new(value).exists() {
+        bail!("{} does not exist: {}", field, value);
+    }
+    Ok(())
+}
+
+fn require_optional_existing_paths(field: &str, value: &str) -> Result<()> {
+    if normalize_env_value(value).is_empty() {
+        return Ok(());
+    }
+    for part in normalize_env_value(value).split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !Path::new(trimmed).exists() {
+            bail!("{} does not exist: {}", field, trimmed);
+        }
+    }
+    Ok(())
+}
+
+fn normalized_model_family(value: &str) -> String {
+    normalize_env_value(value)
+        .replace('-', "_")
+        .to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -1003,5 +1790,54 @@ mod tests {
         assert_eq!(parse_bool("0"), Some(false));
         assert_eq!(parse_bool("off"), Some(false));
         assert_eq!(parse_bool("maybe"), None);
+    }
+
+    #[test]
+    fn speech_provider_env_overrides_apply() {
+        let mut config = AppConfig::default();
+        let env = HashMap::from([
+            ("SPEECH_STT_PROVIDER".to_string(), "sherpa-onnx".to_string()),
+            ("SPEECH_TTS_PROVIDER".to_string(), "sherpa_onnx".to_string()),
+            ("SHERPA_ONNX_TTS_SPEAKER_ID".to_string(), "3".to_string()),
+            ("SHERPA_ONNX_TTS_SPEED".to_string(), "1.25".to_string()),
+            (
+                "SHERPA_ONNX_WARMUP_ON_STARTUP".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "SHERPA_ONNX_REQUEST_TIMEOUT_MS".to_string(),
+                "45000".to_string(),
+            ),
+        ]);
+
+        config.apply_env_overrides_from_map(&env);
+
+        assert_eq!(config.speech.stt_provider, SpeechProvider::SherpaOnnx);
+        assert_eq!(config.speech.tts_provider, SpeechProvider::SherpaOnnx);
+        assert_eq!(config.speech.sherpa_onnx.tts.speaker_id, 3);
+        assert_eq!(config.speech.sherpa_onnx.tts.speed, 1.25);
+        assert!(!config.speech.sherpa_onnx.warmup_on_startup);
+        assert_eq!(config.speech.sherpa_onnx.request_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn llm_and_voice_env_overrides_apply() {
+        let mut config = AppConfig::default();
+        let env = HashMap::from([
+            ("LLM_PROVIDER".to_string(), "none".to_string()),
+            ("VOICE_PROVIDER".to_string(), "openai".to_string()),
+            (
+                "OPENAI_VOICE_MODEL".to_string(),
+                "gpt-audio-1.5".to_string(),
+            ),
+            ("OPENAI_VOICE_NAME".to_string(), "alloy".to_string()),
+        ]);
+
+        config.apply_env_overrides_from_map(&env);
+
+        assert_eq!(config.llm.provider, LlmProvider::None);
+        assert_eq!(config.voice.provider, VoiceProvider::OpenAi);
+        assert_eq!(config.voice.openai.model, "gpt-audio-1.5");
+        assert_eq!(config.voice.openai.voice, "alloy");
     }
 }

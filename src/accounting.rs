@@ -316,28 +316,39 @@ impl AccountingStore {
     /// Returns a path for writing accounting CSV data that is constrained to a
     /// dedicated subdirectory, to avoid writing to arbitrary filesystem locations.
     fn safe_log_path(&self, configured: &str) -> Result<PathBuf> {
-        let base = PathBuf::from("logs");
+        let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+        let base = cwd.join("accounting");
         let configured_path = Path::new(configured);
-        let mut relative = PathBuf::new();
         for component in configured_path.components() {
-            match component {
-                std::path::Component::Normal(part) => relative.push(part),
-                std::path::Component::CurDir => {}
-                std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_) => {
-                    bail!(
-                        "accounting log path must stay within {}: {}",
-                        base.display(),
-                        configured
-                    );
-                }
+            if matches!(component, std::path::Component::ParentDir) {
+                bail!(
+                    "accounting log path must stay within {}: {}",
+                    base.display(),
+                    configured
+                );
             }
         }
-        if relative.as_os_str().is_empty() {
+        let candidate = if configured_path.is_absolute() {
+            configured_path.to_path_buf()
+        } else {
+            cwd.join(configured_path)
+        };
+        let Some(file_name) = candidate.file_name() else {
             bail!("accounting log path must include a file name");
-        }
-        Ok(base.join(relative))
+        };
+
+        let log_path = if candidate.starts_with(&base) {
+            candidate
+        } else if configured_path.is_absolute() {
+            bail!(
+                "accounting log path must stay within {}: {}",
+                base.display(),
+                configured
+            );
+        } else {
+            base.join(file_name)
+        };
+        Ok(log_path)
     }
 
     pub fn record_api_call(
@@ -873,7 +884,7 @@ mod tests {
         let error = store
             .safe_log_path("../../etc/passwd")
             .expect_err("traversal should fail");
-        assert!(error.to_string().contains("must stay within logs"));
+        assert!(error.to_string().contains("must stay within"));
     }
 
     #[test]
@@ -882,16 +893,35 @@ mod tests {
         let error = store
             .safe_log_path("/tmp/api_calls.csv")
             .expect_err("absolute path should fail");
-        assert!(error.to_string().contains("must stay within logs"));
+        assert!(error.to_string().contains("must stay within"));
     }
 
     #[test]
-    fn safe_log_path_preserves_colon_in_filename() {
+    fn safe_log_path_places_relative_files_under_accounting() {
         let store = test_store();
         let path = store
             .safe_log_path("foo:bar.csv")
             .expect("colon file name should be preserved");
-        assert_eq!(path, PathBuf::from("logs").join("foo:bar.csv"));
+        assert_eq!(
+            path,
+            std::env::current_dir()
+                .expect("cwd")
+                .join("accounting")
+                .join("foo:bar.csv")
+        );
+    }
+
+    #[test]
+    fn safe_log_path_allows_absolute_paths_under_accounting() {
+        let store = test_store();
+        let path = std::env::current_dir()
+            .expect("cwd")
+            .join("accounting")
+            .join("api_calls.csv");
+        let resolved = store
+            .safe_log_path(&path.display().to_string())
+            .expect("absolute accounting path should work");
+        assert_eq!(resolved, path);
     }
 
     #[test]

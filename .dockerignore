@@ -1,3 +1,13 @@
 .git
+.venv
 .env
 config/agent_voice.yaml
+target/*
+!target/debug/
+target/debug/*
+!target/debug/agent_voice
+models
+data
+website/node_modules
+website/build
+website/.docusaurus
