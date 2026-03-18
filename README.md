@@ -192,15 +192,16 @@ Linux host networking is the simplest way to run SIP + RTP in Docker without fig
 ```bash
 cp .env.example .env
 make uv-sync
-make docker-build
+make docker-pull
 make docker-up
 make docker-logs
 ```
 
 The container runs from environment variables by default. If you prefer a mounted YAML file, add a bind mount and set `AGENT_VOICE_CONFIG=/app/config/agent_voice.yaml`.
-The Makefile-backed Compose targets automatically use `.env` when present and fall back to `.env.example` for build and config rendering.
-`make docker-build` first runs `cargo build` on the host and then packages `target/debug/agent_voice` into the runtime image, which avoids the release-build cross-device issue on this host.
+The Makefile-backed Compose targets automatically use `.env` when present and fall back to `.env.example` for image pulls and config rendering.
+Container images are published by GitHub Actions to `ghcr.io/djh00t/agent_voice`, and the tv04 deploy runner pulls that image before restarting the Compose service.
 The bundled Compose file sets `AGENT_VOICE_CONFIG=/app/config/agent_voice.yaml` so the mounted YAML baseline is always readable inside the container, but environment variables still override that file on startup.
+Use `AGENT_VOICE_IMAGE` if you need to pin Compose to a specific published tag such as `sha-<commit>` instead of the default `main` tag.
 Compose defaults the container user to `0:0` so it can refresh the mounted pricing catalog and append accounting CSV rows on bind-mounted host directories. Override `AGENT_VOICE_UID` and `AGENT_VOICE_GID` if you want a different runtime user.
 Inbound auto-answer delay is controlled with `INCOMING_ANSWER_DELAY_MS`. Set it to `2000` for a two-second delay before answering.
 Inbound greeting text is controlled with `INCOMING_GREETING_TEXT`. Caller turn detection is tuned with `CALL_TURN_SILENCE_MS`, `CALL_MIN_UTTERANCE_MS`, and `CALL_VAD_THRESHOLD`.
@@ -215,10 +216,12 @@ If you enable local sherpa-onnx speech, the Compose file also mounts `./models` 
 
 ## Deployment
 
-Use the bundled systemd unit at [deploy/agent-voice.service](/Users/djh/agent_voice_work/deploy/agent-voice.service). An optional environment template is included at [deploy/agent-voice.env.example](/Users/djh/agent_voice_work/deploy/agent-voice.env.example). The service expects:
+The recommended deployment path is the bundled Compose stack at `/opt/agent_voice`, with GitHub Actions publishing the image to GHCR and the tv04 self-hosted runner updating that checkout, pulling the image, and restarting `agent-voice`.
+
+Use the bundled systemd unit at [deploy/agent-voice.service](/opt/agent_voice/deploy/agent-voice.service) only for non-container deployments. An optional environment template is included at [deploy/agent-voice.env.example](/opt/agent_voice/deploy/agent-voice.env.example). The service expects:
 
 - project path: `/opt/agent_voice`
 - binary path: `/opt/agent_voice/target/release/agent_voice`
 - config path: `/opt/agent_voice/config/agent_voice.yaml`
 
-Detailed smoke-test steps are in [docs/testing.md](/Users/djh/agent_voice_work/docs/testing.md).
+Detailed smoke-test steps are in [docs/testing.md](/opt/agent_voice/docs/testing.md).
