@@ -24,11 +24,15 @@ That makes the Docker and Compose workflow environment-first while still allowin
 
 - `OPENAI_API_KEY`
 - `OPENAI_TRANSCRIPTION_MODEL`
-- `OPENAI_RESPONSE_MODEL`
 - `OPENAI_TTS_MODEL`
 - `OPENAI_TTS_VOICE`
 - `OPENAI_TTS_INSTRUCTIONS`
-- `OPENAI_RESPONSE_INSTRUCTIONS`
+- `OPENAI_LLM_MODEL`
+- `OPENAI_LLM_INSTRUCTIONS`
+- `OPENAI_VOICE_API_URL`
+- `OPENAI_VOICE_MODEL`
+- `OPENAI_VOICE_NAME`
+- `OPENAI_VOICE_INSTRUCTIONS`
 
 ### Speech backends
 
@@ -57,6 +61,25 @@ That makes the Docker and Compose workflow environment-first while still allowin
 - `SHERPA_ONNX_TTS_KOKORO_TOKENS`
 - `SHERPA_ONNX_TTS_KOKORO_DATA_DIR`
 - `SHERPA_ONNX_TTS_KOKORO_LANG`
+
+### Standalone LLM
+
+- `LLM_PROVIDER`
+- `OPENAI_RESPONSES_API_URL`
+- `OPENAI_LLM_API_URL`
+- `OPENAI_RESPONSE_MODEL`
+- `OPENAI_LLM_MODEL`
+- `OPENAI_RESPONSE_INSTRUCTIONS`
+- `OPENAI_LLM_INSTRUCTIONS`
+
+### Unified voice model
+
+- `VOICE_PROVIDER`
+- `OPENAI_VOICE_API_URL`
+- `OPENAI_VOICE_MODEL`
+- `OPENAI_VOICE_NAME`
+- `OPENAI_VOICE_INSTRUCTIONS`
+- `OPENAI_VOICE_INPUT_TRANSCRIPTION_MODEL`
 
 ### Call behavior
 
@@ -98,6 +121,24 @@ The Compose stack mounts `./models` at `/app/models`, so the default local model
 - `/app/models/tts/kokoro`
 
 The repo-managed Python environment is expected at `./.venv` on the host and `/app/.venv` in Docker. Use `make uv-sync` to create it.
+
+## Split vs voice-model modes
+
+The default runtime is the split pipeline:
+
+- configured STT backend transcribes caller audio
+- configured LLM backend generates the reply text
+- configured TTS backend generates assistant audio
+
+Set `VOICE_PROVIDER=openai` to switch assistant reply generation to an OpenAI audio chat-completions model such as `gpt-audio-1.5`.
+
+In voice-model mode:
+
+- the configured STT backend still runs for transcript bookkeeping, caller-history context, and phone-book flows
+- the standalone `llm` backend is optional and can be set to `none`
+- assistant reply text and audio come from the voice model in one API call
+
+If `VOICE_PROVIDER=disabled`, `LLM_PROVIDER` must remain enabled.
 
 ## Phone-book rules
 
