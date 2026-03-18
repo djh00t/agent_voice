@@ -14,12 +14,12 @@
 
 ## Runtime
 
-- `make docker-build`
+- `make docker-pull`
 - `make docker-up`
 - `curl -sS http://127.0.0.1:8089/healthz`
 - `curl -sS http://127.0.0.1:8089/v1/status`
 
-The Makefile-backed Compose targets use `.env` when it exists and otherwise fall back to `.env.example`, so release validation can build and render config without a secrets file.
+The Makefile-backed Compose targets use `.env` when it exists and otherwise fall back to `.env.example`, so release validation can pull the published image and render config without a secrets file.
 
 ## One-shot local release gate
 
