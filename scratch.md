@@ -18,6 +18,16 @@
 
 `sherpa-onnx-moonshine-v1` calls (STT) + `sherpa-onnx-kokoro` (TTS), OpenAI LLM still `gpt-4o-mini`: 6 calls.
 
+### Snapshot
+
+- Call IDs: 
+  - `106d28773d4d184a50c458084986e551@10.0.6.10:5050`
+  - `60f3d23e29f9b5c95d6bd6133f9ed3ae@10.0.6.10:5050`
+  - `2ea64b3c2aa1e30b0d7af3630f5f8546@10.0.6.10:5050`
+  - `642bb09c40bd31641decb7d53524ee20@10.0.6.10:5050`
+  - `3ddf303009a260982e526bad04cbbaec@10.0.6.10:5050`
+  - `5b6d979a5f57dc0d2fe2d57e70261980@10.0.6.10:5050`
+
 | Metric | Avg | p50 | Min | Max |
 | --- | ---: | ---: | ---: | ---: |
 | Call duration | 27.961 s | 21.963 s | 3.442 s | 39.489 s |
@@ -26,6 +36,13 @@
 | tts.reply | 7,194 ms | 4,884 ms | 1,942 ms | 24,300 ms |
 | Full turn (trans+resp+tts) | 9,270 ms | 6,670 ms | 3,432 ms | 29,076 ms |
 | Cost | $0.000113 | — | — | — |
+
+### Component timings (ms, from accounting api call rows)
+
+- STT (`transcription`): `154 ms` average, `143 ms` median
+- LLM (`responses.reply`): `1,921 ms` average, `1,444 ms` median
+- TTS (`tts.reply`): `7,194 ms` average, `4,884 ms` median
+- Turn aggregate (`transcription + responses.reply + tts.reply`): `9,270 ms` average
 
 ## Notes
 
