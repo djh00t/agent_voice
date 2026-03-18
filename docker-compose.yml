@@ -1,9 +1,7 @@
 services:
   agent-voice:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: agent_voice:local
+    image: ${AGENT_VOICE_IMAGE:-ghcr.io/djh00t/agent_voice:main}
+    pull_policy: always
     container_name: agent_voice
     user: "${AGENT_VOICE_UID:-0}:${AGENT_VOICE_GID:-0}"
     network_mode: host
