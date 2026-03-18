@@ -18,6 +18,8 @@ pub mod api;
 pub mod audio;
 /// Application configuration loading and environment overrides.
 pub mod config;
+/// Standalone LLM backend dispatch and provider selection.
+pub mod llm;
 /// OpenAI API client logic and prompt orchestration.
 pub mod openai;
 /// Persistent caller phone-book storage and validation helpers.
@@ -28,3 +30,9 @@ pub mod service;
 pub mod sherpa_onnx;
 /// Runtime speech backend dispatch and provider selection.
 pub mod speech;
+/// Runtime speech-to-text backend dispatch and provider selection.
+pub mod stt;
+/// Runtime text-to-speech backend dispatch and provider selection.
+pub mod tts;
+/// Runtime unified voice-model dispatch and provider selection.
+pub mod voice;
