@@ -437,6 +437,7 @@ impl OpenAiClients {
         caller_text: Option<&str>,
         wav_bytes: Vec<u8>,
     ) -> Result<VoiceResponseResult> {
+        let audio_byte_len = wav_bytes.len();
         let mut messages = audio_chat_messages(transcript);
         let mut content = Vec::new();
         if let Some(caller_text) = caller_text.map(str::trim).filter(|text| !text.is_empty()) {
@@ -485,7 +486,7 @@ impl OpenAiClients {
             endpoint = %config.api_url,
             model = %config.model,
             message_count = body["messages"].as_array().map(|items| items.len()).unwrap_or(0),
-            request_body = %body,
+            audio_byte_len,
             "sending OpenAI voice-model chat completion request"
         );
         let response = self
