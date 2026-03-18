@@ -1,0 +1,93 @@
+name: Container
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: container-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AGENT_VOICE_IMAGE: ghcr.io/${{ github.repository_owner }}/agent_voice
+  TV04_DEPLOY_PATH: /opt/agent_voice
+
+jobs:
+  publish-image:
+    name: Publish Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.AGENT_VOICE_IMAGE }}
+          tags: |
+            type=raw,value=main,enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=sha,prefix=sha-
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-tv04:
+    name: Deploy tv04
+    if: github.ref == 'refs/heads/main'
+    needs: publish-image
+    runs-on:
+      - self-hosted
+      - tv04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fast-forward the deploy checkout
+        run: |
+          git -C "$TV04_DEPLOY_PATH" fetch origin main
+          git -C "$TV04_DEPLOY_PATH" checkout main
+          git -C "$TV04_DEPLOY_PATH" pull --ff-only origin main
+
+      - name: Pull and restart the runtime container
+        env:
+          AGENT_VOICE_IMAGE: ${{ env.AGENT_VOICE_IMAGE }}:main
+        run: |
+          cd "$TV04_DEPLOY_PATH"
+          docker compose pull agent-voice
+          docker compose up -d agent-voice
+          curl -fsS http://127.0.0.1:8089/healthz
