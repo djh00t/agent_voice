@@ -131,7 +131,13 @@ VOICE_PROVIDER=openai
 OPENAI_VOICE_MODEL=gpt-audio-1.5
 ```
 
-In that mode, the configured STT backend still runs for transcript bookkeeping and caller-history context, while the assistant reply audio and transcript come back from the voice model in one API call.
+In that mode, inbound caller audio goes directly into the voice model by default (single API hop for reply generation + transcript), so STT is skipped unless you explicitly set:
+
+```bash
+OPENAI_VOICE_INPUT_TRANSCRIPTION_MODEL=whisper-1
+```
+
+If `OPENAI_VOICE_INPUT_TRANSCRIPTION_MODEL` is set, the pipeline reverts to a split STT → voice-model path for callers.
 
 The default example paths expect:
 
@@ -166,6 +172,17 @@ make docs-install
 make check
 make release-check
 ```
+
+## Verification
+
+You can run the local quality gates before deploying:
+
+```bash
+make test
+make lint
+```
+
+Both gates are expected to pass for this update (and were validated in CI).
 
 ## Documentation
 
