@@ -7,10 +7,14 @@ Linux host networking is the simplest way to run SIP and RTP in Docker without l
 ```bash
 cp .env.example .env
 make uv-sync
-docker compose build
-docker compose up -d
-docker compose logs -f
+make docker-pull
+make docker-up
+make docker-logs
 ```
+
+GitHub Actions builds and publishes the runtime image to `ghcr.io/djh00t/agent_voice`.
+The tv04 self-hosted runner deploys by fast-forwarding `/opt/agent_voice`, pulling the published image, and restarting the `agent-voice` Compose service.
+Compose defaults to `ghcr.io/djh00t/agent_voice:main`; set `AGENT_VOICE_IMAGE` in `.env` if you need to pin a specific published tag.
 
 The Compose file mounts:
 
@@ -28,4 +32,4 @@ The repo also includes:
 - `deploy/agent-voice.service`
 - `deploy/agent-voice.env.example`
 
-Those are useful for non-container deployments, though the current recommended runtime is Docker Compose.
+Those are useful for non-container deployments, though the current recommended runtime is the GHCR-backed Docker Compose path above.
