@@ -375,6 +375,9 @@ fn reject_parent_dir_components(path: &Path) -> Result<()> {
 }
 
 fn persist_phone_book(path: &Path, phone_book: &PhoneBook) -> Result<()> {
+    // Defensively reject any path that attempts parent directory traversal,
+    // even if upstream callers are expected to provide a normalized path.
+    reject_parent_dir_components(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create phone book dir {}", parent.display()))?;
