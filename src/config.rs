@@ -224,11 +224,6 @@ impl AppConfig {
         );
         apply_string(
             env,
-            "SHERPA_ONNX_STT_MOONSHINE_VERSION",
-            &mut self.speech.sherpa_onnx.stt.moonshine.version,
-        );
-        apply_string(
-            env,
             "SHERPA_ONNX_STT_MOONSHINE_PREPROCESSOR",
             &mut self.speech.sherpa_onnx.stt.moonshine.preprocessor,
         );
