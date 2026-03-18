@@ -2,7 +2,7 @@
 
 ## Local checks
 
-Run these before copying to `tv04`:
+Run these before merging a deployable change:
 
 ```bash
 cargo fmt
@@ -47,12 +47,12 @@ The default example paths assume:
    Leave `ACCOUNTING_REFRESH_PRICING_ON_STARTUP=true` if you want the container to refresh `./accounting/models.json` from the official OpenAI pricing page at boot.
    Set `SPEECH_STT_PROVIDER=sherpa_onnx` and `SPEECH_TTS_PROVIDER=sherpa_onnx` if you want local Moonshine STT plus local Kokoro TTS instead of OpenAI speech.
    Leave `SHERPA_ONNX_WARMUP_ON_STARTUP=true` if you want the container to preload and warm the local speech workers at boot.
-3. Build and start:
+3. Pull and start:
 
 ```bash
-docker compose build
-docker compose up -d
-docker compose logs -f
+make docker-pull
+make docker-up
+make docker-logs
 ```
 
 4. Verify the control API:
@@ -80,37 +80,30 @@ curl -sS http://127.0.0.1:8089/v1/status | jq
 11. Check `./accounting/api_calls.csv` and `./accounting/call_totals.csv` for per-request and per-call token/cost accounting.
     When local sherpa-onnx STT/TTS is active, the speech rows should show `local://sherpa-onnx/...` endpoints and zero API cost for those speech turns.
 
-## Remote build
+## Remote deploy
 
 ```bash
-cd /opt/agent_voice
-cargo build --release
-cargo test
+git push origin main
 ```
+
+GitHub Actions builds and publishes `ghcr.io/djh00t/agent_voice`, then the tv04 self-hosted runner fast-forwards `/opt/agent_voice`, pulls the new image, and restarts the `agent-voice` Compose service.
 
 ## Remote smoke test
 
 1. Put a real SIP config at `/opt/agent_voice/config/agent_voice.yaml`.
-2. Export `OPENAI_API_KEY` or set it in the config.
-3. Start the service:
-
-```bash
-cd /opt/agent_voice
-RUST_LOG=info,agent_voice=debug cargo run --release -- --config /opt/agent_voice/config/agent_voice.yaml
-```
-
-4. In another shell, verify the API:
+2. Set `OPENAI_API_KEY` and any image override in `/opt/agent_voice/.env`.
+3. After the deploy workflow completes, verify the API:
 
 ```bash
 curl -sS http://127.0.0.1:8089/healthz
 curl -sS http://127.0.0.1:8089/v1/status | jq
 ```
 
-5. Place or receive a SIP call.
-6. Confirm the active call appears under `/v1/calls`.
-7. Speak into the call and confirm transcript events appear under `/v1/calls/{call_id}/transcript`.
-8. Confirm the agent generates a spoken reply automatically.
-9. Optionally push manual TTS back into the call:
+4. Place or receive a SIP call.
+5. Confirm the active call appears under `/v1/calls`.
+6. Speak into the call and confirm transcript events appear under `/v1/calls/{call_id}/transcript`.
+7. Confirm the agent generates a spoken reply automatically.
+8. Optionally push manual TTS back into the call:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8089/v1/calls/<call_id>/speak \
@@ -118,7 +111,7 @@ curl -sS -X POST http://127.0.0.1:8089/v1/calls/<call_id>/speak \
   -d '{"text":"This is a remote smoke test of the SIP bridge."}'
 ```
 
-10. Hang up cleanly:
+9. Hang up cleanly:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8089/v1/calls/<call_id>/hangup
