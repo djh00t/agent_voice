@@ -4,6 +4,7 @@
 /data/
 /models/
 /logs/
+/.codex/
 /.venv/
 /python/__pycache__/
 /accounting/api_calls.csv
