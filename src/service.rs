@@ -23,20 +23,26 @@ use crate::accounting::{
 use crate::api;
 use crate::audio::{TELEPHONY_FRAME_SAMPLES, TELEPHONY_RATE, encode_wav_mono_i16};
 use crate::config::{AppConfig, BehaviorConfig};
+use crate::llm::LlmService;
 use crate::openai::{ConversationContext, OpenAiClients, TranscriptEvent, TranscriptSink};
 use crate::phonebook::{
     CallerUpdate, PhoneBookStore, caller_id_display, is_valid_timezone, normalize_caller_id,
     normalize_email_candidate,
 };
-use crate::speech::{SpeechServices, SynthesisOutcome};
+use crate::sherpa_onnx::SherpaOnnxClient;
+use crate::stt::SttService;
+use crate::tts::{SynthesisOutcome, TtsService};
+use crate::voice::VoiceService;
 
 #[derive(Clone)]
 /// The long-running SIP voice service used by the local agent API.
 pub struct VoiceAgentService {
     config: AppConfig,
     phone: Phone,
-    llm: OpenAiClients,
-    speech: SpeechServices,
+    llm: LlmService,
+    stt: SttService,
+    tts: TtsService,
+    voice: VoiceService,
     phone_book: Arc<PhoneBookStore>,
     accounting: Arc<AccountingStore>,
     state: Arc<ServiceState>,
@@ -46,17 +52,41 @@ impl VoiceAgentService {
     /// Constructs a new voice service from fully resolved configuration.
     pub async fn new(config: AppConfig) -> Result<Self> {
         let phone = Phone::new(config.phone_config());
-        let llm = OpenAiClients::new(config.openai.clone())?;
-        let speech = SpeechServices::new(config.speech.clone(), config.openai.clone()).await?;
+        let openai = OpenAiClients::new(config.openai.clone())?;
+        let sherpa = SherpaOnnxClient::new(
+            config.speech.sherpa_onnx.clone(),
+            config.speech.uses_local_stt(),
+            config.speech.uses_local_tts(),
+        )
+        .await?;
+        let llm = LlmService::new(config.llm.clone(), openai.clone());
+        let stt = SttService::new(config.speech.clone(), openai.clone(), sherpa.clone());
+        let tts = TtsService::new(config.speech.clone(), openai.clone(), sherpa);
+        let voice = VoiceService::new(config.voice.clone(), openai);
         let phone_book = Arc::new(PhoneBookStore::load(&config.behavior.phone_book_path)?);
         let accounting = Arc::new(AccountingStore::load(&config.accounting)?);
-        speech.validate_required_models(&accounting, &config.openai)?;
+        let mut required_models = Vec::new();
+        if config.speech.uses_openai_stt() {
+            required_models.push(config.openai.transcription_model.as_str());
+        }
+        if config.speech.uses_openai_tts() {
+            required_models.push(config.openai.tts_model.as_str());
+        }
+        if config.llm.uses_openai() {
+            required_models.push(config.openai.response_model.as_str());
+        }
+        if config.voice.uses_openai() {
+            required_models.push(config.voice.openai.model.as_str());
+        }
+        accounting.validate_required_models(required_models)?;
         let state = Arc::new(ServiceState::default());
         Ok(Self {
             config,
             phone,
             llm,
-            speech,
+            stt,
+            tts,
+            voice,
             phone_book,
             accounting,
             state,
@@ -103,9 +133,19 @@ impl VoiceAgentService {
     pub fn status(&self) -> ServiceStatus {
         ServiceStatus {
             phone_state: self.phone.state().to_string(),
-            stt_backend: self.speech.stt_backend_name().to_string(),
-            tts_backend: self.speech.tts_backend_name().to_string(),
-            tts_model: self.speech.tts_model_name(),
+            conversation_mode: if self.voice.is_enabled() {
+                "voice_model".to_string()
+            } else {
+                "split".to_string()
+            },
+            stt_backend: self.stt.backend_name().to_string(),
+            stt_model: self.stt.model_name(),
+            tts_backend: self.tts.backend_name().to_string(),
+            tts_model: self.tts.model_name(),
+            llm_backend: self.llm.backend_name().to_string(),
+            llm_model: self.llm.model_name(),
+            voice_backend: self.voice.backend_name().to_string(),
+            voice_model: self.voice.model_name(),
             calls: self
                 .state
                 .calls
@@ -175,7 +215,7 @@ impl VoiceAgentService {
             .clone()
             .ok_or_else(|| anyhow!("call media is not ready yet"))?;
         let summary = queue_tts_text(
-            &self.speech,
+            &self.tts,
             &self.accounting,
             &call,
             &tx,
@@ -190,7 +230,7 @@ impl VoiceAgentService {
         .await?;
         info!(
             call_id = %call.call.call_id(),
-            backend = self.speech.tts_backend_name(),
+            backend = self.tts.backend_name(),
             total_tts_ms = summary.total_tts_ms,
             tts_first_audio_ms = summary.first_audio_ms,
             total_playback_ms = summary.total_playback_ms,
@@ -335,7 +375,9 @@ impl VoiceAgentService {
 
         let runtime = tokio::runtime::Handle::current();
         let llm = self.llm.clone();
-        let speech = self.speech.clone();
+        let stt = self.stt.clone();
+        let tts = self.tts.clone();
+        let voice = self.voice.clone();
         let behavior_cfg = self.config.behavior.clone();
         let phone_book = Arc::clone(&self.phone_book);
         let accounting = Arc::clone(&self.accounting);
@@ -344,39 +386,73 @@ impl VoiceAgentService {
         call.on_media(move || {
             let runtime = runtime.clone();
             let llm = llm.clone();
-            let speech = speech.clone();
+            let stt = stt.clone();
+            let tts = tts.clone();
+            let voice = voice.clone();
             let behavior_cfg = behavior_cfg.clone();
             let phone_book = Arc::clone(&phone_book);
             let accounting = Arc::clone(&accounting);
             let call = Arc::clone(&call_for_media);
             let record = Arc::clone(&record_for_media);
             runtime.spawn(async move {
-                if let Err(error) = activate_media_bridge(
-                    llm,
-                    speech,
-                    behavior_cfg,
-                    phone_book,
-                    accounting,
-                    record,
-                    call,
-                )
-                .await
-                {
+                let result = if voice.is_enabled() {
+                    activate_voice_bridge(
+                        stt,
+                        llm,
+                        tts,
+                        voice,
+                        behavior_cfg,
+                        phone_book,
+                        accounting,
+                        record,
+                        call,
+                    )
+                    .await
+                } else {
+                    activate_media_bridge(
+                        llm,
+                        stt,
+                        tts,
+                        behavior_cfg,
+                        phone_book,
+                        accounting,
+                        record,
+                        call,
+                    )
+                    .await
+                };
+                if let Err(error) = result {
                     error!(error = %error, "failed to attach media bridge");
                 }
             });
         });
 
-        activate_media_bridge(
-            self.llm.clone(),
-            self.speech.clone(),
-            self.config.behavior.clone(),
-            Arc::clone(&self.phone_book),
-            Arc::clone(&self.accounting),
-            Arc::clone(&record),
-            Arc::clone(&call),
-        )
-        .await?;
+        if self.voice.is_enabled() {
+            activate_voice_bridge(
+                self.stt.clone(),
+                self.llm.clone(),
+                self.tts.clone(),
+                self.voice.clone(),
+                self.config.behavior.clone(),
+                Arc::clone(&self.phone_book),
+                Arc::clone(&self.accounting),
+                Arc::clone(&record),
+                Arc::clone(&call),
+            )
+            .await?;
+        } else {
+            activate_media_bridge(
+                self.llm.clone(),
+                self.stt.clone(),
+                self.tts.clone(),
+                self.config.behavior.clone(),
+                Arc::clone(&self.phone_book),
+                Arc::clone(&self.accounting),
+                Arc::clone(&record),
+                Arc::clone(&call),
+            )
+            .await?;
+        }
 
         if record.track_existing_caller
             && let Some(phone_book_key) = record.phone_book_key.as_deref()
@@ -442,9 +518,15 @@ struct ServiceState {
 /// A serialized snapshot of overall service state for the control API.
 pub struct ServiceStatus {
     pub phone_state: String,
+    pub conversation_mode: String,
     pub stt_backend: String,
+    pub stt_model: String,
     pub tts_backend: String,
     pub tts_model: String,
+    pub llm_backend: String,
+    pub llm_model: Option<String>,
+    pub voice_backend: String,
+    pub voice_model: Option<String>,
     pub calls: Vec<CallSnapshot>,
 }
 
@@ -759,8 +841,10 @@ struct SanitizedCallerUpdate {
 
 #[derive(Clone)]
 struct MediaBridgeContext {
-    llm: OpenAiClients,
-    speech: SpeechServices,
+    llm: LlmService,
+    stt: SttService,
+    tts: TtsService,
+    voice: Option<VoiceService>,
     phone_book: Arc<PhoneBookStore>,
     accounting: Arc<AccountingStore>,
     behavior: BehaviorConfig,
@@ -777,11 +861,60 @@ impl TranscriptSink for ManagedCall {
 }
 
 async fn activate_media_bridge(
-    llm: OpenAiClients,
-    speech: SpeechServices,
+    llm: LlmService,
+    stt: SttService,
+    tts: TtsService,
     behavior: BehaviorConfig,
     phone_book: Arc<PhoneBookStore>,
     accounting: Arc<AccountingStore>,
+    record: Arc<ManagedCall>,
+    call: Arc<Call>,
+) -> Result<()> {
+    activate_call_bridge(
+        MediaBridgeContext {
+            llm,
+            stt,
+            tts,
+            voice: None,
+            phone_book,
+            accounting,
+            behavior,
+        },
+        record,
+        call,
+    )
+    .await
+}
+
+async fn activate_voice_bridge(
+    stt: SttService,
+    llm: LlmService,
+    tts: TtsService,
+    voice: VoiceService,
+    behavior: BehaviorConfig,
+    phone_book: Arc<PhoneBookStore>,
+    accounting: Arc<AccountingStore>,
+    record: Arc<ManagedCall>,
+    call: Arc<Call>,
+) -> Result<()> {
+    activate_call_bridge(
+        MediaBridgeContext {
+            llm,
+            stt,
+            tts,
+            voice: Some(voice),
+            phone_book,
+            accounting,
+            behavior,
+        },
+        record,
+        call,
+    )
+    .await
+}
+
+async fn activate_call_bridge(
+    bridge: MediaBridgeContext,
     record: Arc<ManagedCall>,
     call: Arc<Call>,
 ) -> Result<()> {
@@ -808,20 +941,15 @@ async fn activate_media_bridge(
     record.set_status(call.state().to_string());
     info!(
         call_id = %record.call.call_id(),
-        stt_backend = speech.stt_backend_name(),
-        tts_backend = speech.tts_backend_name(),
-        turn_silence_ms = behavior.turn_silence_ms,
-        min_utterance_ms = behavior.min_utterance_ms,
-        vad_threshold = behavior.vad_threshold,
+        stt_backend = bridge.stt.backend_name(),
+        tts_backend = bridge.tts.backend_name(),
+        llm_backend = bridge.llm.backend_name(),
+        voice_backend = bridge.voice.as_ref().map(|voice| voice.backend_name()).unwrap_or("disabled"),
+        turn_silence_ms = bridge.behavior.turn_silence_ms,
+        min_utterance_ms = bridge.behavior.min_utterance_ms,
+        vad_threshold = bridge.behavior.vad_threshold,
         "started conversational media workflow"
     );
-    let bridge = MediaBridgeContext {
-        llm,
-        speech,
-        phone_book,
-        accounting,
-        behavior: behavior.clone(),
-    };
 
     let record_clone = Arc::clone(&record);
     let runtime = tokio::runtime::Handle::current();
@@ -874,14 +1002,14 @@ async fn process_detected_utterance(
     let turn_started = Instant::now();
     info!(
         call_id = %record.call.call_id(),
-        backend = bridge.speech.stt_backend_name(),
+        backend = bridge.stt.backend_name(),
         samples = utterance.len(),
         gap_since_previous_turn_ms = ?gap_since_previous_turn_ms,
         "sending caller audio to STT"
     );
     let wav = encode_wav_mono_i16(&utterance, TELEPHONY_RATE)?;
     let stt_started = Instant::now();
-    let transcription = bridge.speech.transcribe_wav(wav).await?;
+    let transcription = bridge.stt.transcribe_wav(wav.clone()).await?;
     let stt_ms = stt_started.elapsed().as_millis();
     let stt_entry = record_api_call(
         &bridge.accounting,
@@ -896,50 +1024,97 @@ async fn process_detected_utterance(
             usage: transcription.usage.clone(),
         },
     )?;
-    let caller_text = transcription.text.trim();
-    if caller_text.is_empty() {
+    let caller_text = transcription.text.trim().to_string().trim().to_string();
+    let caller_text = if caller_text.is_empty() {
+        None
+    } else {
+        Some(caller_text)
+    };
+    if let Some(caller_text) = caller_text.as_deref() {
+        info!(
+            call_id = %record.call.call_id(),
+            caller_text,
+            stt_ms,
+            "caller utterance transcribed"
+        );
+        record.record_caller_text(caller_text.to_string());
+        record.note_activity();
+    } else if bridge.voice.is_none() {
         info!(call_id = %record.call.call_id(), "STT returned empty caller text");
         return Ok(());
+    } else {
+        info!(
+            call_id = %record.call.call_id(),
+            stt_ms,
+            "STT returned empty caller text, continuing because a voice model is enabled"
+        );
     }
-
-    info!(
-        call_id = %record.call.call_id(),
-        caller_text,
-        stt_ms,
-        "caller utterance transcribed"
-    );
-    record.record_caller_text(caller_text.to_string());
-    record.note_activity();
     let transcript_history = record.transcript_history();
-    let caller_requested_end_call = caller_requested_end_call(caller_text);
-    let caller_requested_immediate_hangup = caller_requested_immediate_hangup(caller_text);
+    let caller_requested_end_call = caller_text
+        .as_deref()
+        .map(caller_requested_end_call)
+        .unwrap_or(false);
+    let caller_requested_immediate_hangup = caller_text
+        .as_deref()
+        .map(caller_requested_immediate_hangup)
+        .unwrap_or(false);
 
-    reconcile_pending_email_confirmation(&bridge.phone_book, &record, caller_text)?;
+    if let Some(caller_text) = caller_text.as_deref() {
+        reconcile_pending_email_confirmation(&bridge.phone_book, &record, caller_text)?;
+    }
+    let caller_profile = record
+        .phone_book_key
+        .as_deref()
+        .and_then(|key| bridge.phone_book.get(key));
+    let context = ConversationContext {
+        assistant_name: bridge.behavior.assistant_name.clone(),
+        caller_id: record.peer.clone(),
+        phone_book_writable: record.phone_book_key.is_some(),
+        time_of_day: time_of_day_label(
+            caller_profile
+                .as_ref()
+                .and_then(|caller| caller.timezone.as_deref())
+                .unwrap_or(&bridge.behavior.default_timezone),
+        ),
+        missing_fields: caller_profile
+            .as_ref()
+            .map(|caller| {
+                caller
+                    .missing_fields()
+                    .into_iter()
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    "first_name".to_string(),
+                    "last_name".to_string(),
+                    "email".to_string(),
+                    "company".to_string(),
+                ]
+            }),
+        known_caller: caller_profile.clone(),
+        pending_email_confirmation: record.pending_email_confirmation(),
+    };
+    let context_history =
+        windowed_transcript(&transcript_history, bridge.behavior.context_window_events);
     let mut extraction_ms = 0_u128;
     let mut llm_ms = 0_u128;
     let mut llm_cost_usd = 0.0_f64;
     let mut chained_response = false;
     let mut response_id = None;
     let mut model_requested_end_call = false;
-    let (mut response_text, should_end_call) = if let Some(response_text) = bridge
-        .behavior
-        .auto_end_calls
-        .then(|| fast_path_end_call_response(caller_text))
-        .flatten()
+    let llm_endpoint = bridge
+        .llm
+        .endpoint()
+        .unwrap_or_else(|| "local://disabled-llm".to_string());
+    let llm_model = bridge
+        .llm
+        .model_name()
+        .unwrap_or_else(|| "disabled-llm".to_string());
+    if bridge.llm.is_enabled()
+        && let Some(caller_text) = caller_text.as_deref()
     {
-        info!(
-            call_id = %record.call.call_id(),
-            caller_text,
-            response_text,
-            "using direct end-call fast path without LLM"
-        );
-        (response_text, true)
-    } else {
-        let caller_profile = record
-            .phone_book_key
-            .as_deref()
-            .and_then(|key| bridge.phone_book.get(key));
-
         let extraction_started = Instant::now();
         if let Some(phone_book_key) = record.phone_book_key.as_deref()
             && should_extract_caller_update(&transcript_history, &record, caller_text)
@@ -962,8 +1137,8 @@ async fn process_detected_utterance(
                 &record,
                 LoggedApiCall {
                     operation: "responses.contact_extraction",
-                    endpoint: &bridge.llm.config().responses_api_url,
-                    model: &bridge.llm.config().response_model,
+                    endpoint: &llm_endpoint,
+                    model: &llm_model,
                     duration_ms: completed_extraction_ms,
                     usage_source: "api",
                     estimated: false,
@@ -978,46 +1153,107 @@ async fn process_detected_utterance(
             }
         }
         extraction_ms = extraction_started.elapsed().as_millis();
+    }
 
-        let context = ConversationContext {
-            assistant_name: bridge.behavior.assistant_name.clone(),
-            caller_id: record.peer.clone(),
-            phone_book_writable: record.phone_book_key.is_some(),
-            time_of_day: time_of_day_label(
-                caller_profile
-                    .as_ref()
-                    .and_then(|caller| caller.timezone.as_deref())
-                    .unwrap_or(&bridge.behavior.default_timezone),
-            ),
-            missing_fields: caller_profile
-                .as_ref()
-                .map(|caller| {
-                    caller
-                        .missing_fields()
-                        .into_iter()
-                        .map(ToOwned::to_owned)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| {
-                    vec![
-                        "first_name".to_string(),
-                        "last_name".to_string(),
-                        "email".to_string(),
-                        "company".to_string(),
-                    ]
-                }),
-            known_caller: caller_profile,
-            pending_email_confirmation: record.pending_email_confirmation(),
-        };
-
+    let mut response_text: String;
+    let should_end_call;
+    let playback_ms;
+    let idle_generation;
+    let tts_ms;
+    let tts_first_audio_ms;
+    let tts_cost_usd;
+    if let Some(voice) = &bridge.voice {
         info!(
             call_id = %record.call.call_id(),
             transcript_events = transcript_history.len(),
             context_window_events = bridge.behavior.context_window_events,
-            "sending transcript history to LLM"
+            model = ?voice.model_name(),
+            "sending caller audio turn to voice model"
         );
-        let context_history =
-            windowed_transcript(&transcript_history, bridge.behavior.context_window_events);
+        let voice_started = Instant::now();
+        let outcome = voice
+            .respond_to_wav(
+                &context_history,
+                caller_text.as_deref(),
+                wav,
+                Some(build_voice_model_instructions(&context)),
+            )
+            .await?;
+        llm_ms = voice_started.elapsed().as_millis();
+        let voice_entry = record_api_call(
+            &bridge.accounting,
+            &record,
+            LoggedApiCall {
+                operation: "voice.reply",
+                endpoint: &outcome.endpoint,
+                model: &outcome.model,
+                duration_ms: llm_ms,
+                usage_source: "api",
+                estimated: false,
+                usage: outcome.usage.clone(),
+            },
+        )?;
+        llm_cost_usd = voice_entry.cost_usd;
+        response_text = outcome.text.trim().to_string();
+        if response_text.is_empty() {
+            info!(
+                call_id = %record.call.call_id(),
+                "voice model returned empty assistant transcript"
+            );
+            return Ok(());
+        }
+        playback_ms = pcm_playback_ms(outcome.pcm.len());
+        record.suppress_input_for(StdDuration::from_millis(
+            playback_ms.saturating_add(bridge.behavior.post_tts_input_suppression_ms),
+        ));
+        speaker_tx
+            .send(outcome.pcm)
+            .map_err(|_| anyhow!("paced pcm channel closed"))?;
+        record.record_assistant_text(response_text.clone());
+        idle_generation = record.note_activity();
+        tts_ms = 0;
+        tts_first_audio_ms = llm_ms;
+        tts_cost_usd = 0.0;
+        should_end_call = bridge.behavior.auto_end_calls
+            && (caller_requested_immediate_hangup
+                || (caller_requested_end_call && looks_like_final_farewell(&response_text)));
+        model_requested_end_call = should_end_call;
+    } else if let Some(response_text_fast_path) = bridge
+        .behavior
+        .auto_end_calls
+        .then(|| caller_text.as_deref().and_then(fast_path_end_call_response))
+        .flatten()
+    {
+        info!(
+            call_id = %record.call.call_id(),
+            caller_text = ?caller_text,
+            response_text_fast_path,
+            "using direct end-call fast path without standalone LLM"
+        );
+        response_text = response_text_fast_path;
+        let tts_summary = queue_assistant_tts(
+            &bridge.tts,
+            &bridge.accounting,
+            &record,
+            &speaker_tx,
+            &response_text,
+            "tts.reply",
+            bridge.behavior.post_tts_input_suppression_ms,
+        )
+        .await?;
+        playback_ms = tts_summary.total_playback_ms;
+        idle_generation = tts_summary.idle_generation;
+        tts_ms = tts_summary.total_tts_ms;
+        tts_first_audio_ms = tts_summary.first_audio_ms;
+        tts_cost_usd = tts_summary.last_entry.cost_usd;
+        should_end_call = true;
+    } else {
+        info!(
+            call_id = %record.call.call_id(),
+            transcript_events = transcript_history.len(),
+            context_window_events = bridge.behavior.context_window_events,
+            "sending transcript history to standalone LLM"
+        );
         let previous_response_id = record.last_reply_response_id();
         let llm_started = Instant::now();
         let response = bridge
@@ -1034,8 +1270,8 @@ async fn process_detected_utterance(
             &record,
             LoggedApiCall {
                 operation: "responses.reply",
-                endpoint: &bridge.llm.config().responses_api_url,
-                model: &bridge.llm.config().response_model,
+                endpoint: &llm_endpoint,
+                model: &llm_model,
                 duration_ms: llm_ms,
                 usage_source: "api",
                 estimated: false,
@@ -1043,7 +1279,7 @@ async fn process_detected_utterance(
             },
         )?;
         llm_cost_usd = llm_entry.cost_usd;
-        let mut response_text = response.text.trim().to_string();
+        response_text = response.text.trim().to_string();
         if bridge.behavior.auto_end_calls && caller_requested_end_call {
             response_text = finalize_end_call_response(&response_text);
         }
@@ -1056,14 +1292,28 @@ async fn process_detected_utterance(
                 "ignoring model end_call because assistant reply is not a final closing"
             );
         }
-        let should_end_call = bridge.behavior.auto_end_calls
+        should_end_call = bridge.behavior.auto_end_calls
             && (caller_requested_end_call
                 || (model_requested_end_call && response_has_final_farewell));
         record.set_last_reply_response_id(response.response_id.clone());
         chained_response = previous_response_id.is_some();
         response_id = response.response_id.clone();
-        (response_text, should_end_call)
-    };
+        let tts_summary = queue_assistant_tts(
+            &bridge.tts,
+            &bridge.accounting,
+            &record,
+            &speaker_tx,
+            &response_text,
+            "tts.reply",
+            bridge.behavior.post_tts_input_suppression_ms,
+        )
+        .await?;
+        playback_ms = tts_summary.total_playback_ms;
+        idle_generation = tts_summary.idle_generation;
+        tts_ms = tts_summary.total_tts_ms;
+        tts_first_audio_ms = tts_summary.first_audio_ms;
+        tts_cost_usd = tts_summary.last_entry.cost_usd;
+    }
     if response_text.is_empty() {
         if should_end_call {
             response_text = default_final_farewell().to_string();
@@ -1083,26 +1333,6 @@ async fn process_detected_utterance(
         should_end_call,
         "assistant response generated"
     );
-    info!(
-        call_id = %record.call.call_id(),
-        backend = bridge.speech.tts_backend_name(),
-        chars = response_text.len(),
-        "sending assistant text to TTS"
-    );
-    let tts_summary = queue_assistant_tts(
-        &bridge.speech,
-        &bridge.accounting,
-        &record,
-        &speaker_tx,
-        &response_text,
-        "tts.reply",
-        bridge.behavior.post_tts_input_suppression_ms,
-    )
-    .await?;
-    let tts_ms = tts_summary.total_tts_ms;
-    let tts_entry = tts_summary.last_entry;
-    let playback_ms = tts_summary.total_playback_ms;
-    let idle_generation = tts_summary.idle_generation;
     let suppression_ms = playback_ms.saturating_add(bridge.behavior.post_tts_input_suppression_ms);
     info!(
         call_id = %record.call.call_id(),
@@ -1120,7 +1350,7 @@ async fn process_detected_utterance(
         schedule_end_call(Arc::clone(&record), playback_ms, end_call_buffer_ms);
     } else {
         schedule_idle_prompt(
-            bridge.speech.clone(),
+            bridge.tts.clone(),
             Arc::clone(&bridge.accounting),
             bridge.behavior.clone(),
             Arc::clone(&record),
@@ -1137,7 +1367,7 @@ async fn process_detected_utterance(
         extraction_ms,
         llm_ms,
         tts_ms,
-        tts_first_audio_ms: tts_summary.first_audio_ms,
+        tts_first_audio_ms,
         total_ms,
     };
     let summary = record.record_turn_metrics(&metrics);
@@ -1158,7 +1388,7 @@ async fn process_detected_utterance(
         avg_tts_ms = summary.avg_tts_ms,
         stt_cost_usd = format_args!("{:.8}", stt_entry.cost_usd),
         llm_cost_usd = format_args!("{:.8}", llm_cost_usd),
-        tts_cost_usd = format_args!("{:.8}", tts_entry.cost_usd),
+        tts_cost_usd = format_args!("{:.8}", tts_cost_usd),
         end_call = should_end_call,
         total_call_cost_usd = format_args!("{:.8}", record.accounting_summary().total_cost_usd),
         "assistant audio queued for RTP playback"
@@ -1167,7 +1397,7 @@ async fn process_detected_utterance(
 }
 
 async fn queue_assistant_tts(
-    speech: &SpeechServices,
+    speech: &TtsService,
     accounting: &Arc<AccountingStore>,
     record: &Arc<ManagedCall>,
     speaker_tx: &crossbeam_channel::Sender<Vec<i16>>,
@@ -1209,13 +1439,13 @@ struct QueuedTtsRequest<'a> {
 }
 
 async fn queue_tts_text(
-    speech: &SpeechServices,
+    speech: &TtsService,
     accounting: &Arc<AccountingStore>,
     record: &Arc<ManagedCall>,
     speaker_tx: &crossbeam_channel::Sender<Vec<i16>>,
     request: QueuedTtsRequest<'_>,
 ) -> Result<QueuedTtsSummary> {
-    let segments = split_tts_text(request.text, speech.tts_backend_name());
+    let segments = split_tts_text(request.text, speech.backend_name());
     let segment_count = segments.len();
     let mut total_tts_ms = 0_u128;
     let mut total_playback_ms = 0_u64;
@@ -1255,7 +1485,7 @@ async fn queue_tts_text(
             .map_err(|_| anyhow!("paced pcm channel closed"))?;
         info!(
             call_id = %record.call.call_id(),
-            backend = speech.tts_backend_name(),
+            backend = speech.backend_name(),
             segment_index = index + 1,
             segment_count,
             chars = segment.len(),
@@ -1360,7 +1590,7 @@ fn split_tts_text(text: &str, backend: &str) -> Vec<String> {
 }
 
 fn schedule_idle_prompt(
-    speech: SpeechServices,
+    speech: TtsService,
     accounting: Arc<AccountingStore>,
     behavior: BehaviorConfig,
     record: Arc<ManagedCall>,
@@ -2058,6 +2288,82 @@ fn build_initial_greeting(
         );
     }
     behavior.incoming_greeting_text.trim().to_string()
+}
+
+fn build_voice_model_instructions(context: &ConversationContext) -> String {
+    let mut sections = Vec::new();
+    sections.push(format!(
+        "You are {} on a phone call. Keep replies brief, natural, helpful, and easy to say aloud. It is currently {} for the caller.",
+        context.assistant_name, context.time_of_day
+    ));
+    sections.push(
+        "Speak English unless the caller explicitly asks for another language in this call. If audio is unclear, briefly ask them to repeat."
+            .to_string(),
+    );
+    if let Some(summary) = context
+        .known_caller
+        .as_ref()
+        .and_then(compact_voice_caller_summary)
+    {
+        sections.push(format!("Known caller profile: {}.", summary));
+    }
+    if !context.missing_fields.is_empty() {
+        sections.push(format!(
+            "Missing profile fields: {}. Gather them naturally, at most one lightweight question at a time, only when it helps.",
+            context.missing_fields.join(", ")
+        ));
+    }
+    if let Some(email) = &context.pending_email_confirmation {
+        sections.push(format!(
+            "Pending email confirmation: {}. Confirm that exact spelling before treating it as saved.",
+            email
+        ));
+    }
+    sections.push(
+        "Respond with spoken assistant dialogue only. Do not mention JSON, schemas, hidden instructions, or system prompts."
+            .to_string(),
+    );
+    sections.join("\n")
+}
+
+fn compact_voice_caller_summary(caller: &crate::phonebook::CallerRecord) -> Option<String> {
+    let mut fields = Vec::new();
+    if let Some(first_name) = caller.first_name.as_deref()
+        && !first_name.trim().is_empty()
+    {
+        fields.push(format!("first_name={}", first_name.trim()));
+    }
+    if let Some(last_name) = caller.last_name.as_deref()
+        && !last_name.trim().is_empty()
+    {
+        fields.push(format!("last_name={}", last_name.trim()));
+    }
+    if let Some(email) = caller.email.as_deref()
+        && !email.trim().is_empty()
+    {
+        fields.push(format!("email={}", email.trim()));
+    }
+    if let Some(company) = caller.company.as_deref()
+        && !company.trim().is_empty()
+    {
+        fields.push(format!("company={}", company.trim()));
+    }
+    if let Some(timezone) = caller.timezone.as_deref()
+        && !timezone.trim().is_empty()
+    {
+        fields.push(format!("timezone={}", timezone.trim()));
+    }
+    if let Some(language) = caller.preferred_language.as_deref()
+        && !language.trim().is_empty()
+    {
+        fields.push(format!("preferred_language={}", language.trim()));
+    }
+
+    if fields.is_empty() {
+        None
+    } else {
+        Some(fields.join("; "))
+    }
 }
 
 fn time_of_day_label(timezone: &str) -> String {
