@@ -38,6 +38,10 @@ services:
       OPENAI_RESPONSE_MODEL: ${OPENAI_RESPONSE_MODEL:-gpt-4o-mini}
       OPENAI_TTS_MODEL: ${OPENAI_TTS_MODEL:-gpt-4o-mini-tts}
       OPENAI_TTS_VOICE: ${OPENAI_TTS_VOICE:-alloy}
+      LLM_PROVIDER: ${LLM_PROVIDER:-none}
+      VOICE_PROVIDER: ${VOICE_PROVIDER:-disabled}
+      OPENAI_VOICE_MODEL: ${OPENAI_VOICE_MODEL:-gpt-audio-1.5}
+      OPENAI_VOICE_NAME: ${OPENAI_VOICE_NAME:-alloy}
       OPENAI_TTS_INSTRUCTIONS: ${OPENAI_TTS_INSTRUCTIONS:-Speak in a cheerful, upbeat, warm, and helpful tone with a friendly Australian accent. Sound engaged and natural, not flat, stiff, or monotone.}
       OPENAI_TRANSCRIPTION_PROMPT: ${OPENAI_TRANSCRIPTION_PROMPT:-}
       OPENAI_TRANSCRIPTION_LANGUAGE: ${OPENAI_TRANSCRIPTION_LANGUAGE:-}
