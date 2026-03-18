@@ -1273,7 +1273,7 @@ fn default_openai_voice_instructions() -> Option<String> {
 }
 
 fn default_openai_voice_input_transcription_model() -> Option<String> {
-    Some(default_transcription_model())
+    None
 }
 
 fn default_tts_format() -> String {
