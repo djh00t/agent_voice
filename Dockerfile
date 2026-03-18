@@ -5,10 +5,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock /build/
 COPY src /build/src
 
-RUN --mount=type=bind,source=.cargo/registry/cache,target=/usr/local/cargo/registry/cache,readonly \
-    --mount=type=bind,source=.cargo/registry/index,target=/usr/local/cargo/registry/index,readonly \
-    --mount=type=bind,source=.cargo/registry/src,target=/usr/local/cargo/registry/src,readonly \
-    cargo build --release --offline
+RUN cargo build --release
 
 FROM python:3.10-slim-bookworm
 
@@ -20,7 +17,9 @@ RUN useradd --system --uid 10001 --gid nogroup --create-home --home-dir /app age
 WORKDIR /app
 
 COPY pyproject.toml uv.lock /app/
-COPY .venv /app/.venv
+ENV UV_LINK_MODE=copy
+RUN uv sync --frozen --no-dev
+
 COPY python /app/python
 
 ENV PATH="/app/.venv/bin:${PATH}"
