@@ -27,7 +27,7 @@ impl VoiceService {
         let backend = match config.provider {
             VoiceProvider::Disabled => VoiceBackend::Disabled,
             VoiceProvider::OpenAi => VoiceBackend::OpenAi {
-                client: openai,
+                client: Box::new(openai),
                 config: config.openai,
             },
         };
@@ -90,7 +90,7 @@ impl VoiceService {
 #[derive(Clone)]
 enum VoiceBackend {
     OpenAi {
-        client: OpenAiClients,
+        client: Box<OpenAiClients>,
         config: OpenAiVoiceConfig,
     },
     Disabled,
