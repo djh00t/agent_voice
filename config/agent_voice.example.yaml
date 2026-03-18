@@ -28,12 +28,25 @@ openai:
   tts_model: "gpt-4o-mini-tts"
   tts_voice: "alloy"
   tts_instructions: "Speak in a cheerful, upbeat, warm, and helpful tone with a friendly Australian accent. Sound engaged and natural, not flat, stiff, or monotone."
-  responses_api_url: "https://api.openai.com/v1/responses"
-  response_model: "gpt-4o-mini"
   transcription_prompt: null
   transcription_language: null
   tts_format: "wav"
-  response_instructions: "You are a helpful voice agent on a phone call. Keep replies brief, natural, and conversational."
+
+llm:
+  provider: "openai"
+  openai:
+    responses_api_url: "https://api.openai.com/v1/responses"
+    model: "gpt-4o-mini"
+    instructions: "You are a helpful voice agent on a phone call. Keep replies brief, natural, and conversational."
+
+voice:
+  provider: "disabled"
+  openai:
+    api_url: "https://api.openai.com/v1/chat/completions"
+    model: "gpt-audio-1.5"
+    voice: "alloy"
+    instructions: "You are a helpful voice agent on a phone call. Keep replies brief, natural, and conversational."
+    input_transcription_model: "gpt-4o-transcribe"
 
 agent_api:
   listen: "127.0.0.1:8089"
