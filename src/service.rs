@@ -1004,49 +1004,67 @@ async fn process_detected_utterance(
     let turn_started = Instant::now();
     info!(
         call_id = %record.call.call_id(),
-        backend = bridge.stt.backend_name(),
+        stt_backend = bridge.stt.backend_name(),
+        voice_enabled = bridge.voice.is_some(),
         samples = utterance.len(),
         gap_since_previous_turn_ms = ?gap_since_previous_turn_ms,
-        "sending caller audio to STT"
+        "processing caller utterance"
     );
+
+    let needs_stt = bridge.voice.is_none()
+        || bridge.llm.is_enabled()
+        || bridge
+            .voice
+            .as_ref()
+            .is_some_and(|voice| voice.requires_inbound_transcription());
     let wav = encode_wav_mono_i16(&utterance, TELEPHONY_RATE)?;
-    let stt_started = Instant::now();
-    let transcription = bridge.stt.transcribe_wav(wav.clone()).await?;
-    let stt_ms = stt_started.elapsed().as_millis();
-    let stt_entry = record_api_call(
-        &bridge.accounting,
-        &record,
-        LoggedApiCall {
-            operation: "transcription",
-            endpoint: &transcription.endpoint,
-            model: &transcription.model,
-            duration_ms: stt_ms,
-            usage_source: transcription.usage_source,
-            estimated: transcription.estimated,
-            usage: transcription.usage.clone(),
-        },
-    )?;
-    let text = transcription.text.trim();
-    let caller_text = (!text.is_empty()).then(|| text.to_string());
-    if let Some(caller_text) = caller_text.as_deref() {
-        info!(
-            call_id = %record.call.call_id(),
-            caller_text,
-            stt_ms,
-            "caller utterance transcribed"
-        );
-        record.record_caller_text(caller_text.to_string());
-        record.note_activity();
-    } else if bridge.voice.is_none() {
-        info!(call_id = %record.call.call_id(), "STT returned empty caller text");
-        return Ok(());
+    let (stt_ms, stt_cost_usd, caller_text) = if needs_stt {
+        let stt_started = Instant::now();
+        let transcription = bridge.stt.transcribe_wav(wav.clone()).await?;
+        let stt_ms = stt_started.elapsed().as_millis();
+        let stt_entry = record_api_call(
+            &bridge.accounting,
+            &record,
+            LoggedApiCall {
+                operation: "transcription",
+                endpoint: &transcription.endpoint,
+                model: &transcription.model,
+                duration_ms: stt_ms,
+                usage_source: transcription.usage_source,
+                estimated: transcription.estimated,
+                usage: transcription.usage.clone(),
+            },
+        )?;
+        let text = transcription.text.trim();
+        let caller_text = (!text.is_empty()).then(|| text.to_string());
+        if let Some(caller_text) = caller_text.as_deref() {
+            info!(
+                call_id = %record.call.call_id(),
+                caller_text,
+                stt_ms,
+                "caller utterance transcribed"
+            );
+            record.record_caller_text(caller_text.to_string());
+            record.note_activity();
+        } else if bridge.voice.is_none() {
+            info!(call_id = %record.call.call_id(), "STT returned empty caller text");
+            return Ok(());
+        } else {
+            info!(
+                call_id = %record.call.call_id(),
+                stt_ms,
+                "STT returned empty caller text, continuing because a voice model is enabled"
+            );
+        }
+        (stt_ms, stt_entry.cost_usd, caller_text)
     } else {
         info!(
             call_id = %record.call.call_id(),
-            stt_ms,
-            "STT returned empty caller text, continuing because a voice model is enabled"
+            voice_backend = bridge.voice.as_ref().map_or("disabled", |voice| voice.backend_name()),
+            "skipping dedicated STT for voice-model inbound turn"
         );
-    }
+        (0_u128, 0.0_f64, None)
+    };
     let transcript_history = record.transcript_history();
     let caller_requested_end_call = caller_text
         .as_deref()
@@ -1384,7 +1402,7 @@ async fn process_detected_utterance(
         avg_extraction_ms = summary.avg_extraction_ms,
         avg_llm_ms = summary.avg_llm_ms,
         avg_tts_ms = summary.avg_tts_ms,
-        stt_cost_usd = format_args!("{:.8}", stt_entry.cost_usd),
+        stt_cost_usd = format_args!("{:.8}", stt_cost_usd),
         llm_cost_usd = format_args!("{:.8}", llm_cost_usd),
         tts_cost_usd = format_args!("{:.8}", tts_cost_usd),
         end_call = should_end_call,
