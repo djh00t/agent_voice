@@ -1477,9 +1477,6 @@ async fn queue_tts_text(
         )?;
         let playback_ms = pcm_playback_ms(synthesis.pcm.len());
         total_playback_ms = total_playback_ms.saturating_add(playback_ms);
-        record.suppress_input_for(StdDuration::from_millis(
-            playback_ms.saturating_add(request.post_tts_input_suppression_ms),
-        ));
         speaker_tx
             .send(synthesis.pcm)
             .map_err(|_| anyhow!("paced pcm channel closed"))?;
@@ -1494,6 +1491,11 @@ async fn queue_tts_text(
             "queued assistant TTS segment"
         );
         last_entry = Some(entry);
+    }
+    if total_playback_ms > 0 {
+        record.suppress_input_for(StdDuration::from_millis(
+            total_playback_ms.saturating_add(request.post_tts_input_suppression_ms),
+        ));
     }
 
     record.record_assistant_text(request.text.to_string());
