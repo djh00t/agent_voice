@@ -17,7 +17,7 @@ impl LlmService {
     /// Builds the LLM backend from the resolved app configuration.
     pub fn new(config: LlmConfig, openai: OpenAiClients) -> Self {
         let backend = match config.provider {
-            LlmProvider::OpenAi => LlmBackend::OpenAi(openai),
+            LlmProvider::OpenAi => LlmBackend::OpenAi(Box::new(openai)),
             LlmProvider::None => LlmBackend::Disabled,
         };
         Self { backend }
@@ -84,6 +84,6 @@ impl LlmService {
 
 #[derive(Clone)]
 enum LlmBackend {
-    OpenAi(OpenAiClients),
+    OpenAi(Box<OpenAiClients>),
     Disabled,
 }
