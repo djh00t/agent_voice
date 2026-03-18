@@ -103,7 +103,7 @@ Important environment variables:
 
 The binary auto-loads `./config/agent_voice.yaml` or `/opt/agent_voice/config/agent_voice.yaml` when present. If neither file exists, it runs from environment variables only.
 The container entrypoint resolves hostname-style `SIP_HOST` values to IPv4 automatically before launch because `xphone` expects a socket-address target.
-On startup the app can refresh [accounting/models.json](/Users/djh/agent_voice_work/accounting/models.json) from the official OpenAI pricing page and then use that mounted catalog for token and cost accounting.
+On startup the app can refresh [accounting/models.json](accounting/models.json) from the official OpenAI pricing page and then use that mounted catalog for token and cost accounting.
 
 ## Local sherpa-onnx speech
 
