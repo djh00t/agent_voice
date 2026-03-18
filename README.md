@@ -2,15 +2,16 @@
 
 `agent_voice` is a Rust SIP bridge for agent workflows.
 
-It registers a SIP endpoint with `xphone`, exposes a localhost HTTP API for agents, turns inbound RTP into caller utterances, sends those turns to the configured speech backend, calls OpenAI Responses for reasoning, and sends outbound speech back into the SIP/RTP stream.
+It registers a SIP endpoint with `xphone`, exposes a localhost HTTP API for agents, turns inbound RTP into caller utterances, and can run either a split `STT -> LLM -> TTS` pipeline or a unified OpenAI voice-model reply path.
 
 ## Features
 
 - SIP registration with UDP/TCP/TLS transport support through `xphone`
 - Incoming and outgoing call handling
 - Selectable OpenAI or local sherpa-onnx speech backends for STT and TTS
+- Separately configurable standalone LLM and unified voice-model backends
 - Inbound caller turn detection with OpenAI `POST /v1/audio/transcriptions` or local Moonshine
-- Agent replies via OpenAI `POST /v1/responses`
+- Agent replies via OpenAI `POST /v1/responses` or OpenAI audio chat completions
 - Outbound speech injection via OpenAI `POST /v1/audio/speech` or local Kokoro
 - Persistent JSON phone book keyed by caller ID
 - Deny-by-default inbound caller-ID access control via the phone book
@@ -66,12 +67,18 @@ Important environment variables:
 
 - SIP username, password, host, and transport details
 - `OPENAI_API_KEY`
+- `LLM_PROVIDER`
+- `VOICE_PROVIDER`
 - `SPEECH_STT_PROVIDER`
 - `SPEECH_TTS_PROVIDER`
 - `OPENAI_TRANSCRIPTION_API_URL`
 - `OPENAI_RESPONSES_API_URL`
 - `OPENAI_RESPONSE_MODEL`
 - `OPENAI_RESPONSE_INSTRUCTIONS`
+- `OPENAI_VOICE_API_URL`
+- `OPENAI_VOICE_MODEL`
+- `OPENAI_VOICE_NAME`
+- `OPENAI_VOICE_INSTRUCTIONS`
 - `SHERPA_ONNX_PYTHON_BIN`
 - `SHERPA_ONNX_BRIDGE_SCRIPT`
 - `SHERPA_ONNX_STT_*`
@@ -115,6 +122,16 @@ Then switch `.env` or YAML to:
 SPEECH_STT_PROVIDER=sherpa_onnx
 SPEECH_TTS_PROVIDER=sherpa_onnx
 ```
+
+To keep local STT/TTS but disable the standalone LLM in favor of an OpenAI audio model:
+
+```bash
+LLM_PROVIDER=none
+VOICE_PROVIDER=openai
+OPENAI_VOICE_MODEL=gpt-audio-1.5
+```
+
+In that mode, the configured STT backend still runs for transcript bookkeeping and caller-history context, while the assistant reply audio and transcript come back from the voice model in one API call.
 
 The default example paths expect:
 
