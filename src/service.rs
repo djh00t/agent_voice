@@ -2052,15 +2052,66 @@ fn reconcile_pending_email_confirmation(
 }
 
 fn caller_confirmed_pending_value(text: &str) -> bool {
-    crate::end_call_helpers::caller_confirmed_pending_value(text)
+    let normalized = normalize_match_text(text);
+    [
+        "yes",
+        "yes please",
+        "yeah",
+        "yep",
+        "yup",
+        "sure",
+        "correct",
+        "that s correct",
+        "that is correct",
+        "that is right",
+        "that's right",
+        "confirmed",
+    ]
+    .iter()
+    .any(|phrase| normalized == *phrase || normalized.starts_with(&format!("{phrase} ")))
 }
 
 fn caller_rejected_pending_value(text: &str) -> bool {
-    crate::end_call_helpers::caller_rejected_pending_value(text)
+    let normalized = normalize_match_text(text);
+    [
+        "no",
+        "nope",
+        "no thanks",
+        "not",
+        "cancel",
+        "wrong",
+        "never mind",
+        "forget it",
+        "that is not",
+        "that s not",
+    ]
+    .iter()
+    .any(|phrase| normalized == *phrase || normalized.starts_with(&format!("{phrase} ")))
 }
 
 fn caller_requested_end_call(text: &str) -> bool {
-    crate::end_call_helpers::caller_requested_end_call(text)
+    let normalized = normalize_match_text(text);
+    [
+        "goodbye",
+        "good bye",
+        "bye",
+        "bye bye",
+        "see you",
+        "see ya",
+        "catch you later",
+        "talk to you later",
+        "that s all",
+        "that is all",
+        "nothing else",
+        "hang up",
+        "hanging up",
+        "hangup",
+        "disconnect",
+        "end the call",
+        "drop the call",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
 }
 
 fn caller_requested_immediate_hangup(text: &str) -> bool {
