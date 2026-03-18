@@ -14,6 +14,10 @@ use xphone::{Codec, Config as PhoneConfig};
 pub struct AppConfig {
     pub sip: SipConfig,
     pub openai: OpenAiConfig,
+    #[serde(default)]
+    pub llm: LlmConfig,
+    #[serde(default)]
+    pub voice: VoiceConfig,
     pub agent_api: AgentApiConfig,
     #[serde(default)]
     pub speech: SpeechConfig,
@@ -40,6 +44,7 @@ impl AppConfig {
             None => Self::default(),
         };
         config.apply_env_overrides_from_map(&std::env::vars().collect());
+        config.sync_legacy_openai_sections();
         config.validate()?;
         Ok(config)
     }
@@ -146,6 +151,32 @@ impl AppConfig {
             env,
             "OPENAI_RESPONSE_INSTRUCTIONS",
             &mut self.openai.response_instructions,
+        );
+        apply_llm_provider(env, "LLM_PROVIDER", &mut self.llm.provider);
+        apply_string(
+            env,
+            "OPENAI_LLM_API_URL",
+            &mut self.llm.openai.responses_api_url,
+        );
+        apply_string(env, "OPENAI_LLM_MODEL", &mut self.llm.openai.model);
+        apply_optional_string(
+            env,
+            "OPENAI_LLM_INSTRUCTIONS",
+            &mut self.llm.openai.instructions,
+        );
+        apply_voice_provider(env, "VOICE_PROVIDER", &mut self.voice.provider);
+        apply_string(env, "OPENAI_VOICE_API_URL", &mut self.voice.openai.api_url);
+        apply_string(env, "OPENAI_VOICE_MODEL", &mut self.voice.openai.model);
+        apply_string(env, "OPENAI_VOICE_NAME", &mut self.voice.openai.voice);
+        apply_optional_string(
+            env,
+            "OPENAI_VOICE_INSTRUCTIONS",
+            &mut self.voice.openai.instructions,
+        );
+        apply_optional_string(
+            env,
+            "OPENAI_VOICE_INPUT_TRANSCRIPTION_MODEL",
+            &mut self.voice.openai.input_transcription_model,
         );
 
         apply_speech_provider(env, "SPEECH_STT_PROVIDER", &mut self.speech.stt_provider);
@@ -362,13 +393,32 @@ impl AppConfig {
         apply_string(env, "AGENT_VOICE_LOG_LEVEL", &mut self.logging.level);
     }
 
+    fn sync_legacy_openai_sections(&mut self) {
+        let default_llm = OpenAiLlmConfig::default();
+        if self.llm.openai != default_llm {
+            self.openai.responses_api_url = self.llm.openai.responses_api_url.clone();
+            self.openai.response_model = self.llm.openai.model.clone();
+            self.openai.response_instructions = self.llm.openai.instructions.clone();
+            return;
+        }
+
+        self.llm.openai.responses_api_url = self.openai.responses_api_url.clone();
+        self.llm.openai.model = self.openai.response_model.clone();
+        self.llm.openai.instructions = self.openai.response_instructions.clone();
+    }
+
     fn validate(&self) -> Result<()> {
-        if self
-            .openai
-            .api_key
-            .as_deref()
-            .unwrap_or_default()
-            .is_empty()
+        let requires_openai = self.speech.uses_openai_stt()
+            || self.speech.uses_openai_tts()
+            || self.llm.uses_openai()
+            || self.voice.uses_openai();
+        if requires_openai
+            && self
+                .openai
+                .api_key
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
         {
             bail!("OpenAI API key is required via config or OPENAI_API_KEY");
         }
@@ -385,6 +435,11 @@ impl AppConfig {
             bail!("agent_api.listen must not be empty");
         }
         self.speech.validate()?;
+        self.llm.validate()?;
+        self.voice.validate()?;
+        if !self.voice.is_enabled() && !self.llm.is_enabled() {
+            bail!("llm.provider must be configured when voice.provider is disabled");
+        }
         Ok(())
     }
 
@@ -575,6 +630,150 @@ impl SpeechProvider {
             "openai" => Some(Self::OpenAi),
             "sherpa_onnx" | "sherpa-onnx" | "sherpa" => Some(Self::SherpaOnnx),
             _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Selects which backend handles structured reply generation.
+pub enum LlmProvider {
+    #[default]
+    OpenAi,
+    None,
+}
+
+impl LlmProvider {
+    /// Parses an LLM provider from a config or environment string.
+    pub fn parse(value: &str) -> Option<Self> {
+        match normalize_env_value(value).to_ascii_lowercase().as_str() {
+            "openai" => Some(Self::OpenAi),
+            "none" | "disabled" | "off" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Selects whether calls use the split STT/LLM/TTS path or a unified voice model.
+pub enum VoiceProvider {
+    #[default]
+    Disabled,
+    OpenAi,
+}
+
+impl VoiceProvider {
+    /// Parses a voice provider from a config or environment string.
+    pub fn parse(value: &str) -> Option<Self> {
+        match normalize_env_value(value).to_ascii_lowercase().as_str() {
+            "openai" => Some(Self::OpenAi),
+            "none" | "disabled" | "off" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// Runtime LLM backend selection and provider-specific settings.
+pub struct LlmConfig {
+    #[serde(default)]
+    pub provider: LlmProvider,
+    #[serde(default)]
+    pub openai: OpenAiLlmConfig,
+}
+
+impl LlmConfig {
+    fn validate(&self) -> Result<()> {
+        if self.uses_openai() && self.openai.model.trim().is_empty() {
+            bail!("llm.openai.model must not be empty");
+        }
+        Ok(())
+    }
+
+    /// Returns true when OpenAI handles LLM calls.
+    pub fn uses_openai(&self) -> bool {
+        self.provider == LlmProvider::OpenAi
+    }
+
+    /// Returns true when a standalone LLM backend is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.provider != LlmProvider::None
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+/// OpenAI Responses settings for standalone LLM turns.
+pub struct OpenAiLlmConfig {
+    #[serde(default = "default_responses_api_url")]
+    pub responses_api_url: String,
+    #[serde(default = "default_response_model")]
+    pub model: String,
+    #[serde(default = "default_response_instructions")]
+    pub instructions: Option<String>,
+}
+
+impl Default for OpenAiLlmConfig {
+    fn default() -> Self {
+        Self {
+            responses_api_url: default_responses_api_url(),
+            model: default_response_model(),
+            instructions: default_response_instructions(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// Runtime unified voice-model selection and provider-specific settings.
+pub struct VoiceConfig {
+    #[serde(default)]
+    pub provider: VoiceProvider,
+    #[serde(default)]
+    pub openai: OpenAiVoiceConfig,
+}
+
+impl VoiceConfig {
+    fn validate(&self) -> Result<()> {
+        if self.uses_openai() && self.openai.model.trim().is_empty() {
+            bail!("voice.openai.model must not be empty");
+        }
+        Ok(())
+    }
+
+    /// Returns true when a unified voice model is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.provider != VoiceProvider::Disabled
+    }
+
+    /// Returns true when OpenAI handles full duplex voice turns.
+    pub fn uses_openai(&self) -> bool {
+        self.provider == VoiceProvider::OpenAi
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+/// OpenAI Realtime voice-model settings for full audio-in/audio-out calls.
+pub struct OpenAiVoiceConfig {
+    #[serde(default = "default_openai_voice_api_url")]
+    pub api_url: String,
+    #[serde(default = "default_openai_voice_model")]
+    pub model: String,
+    #[serde(default = "default_openai_voice_name")]
+    pub voice: String,
+    #[serde(default = "default_openai_voice_instructions")]
+    pub instructions: Option<String>,
+    #[serde(default = "default_openai_voice_input_transcription_model")]
+    pub input_transcription_model: Option<String>,
+}
+
+impl Default for OpenAiVoiceConfig {
+    fn default() -> Self {
+        Self {
+            api_url: default_openai_voice_api_url(),
+            model: default_openai_voice_model(),
+            voice: default_openai_voice_name(),
+            instructions: default_openai_voice_instructions(),
+            input_transcription_model: default_openai_voice_input_transcription_model(),
         }
     }
 }
@@ -1041,6 +1240,26 @@ fn default_response_model() -> String {
     "gpt-4o-mini".to_string()
 }
 
+fn default_openai_voice_api_url() -> String {
+    "https://api.openai.com/v1/chat/completions".to_string()
+}
+
+fn default_openai_voice_model() -> String {
+    "gpt-audio-1.5".to_string()
+}
+
+fn default_openai_voice_name() -> String {
+    "alloy".to_string()
+}
+
+fn default_openai_voice_instructions() -> Option<String> {
+    default_response_instructions()
+}
+
+fn default_openai_voice_input_transcription_model() -> Option<String> {
+    Some(default_transcription_model())
+}
+
 fn default_tts_format() -> String {
     "wav".to_string()
 }
@@ -1264,6 +1483,26 @@ fn apply_speech_provider(
     target: &mut SpeechProvider,
 ) {
     if let Some(value) = env.get(key).and_then(|value| SpeechProvider::parse(value)) {
+        *target = value;
+    }
+}
+
+fn apply_llm_provider(
+    env: &std::collections::HashMap<String, String>,
+    key: &str,
+    target: &mut LlmProvider,
+) {
+    if let Some(value) = env.get(key).and_then(|value| LlmProvider::parse(value)) {
+        *target = value;
+    }
+}
+
+fn apply_voice_provider(
+    env: &std::collections::HashMap<String, String>,
+    key: &str,
+    target: &mut VoiceProvider,
+) {
+    if let Some(value) = env.get(key).and_then(|value| VoiceProvider::parse(value)) {
         *target = value;
     }
 }
@@ -1563,5 +1802,26 @@ mod tests {
         assert_eq!(config.speech.sherpa_onnx.tts.speed, 1.25);
         assert!(!config.speech.sherpa_onnx.warmup_on_startup);
         assert_eq!(config.speech.sherpa_onnx.request_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn llm_and_voice_env_overrides_apply() {
+        let mut config = AppConfig::default();
+        let env = HashMap::from([
+            ("LLM_PROVIDER".to_string(), "none".to_string()),
+            ("VOICE_PROVIDER".to_string(), "openai".to_string()),
+            (
+                "OPENAI_VOICE_MODEL".to_string(),
+                "gpt-audio-1.5".to_string(),
+            ),
+            ("OPENAI_VOICE_NAME".to_string(), "alloy".to_string()),
+        ]);
+
+        config.apply_env_overrides_from_map(&env);
+
+        assert_eq!(config.llm.provider, LlmProvider::None);
+        assert_eq!(config.voice.provider, VoiceProvider::OpenAi);
+        assert_eq!(config.voice.openai.model, "gpt-audio-1.5");
+        assert_eq!(config.voice.openai.voice, "alloy");
     }
 }
