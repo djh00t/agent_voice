@@ -79,6 +79,7 @@ jobs:
 
       - name: Fast-forward the deploy checkout
         run: |
+          git -C "$TV04_DEPLOY_PATH" remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git"
           git -C "$TV04_DEPLOY_PATH" fetch origin main
           git -C "$TV04_DEPLOY_PATH" checkout main
           git -C "$TV04_DEPLOY_PATH" pull --ff-only origin main
