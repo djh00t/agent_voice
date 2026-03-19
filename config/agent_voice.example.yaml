@@ -40,13 +40,13 @@ llm:
     instructions: "You are a helpful voice agent on a phone call. Keep replies brief, natural, and conversational."
 
 voice:
-  provider: "disabled"
+  provider: "openai"
   openai:
     api_url: "https://api.openai.com/v1/chat/completions"
     model: "gpt-audio-1.5"
     voice: "alloy"
     instructions: "You are a helpful voice agent on a phone call. Keep replies brief, natural, and conversational."
-    input_transcription_model: "gpt-4o-transcribe"
+    input_transcription_model: null
 
 agent_api:
   listen: "127.0.0.1:8089"
