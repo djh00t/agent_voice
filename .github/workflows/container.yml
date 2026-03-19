@@ -91,4 +91,12 @@ jobs:
           cd "$TV04_DEPLOY_PATH"
           docker compose pull agent-voice
           docker compose up -d agent-voice
-          curl -fsS http://127.0.0.1:8089/healthz
+          for attempt in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:8089/healthz; then
+              exit 0
+            fi
+            echo "health check attempt ${attempt}/15 failed; retrying"
+            sleep 2
+          done
+          docker compose logs --tail 120 agent-voice
+          exit 1
