@@ -29,5 +29,5 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2.5"
-uuid = { version = "1.17", features = ["serde", "v4"] }
+uuid = { version = "1.23", features = ["serde", "v4"] }
 xphone = "0.4.0"
