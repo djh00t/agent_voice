@@ -16,7 +16,6 @@ concurrency:
 jobs:
   quality-gates:
     name: Quality Gates
-    if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -38,18 +37,20 @@ jobs:
           cache-dependency-path: website/package-lock.json
 
       - name: Install docs dependencies
+        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]'
         run: make docs-install
 
       - name: Run repo quality gates
+        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]'
         run: make check
 
   compose-config:
     name: Compose Config
-    if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
       - name: Validate Compose configuration
+        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]'
         run: make compose-config
