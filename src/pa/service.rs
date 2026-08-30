@@ -1,9 +1,8 @@
 //! Application services for the personal-assistant availability workflow.
 //!
-//! This module is intentionally limited to the first service boundary: it
-//! reads both owner calendars, applies the validated availability policy, and
-//! durably freezes a non-empty quote. Appointment preparation, submission,
-//! messages, and owner tasks are separate service packages.
+//! This module contains the provider-free availability and appointment-
+//! preparation boundaries. Submission, messages, and owner tasks are separate
+//! service packages.
 
 use std::fmt;
 
@@ -11,7 +10,10 @@ use chrono::{DateTime, Utc};
 use time::{OffsetDateTime, UtcOffset};
 
 use super::availability::{AvailabilityError, AvailabilityPolicy};
-use super::domain::{AppointmentKind, AppointmentSlot, Quote};
+use super::domain::{
+    AppointmentDraft, AppointmentKind, AppointmentSlot, CallerIdentity, DomainError,
+    IdempotencyKey, Quote, QuoteId,
+};
 use super::providers::{
     GoogleCalendarProvider, OutlookCalendarProvider, ProviderError, ProviderSession, TimeRange,
 };
@@ -32,6 +34,8 @@ pub enum ServiceError {
     GoogleCalendar(ProviderError),
     /// Quote persistence failed.
     Store(StoreError),
+    /// Appointment draft validation failed.
+    Domain(DomainError),
     /// Neither calendar had a slot satisfying the policy.
     NoAvailability,
 }
@@ -44,6 +48,7 @@ impl fmt::Display for ServiceError {
             Self::OutlookCalendar(_) => formatter.write_str("outlook calendar operation failed"),
             Self::GoogleCalendar(_) => formatter.write_str("google calendar operation failed"),
             Self::Store(_) => formatter.write_str("appointment quote store operation failed"),
+            Self::Domain(_) => formatter.write_str("appointment request validation failed"),
             Self::NoAvailability => formatter.write_str("no appointment slots are available"),
         }
     }
@@ -63,6 +68,7 @@ impl fmt::Debug for ServiceError {
             Self::OutlookCalendar(_) => formatter.write_str("OutlookCalendar"),
             Self::GoogleCalendar(_) => formatter.write_str("GoogleCalendar"),
             Self::Store(_) => formatter.write_str("Store"),
+            Self::Domain(_) => formatter.write_str("Domain"),
             Self::NoAvailability => formatter.write_str("NoAvailability"),
         }
     }
@@ -118,6 +124,128 @@ impl fmt::Debug for AvailabilitySearch {
             .field("appointment_kind", &self.appointment_kind)
             .field("timezone", &"<redacted>")
             .field("offered_slot_count", &self.offered_slots.len())
+            .finish()
+    }
+}
+
+/// The durable, provider-free result of preparing an appointment request.
+///
+/// The recap is intentionally available through an explicit accessor because
+/// it contains caller identity data. The ordinary debug representation keeps
+/// that data, the quote identity, and the stored timestamps redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreparedRequest {
+    draft_id: i64,
+    quote_id: QuoteId,
+    caller: CallerIdentity,
+    kind: AppointmentKind,
+    starts_at: OffsetDateTime,
+    ends_at: OffsetDateTime,
+    timezone: String,
+    requester_included: bool,
+    recap: String,
+}
+
+impl PreparedRequest {
+    /// Returns the durable appointment-draft database ID.
+    pub const fn draft_id(&self) -> i64 {
+        self.draft_id
+    }
+
+    /// Alias emphasizing that the ID belongs to an appointment draft.
+    pub const fn appointment_draft_id(&self) -> i64 {
+        self.draft_id()
+    }
+
+    /// Returns the quote identity used for preparation.
+    pub const fn quote_id(&self) -> QuoteId {
+        self.quote_id
+    }
+
+    /// Returns the caller identity through an explicit accessor.
+    pub fn caller(&self) -> &CallerIdentity {
+        &self.caller
+    }
+
+    /// Returns the caller's validated name.
+    pub fn caller_name(&self) -> &str {
+        self.caller.name()
+    }
+
+    /// Returns the caller's confirmed email.
+    pub fn caller_email(&self) -> &str {
+        self.caller.email()
+    }
+
+    /// Returns the frozen appointment kind.
+    pub const fn kind(&self) -> AppointmentKind {
+        self.kind
+    }
+
+    /// Alias emphasizing that this is the appointment kind.
+    pub const fn appointment_kind(&self) -> AppointmentKind {
+        self.kind()
+    }
+
+    /// Returns the selected start instant.
+    pub const fn starts_at(&self) -> OffsetDateTime {
+        self.starts_at
+    }
+
+    /// Alias emphasizing that this is the selected slot start.
+    pub const fn selected_starts_at(&self) -> OffsetDateTime {
+        self.starts_at()
+    }
+
+    /// Returns the selected exclusive end instant.
+    pub const fn ends_at(&self) -> OffsetDateTime {
+        self.ends_at
+    }
+
+    /// Alias emphasizing that this is the selected slot end.
+    pub const fn selected_ends_at(&self) -> OffsetDateTime {
+        self.ends_at()
+    }
+
+    /// Returns the quote's validated IANA timezone.
+    pub fn timezone(&self) -> &str {
+        &self.timezone
+    }
+
+    /// Returns whether the requester is included in the appointment.
+    pub const fn requester_included(&self) -> bool {
+        self.requester_included
+    }
+
+    /// Alias for [`Self::requester_included`].
+    pub const fn includes_requester(&self) -> bool {
+        self.requester_included()
+    }
+
+    /// Returns the exact deterministic recap intended for spoken confirmation.
+    pub fn recap(&self) -> &str {
+        &self.recap
+    }
+
+    /// Alias for [`Self::recap`].
+    pub fn spoken_recap(&self) -> &str {
+        self.recap()
+    }
+}
+
+impl fmt::Debug for PreparedRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedRequest")
+            .field("draft_id", &self.draft_id)
+            .field("quote_id", &"<redacted>")
+            .field("caller", &"<redacted>")
+            .field("kind", &self.kind)
+            .field("starts_at", &"<redacted>")
+            .field("ends_at", &"<redacted>")
+            .field("timezone", &"<redacted>")
+            .field("requester_included", &self.requester_included)
+            .field("recap", &"<redacted>")
             .finish()
     }
 }
@@ -245,6 +373,130 @@ impl<'a> PaService<'a> {
             offered_slots: stored.offered_slots().to_vec(),
         })
     }
+
+    /// Prepares an immutable appointment request from a frozen quote.
+    ///
+    /// This boundary performs no calendar-provider calls. The store owns the
+    /// atomic quote selection, draft persistence, exact-retry behavior, and
+    /// immutable conflict checks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_request(
+        &self,
+        quote_id: QuoteId,
+        slot_index: u32,
+        caller: CallerIdentity,
+        expected_kind: AppointmentKind,
+        requester_included: Option<bool>,
+        source_id: impl AsRef<str>,
+        idempotency_key: IdempotencyKey,
+        now: OffsetDateTime,
+    ) -> ServiceResult<PreparedRequest> {
+        let quoted = self
+            .store
+            .load_appointment_quote_by_id(quote_id)
+            .map_err(ServiceError::Store)?;
+        if quoted.appointment_kind() != expected_kind {
+            return Err(ServiceError::Store(StoreError::Conflict {
+                resource: "appointment quote",
+            }));
+        }
+
+        let slot = quoted
+            .offered_slots()
+            .get(usize::try_from(slot_index).map_err(|_| {
+                if quoted.appointment_draft().is_some() {
+                    ServiceError::Store(StoreError::Conflict {
+                        resource: "appointment quote",
+                    })
+                } else {
+                    ServiceError::Store(StoreError::InvalidInput {
+                        field: "slot_index",
+                    })
+                }
+            })?)
+            .ok_or_else(|| {
+                if quoted.appointment_draft().is_some() {
+                    ServiceError::Store(StoreError::Conflict {
+                        resource: "appointment quote",
+                    })
+                } else {
+                    ServiceError::Store(StoreError::InvalidInput {
+                        field: "slot_index",
+                    })
+                }
+            })?;
+        let requester_included =
+            requester_included.unwrap_or_else(|| expected_kind.requester_included_by_default());
+        let draft = AppointmentDraft::new_with_requester_inclusion(
+            expected_kind,
+            caller,
+            slot.starts_at(),
+            quote_id,
+            idempotency_key,
+            requester_included,
+        )
+        .map_err(ServiceError::Domain)?;
+        let prepared = self
+            .store
+            .prepare_appointment_draft_from_quote(
+                quote_id,
+                slot_index,
+                source_id,
+                &draft,
+                now.to_offset(UtcOffset::UTC),
+            )
+            .map_err(ServiceError::Store)?;
+        let stored_draft =
+            prepared
+                .draft()
+                .ok_or(ServiceError::Store(StoreError::StoredRecordInvalid {
+                    resource: "appointment quote",
+                }))?;
+        let draft_id = prepared.appointment_draft_id().ok_or(ServiceError::Store(
+            StoreError::StoredRecordInvalid {
+                resource: "appointment quote",
+            },
+        ))?;
+        let recap = appointment_recap(stored_draft, prepared.timezone())?;
+
+        Ok(PreparedRequest {
+            draft_id,
+            quote_id: prepared.quote_id(),
+            caller: stored_draft.caller().clone(),
+            kind: stored_draft.kind(),
+            starts_at: stored_draft.starts_at(),
+            ends_at: stored_draft.ends_at(),
+            timezone: prepared.timezone().to_owned(),
+            requester_included: stored_draft.requester_included(),
+            recap,
+        })
+    }
+}
+
+fn appointment_recap(draft: &AppointmentDraft, timezone: &str) -> ServiceResult<String> {
+    let timezone = timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+        ServiceError::Store(StoreError::StoredRecordInvalid {
+            resource: "appointment quote",
+        })
+    })?;
+    let local_start = to_chrono_utc(draft.starts_at())?.with_timezone(&timezone);
+    let kind = match draft.kind() {
+        AppointmentKind::Callback => "Callback",
+        AppointmentKind::Meeting => "Meeting",
+    };
+    let inclusion = if draft.requester_included() {
+        "requester included"
+    } else {
+        "requester not included"
+    };
+    Ok(format!(
+        "{kind} for {} <{}> on {} at {} ({}); {inclusion}.",
+        draft.caller().name(),
+        draft.caller().email(),
+        local_start.format("%Y-%m-%d"),
+        local_start.format("%H:%M"),
+        timezone.name(),
+    ))
 }
 
 fn to_chrono_utc(value: OffsetDateTime) -> ServiceResult<DateTime<Utc>> {
@@ -259,7 +511,10 @@ mod tests {
     use crate::pa::availability::{
         AvailabilityError, AvailabilityPolicy, BusyInterval, default_working_windows,
     };
-    use crate::pa::domain::{AppointmentKind, Quote};
+    use crate::pa::domain::{
+        AppointmentKind, AppointmentSlot, CallerIdentity, ConfirmedEmail, IdempotencyKey, Quote,
+        QuoteId,
+    };
     use crate::pa::fakes::{FakeControl, FakeGoogleCalendar, FakeOperation, FakeOutlookCalendar};
     use crate::pa::providers::{CalendarChange, ProviderError, ProviderSession, RetryAfter};
     use crate::pa::store::{PaStore, StoreError};
@@ -818,6 +1073,432 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_request_returns_spoken_recap_for_frozen_slot_without_provider_calls() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let policy = AvailabilityPolicy::for_timezone("Australia/Sydney").expect("policy");
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &policy,
+        );
+        let quote = Quote::new(now);
+        let slot_start =
+            OffsetDateTime::parse("2026-08-31T22:00:00Z", &Rfc3339).expect("slot start");
+        let slot =
+            AppointmentSlot::new(slot_start, slot_start + Duration::minutes(30)).expect("slot");
+        store
+            .save_appointment_quote(
+                &quote,
+                AppointmentKind::Meeting,
+                "Australia/Sydney",
+                &[slot],
+            )
+            .expect("quote");
+        let caller = CallerIdentity::new(
+            "Ada Lovelace",
+            ConfirmedEmail::confirm("ada@example.test").expect("email"),
+        )
+        .expect("caller");
+
+        let request = service
+            .prepare_request(
+                quote.id(),
+                0,
+                caller,
+                AppointmentKind::Meeting,
+                None,
+                "voice:call-1",
+                IdempotencyKey::new("appointment:call-1").expect("key"),
+                now,
+            )
+            .expect("prepare");
+
+        assert_eq!(request.draft_id(), 1);
+        assert_eq!(request.quote_id(), quote.id());
+        assert_eq!(request.kind(), AppointmentKind::Meeting);
+        assert_eq!(request.starts_at(), slot.starts_at());
+        assert_eq!(request.ends_at(), slot.ends_at());
+        assert_eq!(request.timezone(), "Australia/Sydney");
+        assert!(request.requester_included());
+        assert_eq!(
+            request.recap(),
+            "Meeting for Ada Lovelace <ada@example.test> on 2026-09-01 at 08:00 (Australia/Sydney); requester included."
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook count"),
+            0
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google count"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_request_applies_inclusion_defaults_and_explicit_override() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+        );
+        let caller = || {
+            CallerIdentity::new(
+                "Ada Lovelace",
+                ConfirmedEmail::confirm("ada@example.test").expect("email"),
+            )
+            .expect("caller")
+        };
+
+        let callback_quote = Quote::new(now);
+        let callback_slot = AppointmentSlot::new(
+            now + Duration::hours(1),
+            now + Duration::hours(1) + Duration::minutes(15),
+        )
+        .expect("callback slot");
+        store
+            .save_appointment_quote(
+                &callback_quote,
+                AppointmentKind::Callback,
+                "UTC",
+                &[callback_slot],
+            )
+            .expect("callback quote");
+        let callback_request = service
+            .prepare_request(
+                callback_quote.id(),
+                0,
+                caller(),
+                AppointmentKind::Callback,
+                None,
+                "voice:callback-default",
+                IdempotencyKey::new("appointment:callback-default").expect("key"),
+                now,
+            )
+            .expect("callback prepare");
+        assert!(!callback_request.requester_included());
+        assert!(callback_request.recap().contains("requester not included"));
+
+        let meeting_quote = Quote::new(now);
+        let meeting_slot = AppointmentSlot::new(
+            now + Duration::hours(2),
+            now + Duration::hours(2) + Duration::minutes(30),
+        )
+        .expect("meeting slot");
+        store
+            .save_appointment_quote(
+                &meeting_quote,
+                AppointmentKind::Meeting,
+                "UTC",
+                &[meeting_slot],
+            )
+            .expect("meeting quote");
+        let meeting_request = service
+            .prepare_request(
+                meeting_quote.id(),
+                0,
+                caller(),
+                AppointmentKind::Meeting,
+                Some(false),
+                "voice:meeting-override",
+                IdempotencyKey::new("appointment:meeting-override").expect("key"),
+                now,
+            )
+            .expect("meeting prepare");
+        assert!(!meeting_request.requester_included());
+        assert!(meeting_request.recap().contains("requester not included"));
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook count"),
+            0
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google count"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_request_retries_exactly_after_expiry_and_conflicts_on_changes() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+        );
+        let quote = Quote::new(now);
+        let first_slot = AppointmentSlot::new(
+            now + Duration::hours(1),
+            now + Duration::hours(1) + Duration::minutes(30),
+        )
+        .expect("first slot");
+        let second_slot = AppointmentSlot::new(
+            now + Duration::hours(2),
+            now + Duration::hours(2) + Duration::minutes(30),
+        )
+        .expect("second slot");
+        store
+            .save_appointment_quote(
+                &quote,
+                AppointmentKind::Meeting,
+                "UTC",
+                &[first_slot, second_slot],
+            )
+            .expect("quote");
+        let caller = CallerIdentity::new(
+            "Ada Lovelace",
+            ConfirmedEmail::confirm("ada@example.test").expect("email"),
+        )
+        .expect("caller");
+        let key = IdempotencyKey::new("appointment:retry").expect("key");
+        let first = service
+            .prepare_request(
+                quote.id(),
+                0,
+                caller.clone(),
+                AppointmentKind::Meeting,
+                None,
+                "voice:retry",
+                key.clone(),
+                now,
+            )
+            .expect("first prepare");
+        let retry = service
+            .prepare_request(
+                quote.id(),
+                0,
+                caller.clone(),
+                AppointmentKind::Meeting,
+                None,
+                "voice:retry",
+                key.clone(),
+                quote.expires_at(),
+            )
+            .expect("retry after expiry");
+        assert_eq!(retry, first);
+
+        let changed_caller = CallerIdentity::new(
+            "Grace Hopper",
+            ConfirmedEmail::confirm("grace@example.test").expect("email"),
+        )
+        .expect("caller");
+        for (slot_index, caller, inclusion, source_id, key) in [
+            (0, changed_caller, None, "voice:retry", key.clone()),
+            (0, caller.clone(), Some(false), "voice:retry", key.clone()),
+            (0, caller.clone(), None, "voice:changed", key.clone()),
+            (
+                0,
+                caller.clone(),
+                None,
+                "voice:retry",
+                IdempotencyKey::new("appointment:changed").expect("key"),
+            ),
+            (1, caller.clone(), None, "voice:retry", key.clone()),
+        ] {
+            let error = service
+                .prepare_request(
+                    quote.id(),
+                    slot_index,
+                    caller,
+                    AppointmentKind::Meeting,
+                    inclusion,
+                    source_id,
+                    key,
+                    now,
+                )
+                .expect_err("changed immutable input must conflict");
+            assert!(matches!(
+                error,
+                ServiceError::Store(StoreError::Conflict { .. })
+            ));
+        }
+
+        let error = service
+            .prepare_request(
+                quote.id(),
+                0,
+                caller,
+                AppointmentKind::Callback,
+                None,
+                "voice:retry",
+                IdempotencyKey::new("appointment:retry").expect("key"),
+                now,
+            )
+            .expect_err("changed kind must conflict");
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::Conflict { .. })
+        ));
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook count"),
+            0
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google count"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_request_rejects_unknown_invalid_and_temporally_invalid_quotes() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let policy = AvailabilityPolicy::for_timezone("UTC").expect("policy");
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &policy,
+        );
+        let caller = CallerIdentity::new(
+            "Ada Lovelace",
+            ConfirmedEmail::confirm("ada@example.test").expect("email"),
+        )
+        .expect("caller");
+        let key = || IdempotencyKey::new("appointment:invalid").expect("key");
+        let unknown = service
+            .prepare_request(
+                QuoteId::new(),
+                0,
+                caller.clone(),
+                AppointmentKind::Callback,
+                None,
+                "voice:unknown",
+                key(),
+                now,
+            )
+            .expect_err("unknown quote must fail closed");
+        assert!(matches!(
+            unknown,
+            ServiceError::Store(StoreError::NotFound { .. })
+        ));
+
+        let quote = Quote::with_id(QuoteId::new(), now);
+        let slot = AppointmentSlot::new(
+            now + Duration::hours(1),
+            now + Duration::hours(1) + Duration::minutes(15),
+        )
+        .expect("slot");
+        store
+            .save_appointment_quote(&quote, AppointmentKind::Callback, "UTC", &[slot])
+            .expect("quote");
+        let invalid_slot = service
+            .prepare_request(
+                quote.id(),
+                1,
+                caller.clone(),
+                AppointmentKind::Callback,
+                None,
+                "voice:invalid-slot",
+                key(),
+                now,
+            )
+            .expect_err("unknown slot must fail closed");
+        assert!(matches!(
+            invalid_slot,
+            ServiceError::Store(StoreError::InvalidInput {
+                field: "slot_index"
+            })
+        ));
+        let expired = service
+            .prepare_request(
+                quote.id(),
+                0,
+                caller.clone(),
+                AppointmentKind::Callback,
+                None,
+                "voice:expired",
+                key(),
+                quote.expires_at(),
+            )
+            .expect_err("expired quote must fail closed");
+        assert!(matches!(
+            expired,
+            ServiceError::Store(StoreError::AppointmentQuoteExpired)
+        ));
+
+        let future_quote = Quote::with_id(QuoteId::new(), now + Duration::hours(1));
+        let future_slot = AppointmentSlot::new(
+            future_quote.issued_at() + Duration::hours(1),
+            future_quote.issued_at() + Duration::hours(1) + Duration::minutes(15),
+        )
+        .expect("future slot");
+        store
+            .save_appointment_quote(
+                &future_quote,
+                AppointmentKind::Callback,
+                "UTC",
+                &[future_slot],
+            )
+            .expect("future quote");
+        let not_yet_valid = service
+            .prepare_request(
+                future_quote.id(),
+                0,
+                caller,
+                AppointmentKind::Callback,
+                None,
+                "voice:not-yet-valid",
+                key(),
+                now,
+            )
+            .expect_err("future quote must fail closed");
+        assert!(matches!(
+            not_yet_valid,
+            ServiceError::Store(StoreError::AppointmentQuoteNotYetValid)
+        ));
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook count"),
+            0
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google count"),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn horizon_and_quote_expiry_overflow_fail_before_provider_calls() {
         let horizon_overflow_now = Date::MAX.with_time(Time::MAX).assume_utc();
         let horizon_outlook_control = control(horizon_overflow_now);
@@ -986,5 +1667,70 @@ mod tests {
                 assert!(!debug.contains(secret), "debug leaked {secret}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_request_debug_redacts_caller_and_spoken_recap() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+        );
+        let quote = Quote::new(now);
+        let slot = AppointmentSlot::new(
+            now + Duration::hours(1),
+            now + Duration::hours(1) + Duration::minutes(15),
+        )
+        .expect("slot");
+        store
+            .save_appointment_quote(&quote, AppointmentKind::Callback, "UTC", &[slot])
+            .expect("quote");
+        let request = service
+            .prepare_request(
+                quote.id(),
+                0,
+                CallerIdentity::new(
+                    "Debug Sentinel",
+                    ConfirmedEmail::confirm("debug-sentinel@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:debug",
+                IdempotencyKey::new("appointment:debug").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        let debug = format!("{request:?}");
+        for secret in [
+            "Debug Sentinel",
+            "debug-sentinel@example.test",
+            "2026-08-31T09:00:00Z",
+            "Callback for",
+            "UTC",
+        ] {
+            assert!(!debug.contains(secret), "prepared debug leaked {secret}");
+        }
+        assert!(debug.contains("PreparedRequest"));
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook count"),
+            0
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google count"),
+            0
+        );
     }
 }
