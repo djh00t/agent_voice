@@ -7,7 +7,7 @@
 - **Worktree:** `/private/tmp/agent-voice-pa-06c3-submit-orchestration`
 - **Branch:** `codex/agent-voice-pa-06c3-submit-orchestration`
 - **Base:** `4ba837e6ed7f2cd4ba431660865d902a2787f9eb` (`origin/main`)
-- **Implementation commits:** `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`, `68e8e2e`, `499adc5`, `95f216b`
+- **Implementation commits:** `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`, `68e8e2e`, `499adc5`, `95f216b`, `748d613`
 
 ## Scope
 
@@ -93,11 +93,11 @@ Commands and results:
 | Check | Result |
 | --- | --- |
 | `rtk cargo test pa::service::tests::fractional --lib` | PASS — 2 passed, 494 filtered out |
-| `rtk cargo test pa::service::tests:: --lib` | PASS — 42 passed, 454 filtered out |
+| `rtk cargo test pa::service::tests:: --lib` | PASS — 43 passed, 454 filtered out |
 | `rtk cargo clippy --all-targets --all-features -- -D warnings` | PASS — no issues found |
 | `rtk rustfmt --edition 2024 --check src/pa/service.rs` | PASS |
 | `rtk git diff --check` | PASS |
-| `rtk make check` | PASS — Rust tests, clippy, docs, and Docusaurus build completed; full suite ran 496 tests |
+| `rtk make check` | PASS — Rust tests, clippy, docs, and Docusaurus build completed; full suite ran 497 tests |
 
 The first `rtk make check` attempt stopped at `docs-build` because the clean
 worktree had no installed Docusaurus binary (`docusaurus: command not found`).
@@ -224,6 +224,24 @@ rtk cargo test pa::service::tests::submission_ --lib
 
 Result: PASS — 2 passed, 494 filtered out.
 
+## Reviewer unmapped-retry remediation
+
+When a durable proposal exists but operation-key lookup returns `NotFound`, the
+service now repeats the checked expanded-buffer dual-calendar recheck directly
+before the impending create. Existing-event recovery remains unchanged.
+`unmapped_proposal_not_found_rechecks_buffer_before_retry_create` leaves a
+durable proposal after a closed create failure, adds an unrelated event only in
+the pre-buffer, then verifies the retry fails before another create or local
+tail write.
+
+Focused command:
+
+```text
+rtk cargo test pa::service::tests::unmapped_proposal_not_found_rechecks_buffer_before_retry_create --lib
+```
+
+Result: PASS — 1 passed, 496 filtered out.
+
 ## Non-claims and residual gates
 
 - Evidence is LOCAL only; no CI, live Google/Outlook provider, OAuth,
@@ -231,7 +249,7 @@ Result: PASS — 2 passed, 494 filtered out.
 - #211 owns ambiguous provider-create recovery and its audit/evidence path;
   it remains unimplemented here.
 - Rollback is a code revert of `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`,
-  `68e8e2e`, `499adc5`, and `95f216b`; no remote deletion is inferred or attempted.
+  `68e8e2e`, `499adc5`, `95f216b`, and `748d613`; no remote deletion is inferred or attempted.
 
 ## Completion evidence
 
