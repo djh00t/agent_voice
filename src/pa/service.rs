@@ -753,7 +753,7 @@ impl<'a> PaService<'a> {
             .as_ref()
             .ok_or(ServiceError::OwnerNotConfigured)?;
         let prepared = confirmed.0;
-        let now = now.to_offset(UtcOffset::UTC);
+        let now = canonicalize_utc_second(now, "now")?;
         let quote = self
             .store
             .load_appointment_quote_by_draft_id(prepared.draft_id)
@@ -2676,6 +2676,107 @@ mod tests {
             google_control
                 .invocation_count(FakeOperation::CalendarProposalFind)
                 .expect("find count"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn nonzero_nanosecond_submission_retries_without_partial_state() {
+        let now = now();
+        let submission_now = now
+            .replace_nanosecond(123_456_789)
+            .expect("valid nanosecond");
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:nanosecond-submit",
+                IdempotencyKey::new("appointment:nanosecond-submit").expect("key"),
+                now,
+            )
+            .expect("prepare");
+
+        let first = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                submission_now,
+            )
+            .await
+            .expect("nonzero nanoseconds must be canonicalized");
+        assert!(first.is_pending());
+        assert_eq!(first.requester_notification_id(), None);
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
+        assert_eq!(
+            store
+                .load_appointment_quote_by_id(search.quote().id())
+                .expect("quote")
+                .consumed_at()
+                .expect("consumed timestamp")
+                .nanosecond(),
+            0
+        );
+
+        for operation in [
+            FakeOperation::CalendarBusy,
+            FakeOperation::CalendarProposalFind,
+            FakeOperation::CalendarProposalCreate,
+        ] {
+            let failure = if operation == FakeOperation::CalendarBusy {
+                ProviderError::Unavailable
+            } else {
+                ProviderError::Conflict
+            };
+            google_control
+                .set_failure(operation, failure)
+                .expect("provider failure");
+            if operation == FakeOperation::CalendarBusy {
+                outlook_control
+                    .set_failure(operation, ProviderError::Unavailable)
+                    .expect("outlook failure");
+            }
+        }
+
+        let retry = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                submission_now,
+            )
+            .await
+            .expect("exact retry");
+        assert_eq!(retry, first);
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
             1
         );
     }
