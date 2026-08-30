@@ -170,6 +170,10 @@ mod tests {
                 Err(RealtimeValueError::InvalidOpaqueId)
             );
         }
+        let exact_limit = "a".repeat(128);
+        let id = OpaqueId::new(exact_limit.clone()).expect("128 ASCII bytes are accepted");
+        assert_eq!(id.as_str(), exact_limit);
+        assert_eq!(id.as_str().len(), 128);
         assert_eq!(
             OpaqueId::new("a".repeat(MAX_ID_BYTES + 1)),
             Err(RealtimeValueError::InvalidOpaqueId)
@@ -181,6 +185,9 @@ mod tests {
             INVALID_OPAQUE_ID
         );
         assert!(serde_json::from_str::<OpaqueId>("42").is_err());
+        let malformed = serde_json::from_str::<OpaqueId>(r#""unterminated"#)
+            .expect_err("malformed JSON syntax must be rejected");
+        assert!(!malformed.to_string().contains("unterminated"));
 
         let errors = [
             (RealtimeValueError::EventTooLarge, "event is too large"),
