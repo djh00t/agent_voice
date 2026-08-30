@@ -6,8 +6,8 @@
 - **Evidence date:** 2026-08-30 (Australia/Sydney)
 - **Worktree:** `/private/tmp/agent-voice-pa-06c3-submit-orchestration`
 - **Branch:** `codex/agent-voice-pa-06c3-submit-orchestration`
-- **Base:** `b42498e4e370c1ef4d1e03c98b7361c190ad82fb` (`origin/main`)
-- **Implementation commits:** `03f4880`, `5b1485a`, `ee27ebe`
+- **Base:** `4ba837e6ed7f2cd4ba431660865d902a2787f9eb` (`origin/main`)
+- **Implementation commits:** `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`
 
 ## Scope
 
@@ -125,6 +125,39 @@ dependency change was made.
   redacted. No provider event ID, token, transcript, raw provider payload, or
   email body is returned by the result or error formatting.
 
+## Reviewer P1 remediation
+
+Durable appointment-draft start and end values are now rejected unless both
+use the UTC offset before proposal lookup, calendar reads/creates, quote
+consumption, mapping, notification, or audit writes. This closes the gap where
+instant equality accepted a non-UTC durable RFC 3339 value and
+`NotificationTemplateData` rejected it only after earlier submission effects.
+
+`non_utc_durable_interval_fails_before_submission_side_effects_and_exact_retry_converges`
+corrupts both durable values to an equivalent `+10:00` interval, verifies no
+proposal lookup/create or local submission row, restores the exact UTC values,
+then verifies the initial valid submission and exact retry converge to one
+proposal and one owner-only notification/audit tail.
+
+Focused command:
+
+```text
+rtk cargo test pa::service::tests::non_utc_durable_interval_fails_before_submission_side_effects_and_exact_retry_converges --lib
+```
+
+Result: PASS — 1 passed, 490 filtered out.
+
+Current repository gate:
+
+```text
+rtk make check
+```
+
+Result: PASS — 491 unit tests, 3 doctests, strict clippy, Rust API docs, and
+the Docusaurus production build. The fresh worktree first lacked the local
+Docusaurus binary; `rtk make docs-install` installed the lockfile-resolved
+website dependencies without changing tracked manifests or lockfiles.
+
 ## Non-claims and residual gates
 
 - Evidence is LOCAL only; no CI, live Google/Outlook provider, OAuth,
@@ -140,9 +173,10 @@ dependency change was made.
 ## Completion evidence
 
 - **Implementer:** Codex delegated #210 lane
-- **Commits:** `03f4880` (`feat(service): orchestrate confirmed request submission`),
-  `5b1485a` (`fix(service): canonicalize submission audit time`), `ee27ebe`
-  (`fix(service): preserve fractional quote boundaries`)
-- **Report commit:** added separately after implementation commit
+- **Commits:** `5d2d43e` (`feat(service): orchestrate confirmed request submission`),
+  `cf72a79` (`fix(service): canonicalize submission audit time`), `5d4efc9`
+  (`fix(service): preserve fractional quote boundaries`), `82e6723`
+  (`fix(service): reject non-UTC durable submission intervals`)
+- **Report commit:** added separately after P1 remediation
 - **PR/push:** not created or pushed, per task instruction
 - **Reviewer:** not performed in this lane
