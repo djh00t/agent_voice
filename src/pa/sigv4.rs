@@ -339,7 +339,7 @@ fn canonical_method(method: &str) -> Result<String, SigV4Error> {
     {
         return Err(SigV4Error::new(SigV4ErrorKind::InvalidMethod));
     }
-    Ok(method.to_ascii_uppercase())
+    Ok(method.to_owned())
 }
 
 fn is_method_byte(byte: u8) -> bool {
@@ -581,12 +581,15 @@ fn validate_session_token_header(
     headers: &[(String, String)],
     expected: Option<&str>,
 ) -> Result<(), SigV4Error> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
     let mut matching = headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("x-amz-security-token"));
+    let Some(expected) = expected else {
+        if matching.next().is_some() {
+            return Err(SigV4Error::new(SigV4ErrorKind::InvalidCredential));
+        }
+        return Ok(());
+    };
     let Some((_, value)) = matching.next() else {
         return Err(SigV4Error::new(SigV4ErrorKind::MissingRequiredHeader));
     };
