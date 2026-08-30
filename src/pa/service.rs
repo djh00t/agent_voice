@@ -907,6 +907,40 @@ impl<'a> PaService<'a> {
                 };
                 (proposal, event)
             } else {
+                if existing_proposal.is_some() {
+                    let recheck_start = draft
+                        .starts_at()
+                        .checked_sub(self.policy.meeting_buffer())
+                        .ok_or(ServiceError::Availability(
+                            AvailabilityError::DateTimeOverflow,
+                        ))?;
+                    let recheck_end = draft
+                        .ends_at()
+                        .checked_add(self.policy.meeting_buffer())
+                        .ok_or(ServiceError::Availability(
+                            AvailabilityError::DateTimeOverflow,
+                        ))?;
+                    let recheck =
+                        TimeRange::new(to_chrono_utc(recheck_start)?, to_chrono_utc(recheck_end)?)
+                            .map_err(|_| ServiceError::InvalidInput {
+                                field: "time_range",
+                            })?;
+                    let outlook_busy = self
+                        .outlook
+                        .list_busy(self.outlook_session, &recheck)
+                        .await
+                        .map_err(ServiceError::OutlookCalendar)?;
+                    let google_busy = self
+                        .google
+                        .list_busy(self.google_session, &recheck)
+                        .await
+                        .map_err(ServiceError::GoogleCalendar)?;
+                    if busy_overlaps(&outlook_busy, recheck_start, recheck_end)
+                        || busy_overlaps(&google_busy, recheck_start, recheck_end)
+                    {
+                        return Err(ServiceError::NoAvailability);
+                    }
+                }
                 let proposal = match existing_proposal {
                     Some(proposal) => proposal,
                     None => self
@@ -2765,6 +2799,114 @@ mod tests {
                 .invocation_count(FakeOperation::CalendarBusy)
                 .expect("google busy count"),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn unmapped_proposal_not_found_rechecks_buffer_before_retry_create() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let owner = MailAddress::new("owner@example.test").expect("owner");
+        let policy = AvailabilityPolicy::new(
+            "UTC",
+            default_working_windows(),
+            Duration::ZERO,
+            Duration::hours(2),
+            Duration::minutes(15),
+        )
+        .expect("policy");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &policy,
+            owner.clone(),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:unmapped-buffer",
+                IdempotencyKey::new("appointment:unmapped-buffer").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        google_control
+            .set_failure(
+                FakeOperation::CalendarProposalCreate,
+                ProviderError::Unavailable,
+            )
+            .expect("create failure");
+        assert!(matches!(
+            service
+                .submit_request(
+                    ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                        .expect("confirmation"),
+                    now
+                )
+                .await,
+            Err(ServiceError::GoogleCalendar(ProviderError::Unavailable))
+        ));
+        google_control
+            .clear_failure(FakeOperation::CalendarProposalCreate)
+            .expect("clear create failure");
+        let busy_range = TimeRange::new(
+            super::to_chrono_utc(prepared.starts_at() - Duration::minutes(10)).expect("start"),
+            super::to_chrono_utc(prepared.starts_at() - Duration::minutes(5)).expect("end"),
+        )
+        .expect("range");
+        let occupied = GoogleProposalDraft::from_owner(
+            "unrelated-unmapped-buffer",
+            super::PENDING_PROPOSAL_TITLE,
+            busy_range,
+            prepared.timezone(),
+            CalendarAttendee::needs_action(owner),
+        )
+        .expect("occupied");
+        google
+            .create_proposal(&google_session, &occupied)
+            .await
+            .expect("occupy buffer");
+        let creates_before_retry = google_control
+            .invocation_count(FakeOperation::CalendarProposalCreate)
+            .expect("create count");
+        let error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now + Duration::minutes(1),
+            )
+            .await
+            .expect_err("buffer busy retry must fail");
+        assert!(matches!(error, ServiceError::NoAvailability));
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            creates_before_retry
+        );
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 0);
+        assert!(
+            store
+                .list_audit_events(None, 10)
+                .expect("audits")
+                .is_empty()
         );
     }
 
