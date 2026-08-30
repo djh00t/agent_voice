@@ -2,11 +2,11 @@
 
 - **Issue:** [#219](https://github.com/djh00t/agent_voice/issues/219)
 - **Package:** `task-10b.2`
-- **Evidence date:** 2026-08-30 (Australia/Sydney)
-- **Worktree:** `/private/tmp/agent-voice-pa-10b3-realtime-codecs`
+- **Evidence date:** 2026-08-31 (Australia/Sydney)
+- **Worktree:** `/private/tmp/agent-voice-pa-10b3-realtime-codecs-repair`
 - **Branch:** `codex/agent-voice-pa-10b3-realtime-codecs`
-- **Base:** `57643df4410b217743e8e582fa844cea8864b7fb` (`origin/main`, merged PR #233)
-- **Implementation commit:** `beb17d4`
+- **Base:** `76e8df40220125212588a74ea2a019fb5ea98bc1` (`origin/main`, merged PR #242)
+- **Implementation commit:** `a432ce4f`
 
 ## Scope and ownership
 
@@ -66,11 +66,11 @@ exit 101
 
 | Check | Result |
 | --- | --- |
-| `rtk cargo test --lib realtime::values::tests::bounded_text_and_g711_ulaw -- --exact` | PASS — 1 passed, 498 filtered out |
+| `rtk cargo test --lib realtime::values::tests::bounded_text_and_g711_ulaw -- --exact` | PASS — 1 passed, 507 filtered out |
 | `rtk cargo clippy --all-targets --all-features -- -D warnings` | PASS — no issues found |
 | `rtk rustfmt --edition 2024 --check src/realtime/values.rs` | PASS |
 | `rtk git diff --check` | PASS |
-| `rtk make check` | PASS — Rust tests (499), clippy, Rust docs, and Docusaurus completed with exit 0 |
+| `rtk make check` | PASS — Rust tests (508), clippy, Rust docs, and Docusaurus completed with exit 0 |
 
 The first `rtk make check` attempt stopped at `docs-build` because this fresh
 worktree had no `website/node_modules` (`docusaurus: command not found`).
@@ -84,7 +84,9 @@ formatting differences in unrelated `src/pa/fakes/calendar.rs`,
 `src/pa/fakes/mail.rs`, and `src/service.rs`; the owned file passes the scoped
 formatter check above and those unrelated files were not changed.
 
-The clean baseline before this package was `rtk cargo test --lib` — 498 passed.
+The clean baseline before this package was `rtk cargo test --lib` — 507 passed; this
+implementation adds the focused test, producing 508 passed in the full library
+run above.
 
 ## Non-claims and delivery
 
@@ -92,15 +94,18 @@ The clean baseline before this package was `rtk cargo test --lib` — 498 passed
 - **LIVE:** no provider, credential, network, SIP, transport, queue, sink,
   playback, tool, deployment, or authenticated UAT behavior was exercised.
 - **Persistence:** no persistent data or migration exists; rollback is reverting
-  `beb17d4` and this report commit.
-- **Delivery:** the source commit is ready to push and publish for review; no
-  merge or approval is performed by this package.
+  the reachable implementation commit `a432ce4f` and the report lineage, beginning
+  with report commit `75ea7b1` and its subsequent report-only repair.
+- **Delivery:** the source and report commits are pushed on the PR branch for review;
+  no merge or approval is performed by this package.
 
 ## Lifecycle linkage
 
 `Closes #219`
 
-`Refs #97, #217`
+`Refs #97`
+
+`Refs #217`
 
 ## Package status
 
