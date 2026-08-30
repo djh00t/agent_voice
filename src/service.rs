@@ -1868,13 +1868,9 @@ fn sanitize_caller_update(
     update.first_name = normalize_name_candidate(update.first_name);
     update.last_name = normalize_name_candidate(update.last_name);
     update.company = normalize_company_candidate(update.company);
-    update.timezone = update.timezone.and_then(|value| {
-        if is_valid_timezone(&value) {
-            Some(value)
-        } else {
-            None
-        }
-    });
+    update.timezone = update
+        .timezone
+        .filter(|value| is_valid_timezone(value));
 
     if update.preferred_language.is_some()
         && !caller_explicitly_set_language_preference(latest_caller_text)
