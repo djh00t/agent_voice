@@ -7810,16 +7810,8 @@ CREATE TABLE IF NOT EXISTS http_idempotency_records (
     fingerprint TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('in_progress', 'completed')),
     lease_generation INTEGER NOT NULL CHECK (lease_generation > 0),
-    lease_until TEXT NOT NULL CHECK (
-        typeof(lease_until) = 'text'
-        AND length(CAST(lease_until AS BLOB)) BETWEEN 1 AND 19
-        AND lease_until GLOB '[0-9]*'
-        AND lease_until NOT GLOB '*[^0-9]*'
-        AND (lease_until = '0' OR substr(lease_until, 1, 1) <> '0')
-        AND (
-            length(lease_until) < 19
-            OR lease_until <= '9223372036854775807'
-        )
+    lease_until INTEGER NOT NULL CHECK (
+        typeof(lease_until) = 'integer' AND lease_until >= 0
     ),
     response_status INTEGER,
     response_content_type TEXT,
@@ -7869,7 +7861,7 @@ CREATE TABLE IF NOT EXISTS http_idempotency_records (
     ),
     CHECK (typeof(state) = 'text'),
     CHECK (typeof(lease_generation) = 'integer'),
-    CHECK (typeof(lease_until) = 'text'),
+    CHECK (typeof(lease_until) = 'integer'),
     CHECK (typeof(created_at) = 'text'),
     CHECK (typeof(updated_at) = 'text'),
     CHECK (
@@ -8914,7 +8906,7 @@ END;
                     None,
                     0
                 ),
-                ("lease_until".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("lease_until".to_owned(), "INTEGER".to_owned(), 1, None, 0),
                 (
                     "response_status".to_owned(),
                     "INTEGER".to_owned(),
@@ -8992,7 +8984,7 @@ END;
                     "scope",
                     "default-timestamps",
                     VALID_HTTP_FINGERPRINT,
-                    "1700000000"
+                    1700000000_i64
                 ],
             )
             .expect("insert row using timestamp defaults");
@@ -9019,6 +9011,51 @@ END;
                 "default timestamp is strict canonical RFC3339"
             );
         }
+
+        for (key, lease_until) in [
+            ("numeric-9", 9_i64),
+            ("numeric-10", 10),
+            ("numeric-large", 1_700_000_000),
+        ] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO http_idempotency_records (
+                         scope, idempotency_key, fingerprint, state, lease_generation,
+                         lease_until
+                     ) VALUES ('numeric', ?1, ?2, 'in_progress', 1, ?3)",
+                    rusqlite::params![key, VALID_HTTP_FINGERPRINT, lease_until],
+                )
+                .expect("numeric lease row");
+        }
+        let ordered: Vec<i64> = store
+            .connection()
+            .prepare(
+                "SELECT lease_until FROM http_idempotency_records
+                 WHERE scope = 'numeric' ORDER BY lease_until",
+            )
+            .expect("numeric lease order query")
+            .query_map([], |row| row.get(0))
+            .expect("numeric lease order rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("numeric lease order");
+        assert_eq!(ordered, vec![9, 10, 1_700_000_000]);
+        let query_plan: Vec<String> = store
+            .connection()
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM http_idempotency_records
+                 WHERE lease_until <= 10 ORDER BY lease_until",
+            )
+            .expect("lease query plan")
+            .query_map([], |row| row.get(3))
+            .expect("lease query plan rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("lease query plan");
+        assert!(
+            query_plan
+                .iter()
+                .any(|detail| { detail.contains("idx_http_idempotency_records_lease_until") })
+        );
     }
 
     #[test]
@@ -9537,7 +9574,7 @@ END;
                 Value::Text(VALID_HTTP_FINGERPRINT.to_owned()),
                 Value::Text("in_progress".to_owned()),
                 Value::Integer(1),
-                Value::Text("1700000000".to_owned()),
+                Value::Integer(1_700_000_000),
                 Value::Null,
                 Value::Null,
                 Value::Null,
@@ -9552,7 +9589,7 @@ END;
                 Value::Text(VALID_HTTP_FINGERPRINT.to_owned()),
                 Value::Text("completed".to_owned()),
                 Value::Integer(1),
-                Value::Text("1700000000".to_owned()),
+                Value::Integer(1_700_000_000),
                 Value::Integer(200),
                 Value::Text("application/json".to_owned()),
                 Value::Blob(b"{}".to_vec()),
@@ -9679,9 +9716,9 @@ END;
     }
 
     #[test]
-    fn http_idempotency_v14_constraints_reject_noncanonical_lease_until() {
+    fn http_idempotency_v14_constraints_reject_invalid_lease_until() {
         let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
-        let insert = |key: &str, lease_until: &str| {
+        let insert = |key: &str, lease_until: Value| {
             store.connection().execute(
                 "INSERT INTO http_idempotency_records (
                      scope, idempotency_key, fingerprint, state, lease_generation,
@@ -9692,12 +9729,10 @@ END;
         };
 
         for (index, (label, lease_until)) in [
-            ("empty", ""),
-            ("nondecimal", "1700000000x"),
-            ("signed positive", "+1700000000"),
-            ("signed negative", "-1"),
-            ("leading zero", "01700000000"),
-            ("overflow", "9223372036854775808"),
+            ("negative", Value::Integer(-1)),
+            ("real", Value::Real(1_700_000_000.5)),
+            ("non-numeric text", Value::Text("1700000000x".to_owned())),
+            ("blob", Value::Blob(b"1700000000".to_vec())),
         ]
         .into_iter()
         .enumerate()
@@ -9709,14 +9744,14 @@ END;
         }
 
         for (key, lease_until) in [
-            ("zero", "0"),
-            ("positive", "1700000000"),
-            ("maximum", "9223372036854775807"),
+            ("zero", 0_i64),
+            ("positive", 1_700_000_000),
+            ("maximum", i64::MAX),
         ] {
-            insert(key, lease_until).expect("canonical lease_until was rejected");
+            insert(key, Value::Integer(lease_until)).expect("valid lease_until was rejected");
         }
 
-        let stored: Vec<String> = store
+        let stored: Vec<i64> = store
             .connection()
             .prepare(
                 "SELECT lease_until FROM http_idempotency_records
@@ -9727,7 +9762,7 @@ END;
             .expect("lease values")
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("lease values rows");
-        assert_eq!(stored, vec!["9223372036854775807", "1700000000", "0"]);
+        assert_eq!(stored, vec![i64::MAX, 1_700_000_000, 0]);
     }
 
     #[test]
