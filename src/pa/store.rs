@@ -7816,6 +7816,9 @@ CREATE TABLE IF NOT EXISTS http_idempotency_records (
     response_body BLOB,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (length(trim(scope)) > 0),
+    CHECK (length(trim(idempotency_key)) > 0),
+    CHECK (length(trim(fingerprint)) > 0),
     UNIQUE (scope, idempotency_key),
     CHECK (
       (state = 'in_progress'
@@ -9134,6 +9137,60 @@ END;
             )
             .is_err()
         );
+        for (label, scope, key, fingerprint) in [
+            (
+                "empty scope",
+                Some(""),
+                Some("empty-scope-key"),
+                Some("fingerprint"),
+            ),
+            (
+                "whitespace-only scope",
+                Some("   "),
+                Some("whitespace-scope-key"),
+                Some("fingerprint"),
+            ),
+            (
+                "empty idempotency key",
+                Some("scope"),
+                Some(""),
+                Some("empty-key-fingerprint"),
+            ),
+            (
+                "whitespace-only idempotency key",
+                Some("scope"),
+                Some("   "),
+                Some("whitespace-key-fingerprint"),
+            ),
+            (
+                "empty fingerprint",
+                Some("empty-fingerprint-scope"),
+                Some("empty-fingerprint-key"),
+                Some(""),
+            ),
+            (
+                "whitespace-only fingerprint",
+                Some("whitespace-fingerprint-scope"),
+                Some("whitespace-fingerprint-key"),
+                Some("   "),
+            ),
+        ] {
+            assert!(
+                insert(
+                    scope,
+                    key,
+                    fingerprint,
+                    "in_progress",
+                    1,
+                    Some("1700000000"),
+                    None,
+                    None,
+                    None,
+                )
+                .is_err(),
+                "{label} was accepted"
+            );
+        }
         assert!(
             insert(
                 Some("scope"),
