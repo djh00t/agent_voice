@@ -1,11 +1,13 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ring::rand::{SecureRandom, SystemRandom};
-use rusqlite::{Connection, backup::Backup};
+use rusqlite::{Connection, OpenFlags, backup::Backup};
 
 use crate::pa::store::{PaStore, StoreError, StoreResult};
 
@@ -16,11 +18,15 @@ static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 impl PaStore {
     /// Copies the live SQLCipher database to a new caller-selected attempt path.
     ///
-    /// The copy is built in an opaque sibling artifact owned by this call, so
-    /// failure cleanup never removes the caller path or its sidecars. After
-    /// validation, the owned artifact is published with a no-clobber hard
-    /// link. This produces only the disposable source database; the later
-    /// snapshot writer owns final encoded-snapshot fsync and rename behavior.
+    /// On Unix, the destination's direct parent must not be group or
+    /// other-writable. The method creates an opaque sibling artifact in that
+    /// trusted parent, retains the exclusive creation handle, and verifies its
+    /// device/inode identity before opening, publishing, or cleaning up the
+    /// artifact. A mismatched path fails closed and is left untouched. This
+    /// treats same-principal filesystem writers as part of the application
+    /// trust boundary. Unsupported platforms fail closed until they have an
+    /// equivalent capability and identity check. The later snapshot writer
+    /// owns final encoded-snapshot fsync and rename behavior.
     pub fn backup_to_path<P, K>(&self, destination: P, database_key: K) -> StoreResult<()>
     where
         P: AsRef<Path>,
@@ -33,8 +39,7 @@ impl PaStore {
         {
             let attempt = AttemptGuard::create(destination.as_ref())?;
             {
-                let mut attempt_connection =
-                    Connection::open(attempt.path()).map_err(|_| backup_error())?;
+                let mut attempt_connection = attempt.open_connection()?;
 
                 apply_database_key(&attempt_connection, key)?;
                 verify_destination_cipher(&attempt_connection)?;
@@ -157,32 +162,28 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 struct AttemptGuard {
     path: PathBuf,
+    file: File,
 }
 
 impl AttemptGuard {
     fn create(destination: &Path) -> StoreResult<Self> {
-        ensure_destination_absent(destination)?;
-        let parent = destination
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
         if destination.file_name().is_none() {
             return Err(backup_error());
         }
+        let parent = trusted_attempt_parent(destination)?;
+        ensure_destination_absent(destination)?;
 
         for _ in 0..ATTEMPT_COLLISION_LIMIT {
             let attempt_path = opaque_sibling_attempt_path(parent)?;
             if attempt_path == destination {
                 continue;
             }
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&attempt_path)
-            {
+            match create_owned_attempt_file(&attempt_path) {
                 Ok(file) => {
-                    drop(file);
-                    return Ok(Self { path: attempt_path });
+                    return Ok(Self {
+                        path: attempt_path,
+                        file,
+                    });
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
                 Err(_) => return Err(backup_error()),
@@ -195,7 +196,17 @@ impl AttemptGuard {
         &self.path
     }
 
+    fn open_connection(&self) -> StoreResult<Connection> {
+        self.require_owned_path()?;
+        Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| backup_error())
+    }
+
     fn publish(&self, destination: &Path) -> StoreResult<()> {
+        self.require_owned_path()?;
         match fs::hard_link(&self.path, destination) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(StoreError::Conflict {
@@ -204,12 +215,64 @@ impl AttemptGuard {
             Err(_) => Err(backup_error()),
         }
     }
+
+    fn require_owned_path(&self) -> StoreResult<()> {
+        if self.path_matches_owned_file() {
+            Ok(())
+        } else {
+            Err(backup_error())
+        }
+    }
+
+    #[cfg(unix)]
+    fn path_matches_owned_file(&self) -> bool {
+        let Ok(file_metadata) = self.file.metadata() else {
+            return false;
+        };
+        let Ok(path_metadata) = fs::symlink_metadata(&self.path) else {
+            return false;
+        };
+        file_metadata.dev() == path_metadata.dev() && file_metadata.ino() == path_metadata.ino()
+    }
+
+    #[cfg(not(unix))]
+    fn path_matches_owned_file(&self) -> bool {
+        false
+    }
 }
 
 impl Drop for AttemptGuard {
     fn drop(&mut self) {
-        remove_owned_attempt_artifacts(&self.path);
+        if self.path_matches_owned_file() {
+            remove_owned_attempt_artifacts(&self.path);
+        }
     }
+}
+
+fn create_owned_attempt_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn trusted_attempt_parent(destination: &Path) -> StoreResult<&Path> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let metadata = fs::symlink_metadata(parent).map_err(|_| backup_error())?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(backup_error());
+    }
+    Ok(parent)
+}
+
+#[cfg(not(unix))]
+fn trusted_attempt_parent(_destination: &Path) -> StoreResult<&Path> {
+    Err(backup_error())
 }
 
 fn ensure_destination_absent(destination: &Path) -> StoreResult<()> {
@@ -252,12 +315,13 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(sidecar)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
+    use ring::rand::{SecureRandom, SystemRandom};
     use rusqlite::Connection;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -267,36 +331,77 @@ mod tests {
 
     const DATABASE_KEY: &[u8] = b"source-boundary-test-key";
     const WRONG_DATABASE_KEY: &[u8] = b"source-boundary-wrong-key";
-    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    const TEST_DIRECTORY_PREFIX: &str = "agent-voice-source-boundary-";
+    const TEST_DIRECTORY_COLLISION_LIMIT: usize = 32;
 
     struct TempDestination {
+        directory: PathBuf,
         path: PathBuf,
     }
 
     impl TempDestination {
         fn new(label: &str) -> Self {
-            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "agent_voice_source_backup_{}_{}_{}.db",
-                std::process::id(),
-                sequence,
-                label
-            ));
-            remove_database_files(&path);
-            Self { path }
+            let directory = create_test_directory();
+            let path = directory.join(format!("{label}.db"));
+            assert!(!path.exists());
+            Self { directory, path }
+        }
+
+        fn sibling(&self, name: &str) -> PathBuf {
+            self.directory.join(name)
         }
     }
 
     impl Drop for TempDestination {
         fn drop(&mut self) {
+            // The fixture exclusively created this 0700 directory. Only its
+            // known database artifacts are removed; unexpected files keep the
+            // non-recursive directory removal from deleting them.
             remove_database_files(&self.path);
+            let _ = fs::remove_dir(&self.directory);
         }
     }
 
+    fn create_test_directory() -> PathBuf {
+        for _ in 0..TEST_DIRECTORY_COLLISION_LIMIT {
+            let mut nonce = [0_u8; 16];
+            SystemRandom::new()
+                .fill(&mut nonce)
+                .expect("fill test directory nonce");
+            let directory = std::env::temp_dir().join(format!(
+                "{TEST_DIRECTORY_PREFIX}{}",
+                super::hex_encode(&nonce)
+            ));
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&directory) {
+                Ok(()) => {
+                    assert_eq!(
+                        fs::metadata(&directory)
+                            .expect("read private test directory metadata")
+                            .permissions()
+                            .mode()
+                            & 0o077,
+                        0
+                    );
+                    return directory;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create private test directory: {error}"),
+            }
+        }
+        panic!("allocate private test directory");
+    }
+
     fn remove_database_files(path: &Path) {
-        let _ = fs::remove_file(path);
-        let _ = fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
-        let _ = fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+        for artifact in [
+            path.to_owned(),
+            super::sidecar_path(path, "-wal"),
+            super::sidecar_path(path, "-shm"),
+            super::sidecar_path(path, "-journal"),
+        ] {
+            let _ = fs::remove_file(artifact);
+        }
     }
 
     fn fixture_store() -> PaStore {
@@ -475,6 +580,96 @@ mod tests {
             fs::read(&stale_shm).expect("caller SHM sidecar survives"),
             b"caller-stale-shm"
         );
+    }
+
+    #[test]
+    fn unsafe_parent_is_rejected_before_creating_an_attempt_artifact() {
+        let destination = TempDestination::new("unsafe-parent");
+        fs::set_permissions(&destination.directory, fs::Permissions::from_mode(0o777))
+            .expect("make test parent group and other writable");
+
+        let result = super::AttemptGuard::create(&destination.path);
+
+        fs::set_permissions(&destination.directory, fs::Permissions::from_mode(0o700))
+            .expect("restore private test parent");
+        let error = match result {
+            Ok(_) => panic!("untrusted parent must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            StoreError::StoredRecordInvalid { resource: "backup" }
+        ));
+        assert!(!destination.path.exists());
+        assert!(
+            fs::read_dir(&destination.directory)
+                .expect("read rejected parent")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn owned_attempt_identity_allows_database_open_and_publication() {
+        let destination = TempDestination::new("owned-identity");
+        let attempt = super::AttemptGuard::create(&destination.path).expect("create attempt");
+        let attempt_path = attempt.path().to_owned();
+
+        attempt
+            .open_connection()
+            .expect("open exclusively owned attempt");
+        fs::write(&attempt_path, b"owned-attempt-bytes").expect("write owned attempt bytes");
+        attempt
+            .publish(&destination.path)
+            .expect("publish exclusively owned attempt");
+
+        assert_eq!(
+            fs::read(&destination.path).expect("read published attempt"),
+            b"owned-attempt-bytes"
+        );
+        drop(attempt);
+        assert!(!attempt_path.exists());
+    }
+
+    #[test]
+    fn replacement_after_attempt_creation_never_opens_publishes_or_deletes_it() {
+        let destination = TempDestination::new("attempt-replacement");
+        let attempt = super::AttemptGuard::create(&destination.path).expect("create attempt");
+        let attempt_path = attempt.path().to_owned();
+        let sentinel_source = destination.sibling("sentinel-source.db");
+        let sentinel = b"replacement-sentinel";
+        fs::write(&sentinel_source, sentinel).expect("write replacement source");
+        fs::remove_file(&attempt_path).expect("unlink owned attempt path");
+        fs::hard_link(&sentinel_source, &attempt_path).expect("replace attempt with sentinel link");
+
+        let open_error = attempt
+            .open_connection()
+            .expect_err("replaced attempt must not be opened");
+        let publish_error = attempt
+            .publish(&destination.path)
+            .expect_err("replaced attempt must not be published");
+        assert!(matches!(
+            open_error,
+            StoreError::StoredRecordInvalid { resource: "backup" }
+        ));
+        assert!(matches!(
+            publish_error,
+            StoreError::StoredRecordInvalid { resource: "backup" }
+        ));
+        assert!(!destination.path.exists());
+
+        drop(attempt);
+
+        assert_eq!(
+            fs::read(&attempt_path).expect("read replacement after attempt drop"),
+            sentinel
+        );
+        assert_eq!(
+            fs::read(&sentinel_source).expect("read sentinel source after attempt drop"),
+            sentinel
+        );
+        fs::remove_file(&attempt_path).expect("remove test-created replacement link");
+        fs::remove_file(&sentinel_source).expect("remove test-created sentinel source");
     }
 
     #[test]
