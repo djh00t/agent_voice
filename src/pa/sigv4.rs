@@ -586,7 +586,7 @@ fn validate_region(region: &str) -> Result<(), SigV4Error> {
 }
 
 fn validate_credentials(credentials: &Credentials) -> Result<(), SigV4Error> {
-    if !is_bounded_ascii_identifier(&credentials.access_key_id, MAX_ACCESS_KEY_LEN)
+    if !is_access_key_id(&credentials.access_key_id)
         || credentials.secret_access_key.is_empty()
         || credentials.secret_access_key.len() > MAX_SECRET_LEN
     {
@@ -598,6 +598,12 @@ fn validate_credentials(credentials: &Credentials) -> Result<(), SigV4Error> {
         return Err(SigV4Error::new(SigV4ErrorKind::InvalidCredential));
     }
     Ok(())
+}
+
+fn is_access_key_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ACCESS_KEY_LEN
+        && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 fn is_bounded_ascii_identifier(value: &str, max_len: usize) -> bool {
@@ -677,5 +683,32 @@ mod tests {
             .expect("origin-form URI is valid");
 
         assert!(canonical.starts_with("GET\n/folder/a%252/%25ZZ%20caf%C3%A9\n\n"));
+    }
+
+    fn request() -> Request {
+        Request {
+            method: "GET".into(),
+            uri: "/test.txt".into(),
+            headers: headers(),
+            payload_sha256: PAYLOAD_HASH.into(),
+            region: "us-east-1".into(),
+        }
+    }
+
+    #[test]
+    fn access_key_id_rejects_authorization_delimiters() {
+        for delimiter in ["/", ",", "=", " "] {
+            let credentials = Credentials {
+                access_key_id: format!("AKIAIOSFODNN7EXAMPLE{delimiter}TAIL"),
+                secret_access_key: b"secret".to_vec(),
+                session_token: None,
+            };
+            let error = sign_request(&request(), &credentials, TIMESTAMP).unwrap_err();
+            assert_eq!(
+                error.kind,
+                SigV4ErrorKind::InvalidCredential,
+                "{delimiter:?}"
+            );
+        }
     }
 }
