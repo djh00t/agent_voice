@@ -6,10 +6,10 @@
 - **Evidence date:** 2026-08-30 (Australia/Sydney)
 - **Worktree:** `/private/tmp/agent-voice-pa-task6-build`
 - **Branch:** `codex/agent-voice-pa-06-service-layer`
-- **Implementation commits:** `bb10f2d`, `1512f9e`, `3a9180c`
-- **Evidence commit:** `687567e`
-- **Review remediation commits:** `3a9180c`, `fbd03fd`
-- **Assembly metadata:** `4860515` and any subsequent report-only
+- **Implementation commits:** `05dc49c`, `781f7e6`, `d0b6fc3`
+- **Evidence commit:** `70bfece`
+- **Review remediation commits:** `d0b6fc3`, `9a86e71`
+- **Assembly metadata:** `dc0dfdb` and any subsequent report-only
   synchronization commit touching this file are out-of-package phase assembly
   metadata. They are discoverable by this path and `Refs #178`, and are
   included automatically when the complete Task 6 phase PR is reverted.
@@ -171,8 +171,8 @@ results.
 ### Phase-stack assembly note
 
 Task 6 is delivered as one phase-level stacked PR rather than a standalone
-Task 6c1 PR. Fresh review occurred after Task 6c2 commit `e8ab117` had been
-assembled, so Task 6c1 remediation commits `3a9180c` and `fbd03fd` follow that
+Task 6c1 PR. Fresh review occurred after Task 6c2 commit `3ed5bff` had been
+assembled, so Task 6c1 remediation commits `d0b6fc3` and `9a86e71` follow that
 commit in branch history. Their diffs remain one-file and reference only #178,
 but rollback must use the complete Task 6 phase PR so the intervening Task 6c2
 commit and its evidence are not orphaned.
@@ -194,7 +194,7 @@ calls.
   here.
 - **Rollback:** revert the complete Task 6 phase PR, including the intervening
   Task 6c2 commits, if the service facade must be withdrawn. The Task 6c1-owned
-  set is `bb10f2d`, `1512f9e`, `687567e`, `3a9180c`, and `fbd03fd`; no
+  set is `05dc49c`, `781f7e6`, `70bfece`, `d0b6fc3`, and `9a86e71`; no
   provider-side data is created by these commits.
 
 ## PR linkage and completion evidence
@@ -205,8 +205,8 @@ The implementation PR must contain the exact closing footer:
 Closes #178
 ```
 
-It must also reference feature #138 and identify commits `bb10f2d`, `1512f9e`,
-`687567e`, `3a9180c`, and `fbd03fd`. Issue #178 should remain open until that linked PR is reviewed,
+It must also reference feature #138 and identify commits `05dc49c`, `781f7e6`,
+`70bfece`, `d0b6fc3`, and `9a86e71`. Issue #178 should remain open until that linked PR is reviewed,
 all findings are resolved, CI is green, and the PR is merged.
 
 **Package status:** `status:review` / locally verified; CI and LIVE remain
@@ -215,7 +215,7 @@ explicitly unverified.
 ## Completion evidence record
 
 - **Implementer:** Task 6c1 implementation lane
-- **Commits:** `bb10f2d`, `1512f9e`, `687567e`, `3a9180c`, `fbd03fd`
+- **Commits:** `05dc49c`, `781f7e6`, `70bfece`, `d0b6fc3`, `9a86e71`
 - **PR:** to be opened with `Closes #178`
 - **Commands/results:** listed in the LOCAL evidence table
 - **Reviewer:** pending independent review
