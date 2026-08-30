@@ -6,7 +6,7 @@
 - **Evidence date:** 2026-08-30 (Australia/Sydney)
 - **Worktree:** `/private/tmp/agent-voice-pa-task5-build`
 - **Branch:** `codex/agent-voice-pa-05-provider-contracts`
-- **Observed HEAD:** `553332b1706df1b18b22a3682aaad3219a0bdd1d` (`fix(store): block audit replacement bypasses`)
+- **Reviewed Task 5 stack:** `5ca2aea` (`docs(fakes): refresh provider matrix evidence`)
 
 ## Scope and ownership
 
@@ -47,13 +47,10 @@ shared `FakeControl`.
 No historical failing-first run was available in this report-only handoff. I do
 not claim that a prior RED command was executed.
 
-The current checkout confirms why a baseline execution cannot be reconstructed
-from its committed tree: both owned implementation paths are present on disk
-but absent from `HEAD` (`git show HEAD:src/pa/fakes/triage.rs` and
-`git show HEAD:src/pa/fakes/mod.rs` each reported `path ... exists on disk, but
-not in 'HEAD'`). The expected RED condition for the package was therefore the
-missing fake/export surface and its focused tests; that failure was not
-replayed here because this package permits changes only to this report.
+The implementation and focused tests were already present when this report was
+assembled, so the original missing-surface failure cannot be replayed without
+discarding accepted work. The expected RED condition was the absent
+fake/export surface; this report records that as reconstructed context only.
 
 **RED status:** unavailable; no invented output.
 
