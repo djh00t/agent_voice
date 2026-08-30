@@ -1508,7 +1508,10 @@ fn validate_mail_text(value: String, field: ProviderInputField) -> ProviderResul
 }
 
 fn validate_calendar_title(value: String) -> ProviderResult<String> {
-    if value.trim().is_empty() || value.len() > MAX_CALENDAR_TITLE_LENGTH {
+    if value.trim().is_empty()
+        || value.len() > MAX_CALENDAR_TITLE_LENGTH
+        || value.chars().any(char::is_control)
+    {
         return Err(ProviderError::InvalidInput {
             field: ProviderInputField::Title,
         });
@@ -2454,7 +2457,7 @@ mod tests {
         OutboundMail, OutlookCalendarProvider, OutlookMailProvider, OwnerEventDraft, ProviderError,
         ProviderEventId, ProviderFuture, ProviderInputField, ProviderItemFailure, ProviderResult,
         ProviderSession, RetryAfter, Rsvp, SentMail, StructuredTriageProvider, SyncPage, TimeRange,
-        TriageDecision, TriageInput,
+        TriageDecision, TriageInput, validate_calendar_title,
     };
 
     use crate::pa::availability::BusyInterval;
@@ -2998,6 +3001,12 @@ mod tests {
 
     #[test]
     fn machine_text_rejects_injection_controls_and_unicode_identifiers() {
+        assert!(matches!(
+            validate_calendar_title("Injected\r\nTitle".to_owned()),
+            Err(ProviderError::InvalidInput {
+                field: ProviderInputField::Title
+            })
+        ));
         assert!(matches!(
             MailMessageId::new("source\nid"),
             Err(ProviderError::InvalidInput {
