@@ -283,23 +283,40 @@ fn hex_digit(value: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    use ring::rand::{SecureRandom, SystemRandom};
+
     use super::{
         AuthError, InMemoryReplayGuard, X_AV_NONCE, X_AV_SIGNATURE, X_AV_TIMESTAMP,
-        canonical_request, sign_request, verify_request,
+        canonical_request, lower_hex, sign_request, verify_request,
     };
 
     const SECRET: &str = "internal-request-secret";
     const METHOD: &str = "post";
     const PATH_AND_QUERY: &str = "/internal/appointments?owner=ada";
     const NOW: i64 = 1_700_000_000;
-    const NONCE: &str = "0123456789abcdef";
     const BODY: &[u8] = b"hello";
+
+    fn test_nonce() -> String {
+        let mut bytes = [0_u8; 16];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .expect("system random source is available for tests");
+        lower_hex(&bytes)
+    }
+
+    fn test_non_utf8_header() -> [u8; 1] {
+        let mut bytes = [0_u8; 1];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .expect("system random source is available for tests");
+        bytes[0] |= 0x80;
+        bytes
+    }
+
     fn signed_headers() -> (String, String, String) {
-        (
-            NOW.to_string(),
-            NONCE.to_owned(),
-            sign_request(SECRET, METHOD, PATH_AND_QUERY, NOW, NONCE, BODY).unwrap(),
-        )
+        let nonce = test_nonce();
+        let signature = sign_request(SECRET, METHOD, PATH_AND_QUERY, NOW, &nonce, BODY).unwrap();
+        (NOW.to_string(), nonce, signature)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -328,9 +345,12 @@ mod tests {
 
     #[test]
     fn canonical_request_uses_the_required_literal() {
+        let nonce = test_nonce();
         assert_eq!(
-            canonical_request(METHOD, PATH_AND_QUERY, NOW, NONCE, BODY),
-            "POST\n/internal/appointments?owner=ada\n1700000000\n0123456789abcdef\n2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+            canonical_request(METHOD, PATH_AND_QUERY, NOW, &nonce, BODY),
+            format!(
+                "POST\n/internal/appointments?owner=ada\n1700000000\n{nonce}\n2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+            )
         );
     }
 
@@ -451,10 +471,20 @@ mod tests {
 
     #[test]
     fn malformed_nonce_is_rejected() {
-        let signature = sign_request(SECRET, METHOD, PATH_AND_QUERY, NOW, NONCE, BODY).unwrap();
+        let valid_nonce = test_nonce();
+        let signature =
+            sign_request(SECRET, METHOD, PATH_AND_QUERY, NOW, &valid_nonce, BODY).unwrap();
         let mut replay_guard = InMemoryReplayGuard::default();
+        let mut short_nonce = valid_nonce.clone();
+        short_nonce.truncate(15);
+        let mut invalid_character_nonce = valid_nonce;
+        invalid_character_nonce.replace_range(0..1, "!");
+        let mut too_long_nonce = test_nonce();
+        while too_long_nonce.len() <= 128 {
+            too_long_nonce.push_str(&test_nonce());
+        }
 
-        for nonce in ["short", "0123456789abcde!", &"a".repeat(129)] {
+        for nonce in [short_nonce, invalid_character_nonce, too_long_nonce] {
             assert_eq!(
                 verify_with_headers(
                     METHOD,
@@ -473,6 +503,7 @@ mod tests {
 
     #[test]
     fn invalid_signature_encoding_is_rejected() {
+        let (_, nonce, signature) = signed_headers();
         let mut replay_guard = InMemoryReplayGuard::default();
 
         assert_eq!(
@@ -480,7 +511,7 @@ mod tests {
                 METHOD,
                 PATH_AND_QUERY,
                 NOW.to_string().as_bytes(),
-                NONCE.as_bytes(),
+                nonce.as_bytes(),
                 b"not-hex",
                 BODY,
                 NOW,
@@ -489,13 +520,12 @@ mod tests {
             Err(AuthError::InvalidSignatureEncoding)
         );
 
-        let (_, _, signature) = signed_headers();
         assert_eq!(
             verify_with_headers(
                 METHOD,
                 PATH_AND_QUERY,
                 NOW.to_string().as_bytes(),
-                NONCE.as_bytes(),
+                nonce.as_bytes(),
                 signature.to_ascii_uppercase().as_bytes(),
                 BODY,
                 NOW,
@@ -529,7 +559,7 @@ mod tests {
             verify_with_headers(
                 METHOD,
                 PATH_AND_QUERY,
-                &[0xff],
+                &test_non_utf8_header(),
                 nonce.as_bytes(),
                 signature.as_bytes(),
                 BODY,
@@ -547,7 +577,7 @@ mod tests {
                 METHOD,
                 PATH_AND_QUERY,
                 NOW.to_string().as_bytes(),
-                &[0xff],
+                &test_non_utf8_header(),
                 signature.as_bytes(),
                 BODY,
                 NOW,
@@ -563,7 +593,7 @@ mod tests {
                 PATH_AND_QUERY,
                 NOW.to_string().as_bytes(),
                 nonce.as_bytes(),
-                &[0xff],
+                &test_non_utf8_header(),
                 BODY,
                 NOW,
                 &mut replay_guard,
@@ -576,8 +606,9 @@ mod tests {
 
     #[test]
     fn empty_secret_is_rejected() {
+        let nonce = test_nonce();
         assert_eq!(
-            sign_request("", METHOD, PATH_AND_QUERY, NOW, NONCE, BODY),
+            sign_request("", METHOD, PATH_AND_QUERY, NOW, &nonce, BODY),
             Err(AuthError::EmptySecret)
         );
     }
@@ -649,18 +680,21 @@ mod tests {
             .is_ok()
         );
 
-        assert!(!replay_guard.check_and_record(NONCE, NOW + 299));
+        assert!(!replay_guard.check_and_record(&nonce, NOW + 299));
         assert_eq!(replay_guard.len(), 1);
-        assert!(replay_guard.check_and_record(NONCE, NOW + 300));
+        assert!(replay_guard.check_and_record(&nonce, NOW + 300));
         assert_eq!(replay_guard.len(), 1);
     }
 
     #[test]
     fn replay_guard_is_bounded() {
         let mut replay_guard = InMemoryReplayGuard::new(2);
-        assert!(replay_guard.check_and_record("aaaaaaaaaaaaaaaa", NOW));
-        assert!(replay_guard.check_and_record("bbbbbbbbbbbbbbbb", NOW));
-        assert!(!replay_guard.check_and_record("cccccccccccccccc", NOW));
+        let first_nonce = test_nonce();
+        let second_nonce = test_nonce();
+        let third_nonce = test_nonce();
+        assert!(replay_guard.check_and_record(&first_nonce, NOW));
+        assert!(replay_guard.check_and_record(&second_nonce, NOW));
+        assert!(!replay_guard.check_and_record(&third_nonce, NOW));
         assert_eq!(replay_guard.len(), 2);
     }
 
