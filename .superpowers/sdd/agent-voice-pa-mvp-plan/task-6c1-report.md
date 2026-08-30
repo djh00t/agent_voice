@@ -9,6 +9,10 @@
 - **Implementation commits:** `bb10f2d`, `1512f9e`, `3a9180c`
 - **Evidence commit:** `687567e`
 - **Review remediation commits:** `3a9180c`, `fbd03fd`
+- **Assembly metadata:** `4860515` and any subsequent report-only
+  synchronization commit touching this file are out-of-package phase assembly
+  metadata. They are discoverable by this path and `Refs #178`, and are
+  included automatically when the complete Task 6 phase PR is reverted.
 
 ## Prerequisite evidence
 
