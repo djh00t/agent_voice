@@ -1,18 +1,26 @@
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, backup::Backup};
 
 use crate::pa::store::{PaStore, StoreError, StoreResult};
 
+const ATTEMPT_FILE_PREFIX: &str = ".agent-voice-backup-attempt-";
+const ATTEMPT_COLLISION_LIMIT: usize = 32;
+static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 impl PaStore {
-    /// Copies the live SQLCipher database to a new attempt-local path.
+    /// Copies the live SQLCipher database to a new caller-selected attempt path.
     ///
-    /// The caller-supplied key is applied to the destination before the
-    /// backup starts. The destination is checked after the complete backup
-    /// for SQLCipher support, integrity, and the current PA schema.
+    /// The copy is built in an opaque sibling artifact owned by this call, so
+    /// failure cleanup never removes the caller path or its sidecars. After
+    /// validation, the owned artifact is published with a no-clobber hard
+    /// link. This produces only the disposable source database; the later
+    /// snapshot writer owns final encoded-snapshot fsync and rename behavior.
     pub fn backup_to_path<P, K>(&self, destination: P, database_key: K) -> StoreResult<()>
     where
         P: AsRef<Path>,
@@ -22,23 +30,28 @@ impl PaStore {
         reject_empty_database_key(key)?;
 
         let expected_schema_version = schema_version(self.connection())?;
-        let mut destination_guard = DestinationGuard::create(destination.as_ref())?;
-        let mut destination_connection =
-            Connection::open(destination_guard.path()).map_err(|_| backup_error())?;
-
-        apply_database_key(&destination_connection, key)?;
-        verify_destination_cipher(&destination_connection)?;
-
         {
-            let backup = Backup::new(self.connection(), &mut destination_connection)
-                .map_err(|_| backup_error())?;
-            backup
-                .run_to_completion(5, Duration::from_millis(50), None)
-                .map_err(|_| backup_error())?;
-        }
+            let attempt = AttemptGuard::create(destination.as_ref())?;
+            {
+                let mut attempt_connection =
+                    Connection::open(attempt.path()).map_err(|_| backup_error())?;
 
-        validate_destination(&destination_connection, expected_schema_version)?;
-        destination_guard.persist();
+                apply_database_key(&attempt_connection, key)?;
+                verify_destination_cipher(&attempt_connection)?;
+
+                {
+                    let backup = Backup::new(self.connection(), &mut attempt_connection)
+                        .map_err(|_| backup_error())?;
+                    backup
+                        .run_to_completion(5, Duration::from_millis(50), None)
+                        .map_err(|_| backup_error())?;
+                }
+
+                validate_destination(&attempt_connection, expected_schema_version)?;
+            }
+
+            attempt.publish(destination.as_ref())?;
+        }
         Ok(())
     }
 }
@@ -142,54 +155,95 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-struct DestinationGuard {
+struct AttemptGuard {
     path: PathBuf,
-    persisted: bool,
 }
 
-impl DestinationGuard {
-    fn create(path: &Path) -> StoreResult<Self> {
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(file) => {
-                drop(file);
-                Ok(Self {
-                    path: path.to_owned(),
-                    persisted: false,
-                })
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(StoreError::Conflict {
-                resource: "backup destination",
-            }),
-            Err(_) => Err(backup_error()),
+impl AttemptGuard {
+    fn create(destination: &Path) -> StoreResult<Self> {
+        ensure_destination_absent(destination)?;
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if destination.file_name().is_none() {
+            return Err(backup_error());
         }
+
+        for _ in 0..ATTEMPT_COLLISION_LIMIT {
+            let attempt_path = opaque_sibling_attempt_path(parent)?;
+            if attempt_path == destination {
+                continue;
+            }
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&attempt_path)
+            {
+                Ok(file) => {
+                    drop(file);
+                    return Ok(Self { path: attempt_path });
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(backup_error()),
+            }
+        }
+        Err(backup_error())
     }
 
     fn path(&self) -> &Path {
         &self.path
     }
 
-    fn persist(&mut self) {
-        self.persisted = true;
-    }
-}
-
-impl Drop for DestinationGuard {
-    fn drop(&mut self) {
-        if !self.persisted {
-            remove_database_files(&self.path);
+    fn publish(&self, destination: &Path) -> StoreResult<()> {
+        match fs::hard_link(&self.path, destination) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(StoreError::Conflict {
+                resource: "backup destination",
+            }),
+            Err(_) => Err(backup_error()),
         }
     }
 }
 
-fn remove_database_files(path: &Path) {
-    let _ = fs::remove_file(path);
-    let _ = fs::remove_file(sidecar_path(path, "-wal"));
-    let _ = fs::remove_file(sidecar_path(path, "-shm"));
+impl Drop for AttemptGuard {
+    fn drop(&mut self) {
+        remove_owned_attempt_artifacts(&self.path);
+    }
+}
+
+fn ensure_destination_absent(destination: &Path) -> StoreResult<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => Err(StoreError::Conflict {
+            resource: "backup destination",
+        }),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(backup_error()),
+    }
+}
+
+fn opaque_sibling_attempt_path(parent: &Path) -> StoreResult<PathBuf> {
+    let mut nonce = [0_u8; 16];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| backup_error())?;
+    let sequence = ATTEMPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    Ok(parent.join(format!(
+        "{ATTEMPT_FILE_PREFIX}{}-{sequence}-{}.db",
+        std::process::id(),
+        hex_encode(&nonce)
+    )))
+}
+
+fn remove_owned_attempt_artifacts(path: &Path) {
+    for artifact in [
+        path.to_owned(),
+        sidecar_path(path, "-wal"),
+        sidecar_path(path, "-shm"),
+        sidecar_path(path, "-journal"),
+    ] {
+        let _ = fs::remove_file(artifact);
+    }
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -389,5 +443,96 @@ mod tests {
             .backup_to_path(&retry.path, DATABASE_KEY)
             .expect("fresh retry destination succeeds");
         assert!(retry.path.exists());
+    }
+
+    #[test]
+    fn failed_backup_preserves_caller_sidecars() {
+        let store = fixture_store();
+        store
+            .connection()
+            .execute("DELETE FROM configuration", [])
+            .expect("make the copied database fail its post-copy validation");
+        let destination = TempDestination::new("failure-cleanup");
+        let stale_wal = super::sidecar_path(&destination.path, "-wal");
+        let stale_shm = super::sidecar_path(&destination.path, "-shm");
+        fs::write(&stale_wal, b"caller-stale-wal").expect("write caller WAL sidecar");
+        fs::write(&stale_shm, b"caller-stale-shm").expect("write caller SHM sidecar");
+
+        let error = store
+            .backup_to_path(&destination.path, DATABASE_KEY)
+            .expect_err("invalid copied database must fail");
+
+        assert!(matches!(
+            error,
+            StoreError::StoredRecordInvalid { resource: "backup" }
+        ));
+        assert!(!destination.path.exists());
+        assert_eq!(
+            fs::read(&stale_wal).expect("caller WAL sidecar survives"),
+            b"caller-stale-wal"
+        );
+        assert_eq!(
+            fs::read(&stale_shm).expect("caller SHM sidecar survives"),
+            b"caller-stale-shm"
+        );
+    }
+
+    #[test]
+    fn publication_race_preserves_the_replacement_without_overwrite() {
+        let destination = TempDestination::new("publication-race");
+        let attempt = super::AttemptGuard::create(&destination.path).expect("create attempt");
+        let attempt_path = attempt.path().to_owned();
+        fs::write(&attempt_path, b"attempt-bytes").expect("write attempt bytes");
+        fs::write(&destination.path, b"racing-replacement").expect("write replacement");
+
+        let error = attempt
+            .publish(&destination.path)
+            .expect_err("publication must not overwrite a racing replacement");
+
+        assert!(matches!(
+            error,
+            StoreError::Conflict {
+                resource: "backup destination"
+            }
+        ));
+        assert_eq!(
+            fs::read(&destination.path).expect("read racing replacement"),
+            b"racing-replacement"
+        );
+        drop(attempt);
+        assert!(!attempt_path.exists());
+    }
+
+    #[test]
+    fn attempt_cleanup_removes_only_its_opaque_database_artifacts() {
+        let destination = TempDestination::new("caller-secret-destination-name");
+        let attempt = super::AttemptGuard::create(&destination.path).expect("create attempt");
+        let attempt_path = attempt.path().to_owned();
+        let attempt_wal = super::sidecar_path(&attempt_path, "-wal");
+        let attempt_shm = super::sidecar_path(&attempt_path, "-shm");
+        let attempt_journal = super::sidecar_path(&attempt_path, "-journal");
+        let destination_wal = super::sidecar_path(&destination.path, "-wal");
+        fs::write(&attempt_wal, b"attempt-wal").expect("write attempt WAL sidecar");
+        fs::write(&attempt_shm, b"attempt-shm").expect("write attempt SHM sidecar");
+        fs::write(&attempt_journal, b"attempt-journal").expect("write attempt journal");
+        fs::write(&destination_wal, b"caller-wal").expect("write caller WAL sidecar");
+
+        let attempt_name = attempt_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("opaque attempt name");
+        assert!(attempt_name.starts_with(".agent-voice-backup-attempt-"));
+        assert!(!attempt_name.contains("caller-secret-destination-name"));
+
+        drop(attempt);
+
+        assert!(!attempt_path.exists());
+        assert!(!attempt_wal.exists());
+        assert!(!attempt_shm.exists());
+        assert!(!attempt_journal.exists());
+        assert_eq!(
+            fs::read(&destination_wal).expect("caller sidecar survives"),
+            b"caller-wal"
+        );
     }
 }
