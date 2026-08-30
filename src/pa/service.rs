@@ -365,16 +365,24 @@ impl<'a> PaService<'a> {
                 .ok_or(ServiceError::Availability(
                     AvailabilityError::DateTimeOverflow,
                 ))?;
+        let provider_start =
+            now.checked_sub(self.policy.meeting_buffer())
+                .ok_or(ServiceError::Availability(
+                    AvailabilityError::DateTimeOverflow,
+                ))?;
+        let provider_end = horizon_end
+            .checked_add(self.policy.meeting_buffer())
+            .ok_or(ServiceError::Availability(
+                AvailabilityError::DateTimeOverflow,
+            ))?;
         let quote_expiry = now
             .checked_add(Quote::VALID_FOR)
             .ok_or(ServiceError::Availability(
                 AvailabilityError::DateTimeOverflow,
             ))?;
-        let range =
-            TimeRange::new(to_chrono_utc(now)?, to_chrono_utc(horizon_end)?).map_err(|_| {
-                ServiceError::InvalidInput {
-                    field: "time_range",
-                }
+        let range = TimeRange::new(to_chrono_utc(provider_start)?, to_chrono_utc(provider_end)?)
+            .map_err(|_| ServiceError::InvalidInput {
+                field: "time_range",
             })?;
 
         let outlook_busy = self
@@ -538,11 +546,13 @@ impl<'a> PaService<'a> {
     /// Records one validated voice-call summary and queues its owner-only
     /// call-summary notification.
     ///
-    /// The source identity is the sole input to all message, notification,
-    /// and audit idempotency/provider identities. The summary is a validated
-    /// structured value; raw transcripts and message bodies cannot cross this
-    /// boundary. Each local write is independently idempotent, so retries
-    /// resume after any durable prefix left by a failed tail write.
+    /// The validated source identity is persisted as `voice:<source>` so it
+    /// cannot collide with Outlook or Gmail source identities. The raw source
+    /// remains the input to message, notification, and audit idempotency/
+    /// provider identities. The summary is a validated structured value; raw
+    /// transcripts and message bodies cannot cross this boundary. Each local
+    /// write is independently idempotent, so retries resume after any durable
+    /// prefix left by a failed tail write.
     pub fn record_message(
         &self,
         summary: MessageSummary,
@@ -554,6 +564,8 @@ impl<'a> PaService<'a> {
             .as_ref()
             .ok_or(ServiceError::OwnerNotConfigured)?;
         let source_id = validate_message_source_id(source_id.as_ref().to_owned())
+            .map_err(ServiceError::Store)?;
+        let stored_source_id = validate_message_source_id(format!("voice:{source_id}"))
             .map_err(ServiceError::Store)?;
         let message_key = format!("pa-voice-message-recorded-{source_id}");
         let provider_message_id = format!("pa-voice-provider-message-{source_id}");
@@ -575,7 +587,7 @@ impl<'a> PaService<'a> {
             .store
             .record_message(
                 message_key,
-                &source_id,
+                &stored_source_id,
                 MessageProvider::Voice,
                 provider_message_id,
                 summary.clone(),
@@ -686,7 +698,9 @@ mod tests {
     };
     use crate::pa::fakes::{FakeControl, FakeGoogleCalendar, FakeOperation, FakeOutlookCalendar};
     use crate::pa::providers::{CalendarChange, ProviderError, ProviderSession, RetryAfter};
-    use crate::pa::store::{AuditEntityType, AuditEventType, MessageSummary, PaStore, StoreError};
+    use crate::pa::store::{
+        AuditEntityType, AuditEventType, MessageProvider, MessageSummary, PaStore, StoreError,
+    };
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use time::{Date, Duration, OffsetDateTime, Time, format_description::well_known::Rfc3339};
 
@@ -1116,6 +1130,81 @@ mod tests {
                 OffsetDateTime::parse("2026-08-31T09:30:00Z", &Rfc3339).expect("start"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn meeting_buffer_busy_interval_before_now_blocks_buffered_candidate() {
+        let now = now();
+        let policy = AvailabilityPolicy::new(
+            "UTC",
+            default_working_windows(),
+            Duration::ZERO,
+            Duration::hours(2),
+            Duration::minutes(30),
+        )
+        .expect("buffered policy");
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let busy = BusyInterval::new(now - Duration::minutes(15), now - Duration::minutes(5))
+            .expect("busy interval before now");
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, vec![busy], Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &policy,
+        );
+
+        let result = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("buffered availability");
+
+        assert_eq!(
+            result.offered_slots()[0].starts_at(),
+            now + Duration::minutes(30)
+        );
+    }
+
+    #[tokio::test]
+    async fn meeting_buffer_busy_interval_after_horizon_blocks_buffered_candidate() {
+        let now = OffsetDateTime::parse("2026-08-31T09:45:00Z", &Rfc3339).expect("now");
+        let policy = AvailabilityPolicy::new(
+            "UTC",
+            default_working_windows(),
+            Duration::ZERO,
+            Duration::minutes(15),
+            Duration::minutes(30),
+        )
+        .expect("buffered policy");
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let horizon_end = now + Duration::minutes(15);
+        let busy = BusyInterval::new(
+            horizon_end + Duration::minutes(15),
+            horizon_end + Duration::minutes(20),
+        )
+        .expect("busy interval after horizon");
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, vec![busy], Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &policy,
+        );
+
+        let error = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect_err("buffered candidate must be blocked");
+
+        assert!(matches!(error, ServiceError::NoAvailability));
     }
 
     #[tokio::test]
@@ -1790,6 +1879,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn meeting_buffer_range_overflow_fails_before_provider_calls() {
+        let before_minimum = Date::MIN.with_time(Time::MIDNIGHT).assume_utc();
+        let before_policy = AvailabilityPolicy::new(
+            "UTC",
+            default_working_windows(),
+            Duration::ZERO,
+            Duration::days(1),
+            Duration::minutes(1),
+        )
+        .expect("before-boundary policy");
+        let before_outlook_control = control(before_minimum);
+        let before_google_control = control(before_minimum);
+        let (
+            before_store,
+            before_outlook,
+            before_google,
+            before_outlook_session,
+            before_google_session,
+        ) = fixture(
+            &before_outlook_control,
+            &before_google_control,
+            Vec::new(),
+            Vec::new(),
+        );
+        let before_service = PaService::new(
+            &before_store,
+            &before_outlook,
+            &before_outlook_session,
+            &before_google,
+            &before_google_session,
+            &before_policy,
+        );
+
+        let before_error = before_service
+            .search_slots(AppointmentKind::Callback, before_minimum, 1)
+            .await
+            .expect_err("provider start overflow must fail");
+
+        assert!(matches!(
+            before_error,
+            ServiceError::Availability(AvailabilityError::DateTimeOverflow)
+        ));
+        assert_eq!(
+            before_outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook count"),
+            0
+        );
+        assert_eq!(
+            before_google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google count"),
+            0
+        );
+        assert_eq!(appointment_quote_row_count(&before_store), 0);
+
+        let after_maximum = Date::MAX
+            .with_time(Time::MAX)
+            .assume_utc()
+            .checked_sub(Duration::minutes(10))
+            .expect("ten minutes before maximum");
+        let after_policy = AvailabilityPolicy::new(
+            "UTC",
+            default_working_windows(),
+            Duration::ZERO,
+            Duration::minutes(5),
+            Duration::minutes(10),
+        )
+        .expect("after-boundary policy");
+        let after_outlook_control = control(after_maximum);
+        let after_google_control = control(after_maximum);
+        let (after_store, after_outlook, after_google, after_outlook_session, after_google_session) =
+            fixture(
+                &after_outlook_control,
+                &after_google_control,
+                Vec::new(),
+                Vec::new(),
+            );
+        let after_service = PaService::new(
+            &after_store,
+            &after_outlook,
+            &after_outlook_session,
+            &after_google,
+            &after_google_session,
+            &after_policy,
+        );
+
+        let after_error = after_service
+            .search_slots(AppointmentKind::Callback, after_maximum, 1)
+            .await
+            .expect_err("provider end overflow must fail");
+
+        assert!(matches!(
+            after_error,
+            ServiceError::Availability(AvailabilityError::DateTimeOverflow)
+        ));
+        assert_eq!(
+            after_outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook count"),
+            0
+        );
+        assert_eq!(
+            after_google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google count"),
+            0
+        );
+        assert_eq!(appointment_quote_row_count(&after_store), 0);
+    }
+
+    #[tokio::test]
     async fn search_and_service_errors_redact_sensitive_values_from_display_and_debug() {
         let now = now();
         let outlook_control = control(now);
@@ -1826,7 +2027,7 @@ mod tests {
         ] {
             assert!(
                 !search_debug.contains(secret),
-                "search debug leaked {secret}"
+                "search debug redaction assertion failed"
             );
         }
 
@@ -1852,8 +2053,14 @@ mod tests {
                 "calendar-access-token",
                 "Australia/Sydney",
             ] {
-                assert!(!display.contains(secret), "display leaked {secret}");
-                assert!(!debug.contains(secret), "debug leaked {secret}");
+                assert!(
+                    !display.contains(secret),
+                    "service display redaction assertion failed"
+                );
+                assert!(
+                    !debug.contains(secret),
+                    "service debug redaction assertion failed"
+                );
             }
         }
     }
@@ -1906,7 +2113,10 @@ mod tests {
             "Callback for",
             "UTC",
         ] {
-            assert!(!debug.contains(secret), "prepared debug leaked {secret}");
+            assert!(
+                !debug.contains(secret),
+                "prepared request redaction assertion failed"
+            );
         }
         assert!(debug.contains("PreparedRequest"));
         assert_eq!(
@@ -1955,7 +2165,7 @@ mod tests {
         assert_eq!(result.notification_id(), 1);
         let message = store.load_message_by_id(1).expect("message");
         assert_eq!(message.provider(), crate::pa::store::MessageProvider::Voice);
-        assert_eq!(message.source_id(), "call-1");
+        assert_eq!(message.source_id(), "voice:call-1");
         assert_eq!(message.summary().as_str(), "Caller requested a callback");
         assert_eq!(message.subject(), None);
         assert_eq!(message.sender(), None);
@@ -2008,6 +2218,13 @@ mod tests {
         let first = service
             .record_message(summary.clone(), "retry-call", received_at)
             .expect("first");
+        assert_eq!(
+            store
+                .load_message_by_id(first.message_id())
+                .expect("stored message")
+                .source_id(),
+            "voice:retry-call"
+        );
         let retry = service
             .record_message(summary.clone(), "retry-call", canonical_received_at)
             .expect("exact source retry");
@@ -2118,17 +2335,44 @@ mod tests {
             "message_id: 1",
             "notification_id: 1",
         ] {
-            assert!(!debug.contains(secret), "debug leaked {secret}");
+            assert!(
+                !debug.contains(secret),
+                "recorded message redaction assertion failed"
+            );
         }
         assert_no_calendar_operations(&control);
     }
 
     #[test]
-    fn record_message_namespaces_submit_flow_identities() {
+    fn record_message_namespaces_source_and_submit_flow_identities() {
         let received_at = now();
         let control = control(received_at);
         let (store, outlook, google, outlook_session, google_session) =
             fixture(&control, &control, Vec::new(), Vec::new());
+        store
+            .record_message(
+                "outlook-message-collision",
+                "owner-1",
+                MessageProvider::Outlook,
+                "outlook-owner-1",
+                MessageSummary::new("outlook summary").expect("summary"),
+                None,
+                None,
+                received_at,
+            )
+            .expect("seed outlook message");
+        store
+            .record_message(
+                "gmail-message-collision",
+                "requester-1",
+                MessageProvider::Gmail,
+                "gmail-requester-1",
+                MessageSummary::new("gmail summary").expect("summary"),
+                None,
+                None,
+                received_at,
+            )
+            .expect("seed gmail message");
         for (key, entity_id) in [
             (
                 "pa-audit-notification-enqueued-owner-1",
@@ -2176,11 +2420,25 @@ mod tests {
         assert_ne!(owner_result.message_id(), requester_result.message_id());
         assert_eq!(
             store
+                .load_message_by_id(owner_result.message_id())
+                .expect("owner message")
+                .source_id(),
+            "voice:owner-1"
+        );
+        assert_eq!(
+            store
+                .load_message_by_id(requester_result.message_id())
+                .expect("requester message")
+                .source_id(),
+            "voice:requester-1"
+        );
+        assert_eq!(
+            store
                 .connection()
                 .query_row("SELECT count(*) FROM messages", [], |row| row
                     .get::<_, i64>(0))
                 .expect("messages"),
-            2
+            4
         );
         assert_eq!(
             store
