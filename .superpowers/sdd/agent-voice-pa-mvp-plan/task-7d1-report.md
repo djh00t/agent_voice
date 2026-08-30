@@ -132,6 +132,21 @@ filtered out`. Scoped rustfmt and `rtk git diff --check` each exited `0`. A
 fresh `rtk make check` exited `0`, running all 517 tests plus lint, rustdoc,
 and documentation checks.
 
+## Fix-round reviewer finding: typed lease fixtures
+
+An independent review found an Important stale assumption: several v14
+fixtures bound `"1700000000"` as TEXT, allowing SQLite INTEGER affinity to
+coerce the value and masking the intended typed boundary. Source-only commit
+`7911d48d732a23c79d7b0954f5faf80fb3761f52` changes the v14 helper to
+`Option<i64>` and binds valid lease fixtures as `1_700_000_000_i64`. Explicit
+invalid nonnumeric TEXT and BLOB corruption fixtures remain to prove rejection.
+
+All seven exact v14 selectors exited `0` with `1 passed; 516 filtered out`.
+Scoped rustfmt and `rtk git diff --check` exited `0`. A fresh `rtk make check`
+exited `0` with all 517 tests and repository lint, rustdoc, and documentation
+checks passing. These are LOCAL/STATIC results; CI, LIVE, provider, OAuth,
+cluster, and UAT gates remain residual.
+
 ## Evidence records
 
 | evidence_id | order | command | expected_exit | observed_exit | selector_or_diagnostic | evidence_tier | status | artifact_ref | non_claim | reviewer |
@@ -155,6 +170,9 @@ and documentation checks.
 | EV-13F-16 | 16 | v14 creation selector with numeric lease-order/query-plan proof | nonzero then 0 | 101 then 0 | INTEGER lease metadata; values 9, 10, 1700000000 order numerically; named lease index used | LOCAL | CONFIRMED | `7ac5cef77b35a8c552e50d0bb1d97b81b2015186` | does not prove downstream decoding or reservation behavior | NONE |
 | EV-13F-17 | 17 | four required v14 exact selectors | 0 | 0 | migration, idempotence, invalid-row constraints, and reopen preservation; each 1 passed, 516 filtered | LOCAL | CONFIRMED | `7ac5cef77b35a8c552e50d0bb1d97b81b2015186` | does not prove CI or live behavior | NONE |
 | EV-13F-18 | 18 | `rtk make check` | 0 | 0 | fresh 517-test suite, lint, rustdoc, and documentation checks | LOCAL | CONFIRMED | `7ac5cef77b35a8c552e50d0bb1d97b81b2015186` | does not prove CI, live, provider, OAuth, cluster, or UAT behavior | NONE |
+| EV-13F-19 | 19 | seven v14 exact selectors after typed-fixture correction | 0 | 0 | valid lease fixtures bind i64; intentional invalid TEXT/BLOB cases remain; each 1 passed, 516 filtered | LOCAL | CONFIRMED | `7911d48d732a23c79d7b0954f5faf80fb3761f52` | does not prove CI or live behavior | independent reviewer |
+| EV-13F-20 | 20 | `rtk rustfmt --edition 2024 --check src/pa/store.rs`; `rtk git diff --check` | 0 | 0 | source formatting and repository whitespace clean | STATIC | CONFIRMED | `7911d48d732a23c79d7b0954f5faf80fb3761f52` | does not prove semantic review or CI | NONE |
+| EV-13F-21 | 21 | `rtk make check` | 0 | 0 | fresh 517-test suite, lint, rustdoc, and documentation checks | LOCAL | CONFIRMED | `7911d48d732a23c79d7b0954f5faf80fb3761f52` | does not prove CI, live, provider, OAuth, cluster, or UAT behavior | NONE |
 
 ## Round-1 findings and resolutions
 
@@ -220,6 +238,7 @@ Controller review must verify the exact base/stack, one-file source commit, migr
 - Round-6 source remediation: `c64dd7f2c3f77c18155b428fd66670965776eb06`.
 - Round-7 source remediation: `50f88723c06886b35610cc865d56249dda619191`.
 - Round-8 source remediation: `7ac5cef77b35a8c552e50d0bb1d97b81b2015186`.
+- Fix-round source test correction: `7911d48d732a23c79d7b0954f5faf80fb3761f52`.
 - Prior report commits: `0f711bf03eecf009980de96e8b4990fb5de9389a`, `ddc35eab9aff4955d11b8ac1d54d5557c4bbaa8f`.
 - Report commit state: containing commit; resolve with `rtk git log -1 --format=%H -- .superpowers/sdd/agent-voice-pa-mvp-plan/task-7d1-report.md` after this report is committed.
 - Reviewer: pending controller review.
