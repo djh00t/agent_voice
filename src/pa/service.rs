@@ -15,9 +15,14 @@ use super::domain::{
     IdempotencyKey, Quote, QuoteId,
 };
 use super::providers::{
-    GoogleCalendarProvider, OutlookCalendarProvider, ProviderError, ProviderSession, TimeRange,
+    GoogleCalendarProvider, MailAddress, OutlookCalendarProvider, ProviderError, ProviderSession,
+    TimeRange,
 };
-use super::store::{MAX_APPOINTMENT_QUOTE_SLOTS, PaStore, StoreError};
+use super::store::{
+    AuditEntityType, AuditEventType, MAX_APPOINTMENT_QUOTE_SLOTS, MessageProvider, MessageSummary,
+    NotificationKind, NotificationRecipient, NotificationTemplateData, PaStore, StoreError,
+    validate_message_idempotency_key, validate_message_source_id, validate_provider_message_id,
+};
 
 /// The result type returned by personal-assistant services.
 pub type ServiceResult<T> = Result<T, ServiceError>;
@@ -36,6 +41,8 @@ pub enum ServiceError {
     Store(StoreError),
     /// Appointment draft validation failed.
     Domain(DomainError),
+    /// A message recording requires the explicitly configured owner address.
+    OwnerNotConfigured,
     /// Neither calendar had a slot satisfying the policy.
     NoAvailability,
 }
@@ -49,6 +56,7 @@ impl fmt::Display for ServiceError {
             Self::GoogleCalendar(_) => formatter.write_str("google calendar operation failed"),
             Self::Store(_) => formatter.write_str("appointment quote store operation failed"),
             Self::Domain(_) => formatter.write_str("appointment request validation failed"),
+            Self::OwnerNotConfigured => formatter.write_str("owner address is not configured"),
             Self::NoAvailability => formatter.write_str("no appointment slots are available"),
         }
     }
@@ -69,6 +77,7 @@ impl fmt::Debug for ServiceError {
             Self::GoogleCalendar(_) => formatter.write_str("GoogleCalendar"),
             Self::Store(_) => formatter.write_str("Store"),
             Self::Domain(_) => formatter.write_str("Domain"),
+            Self::OwnerNotConfigured => formatter.write_str("OwnerNotConfigured"),
             Self::NoAvailability => formatter.write_str("NoAvailability"),
         }
     }
@@ -250,6 +259,36 @@ impl fmt::Debug for PreparedRequest {
     }
 }
 
+/// The durable result of recording one voice-call summary.
+///
+/// The associated message and notification values remain in the store. This
+/// result exposes only their database identities; summary, owner, source, and
+/// timestamps are intentionally unavailable through ordinary formatting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RecordedMessage {
+    message_id: i64,
+    notification_id: i64,
+}
+
+impl RecordedMessage {
+    /// Returns the durable message database identity.
+    pub const fn message_id(self) -> i64 {
+        self.message_id
+    }
+
+    /// Returns the durable notification database identity.
+    pub const fn notification_id(self) -> i64 {
+        self.notification_id
+    }
+}
+
+impl fmt::Debug for RecordedMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .write_str("RecordedMessage { message_id: <redacted>, notification_id: <redacted> }")
+    }
+}
+
 /// Coordinates availability policy, calendar reads, and durable quote writes.
 pub struct PaService<'a> {
     store: &'a PaStore,
@@ -258,6 +297,7 @@ pub struct PaService<'a> {
     google: &'a dyn GoogleCalendarProvider,
     google_session: &'a ProviderSession,
     policy: AvailabilityPolicy,
+    owner: Option<MailAddress>,
 }
 
 impl<'a> PaService<'a> {
@@ -278,6 +318,29 @@ impl<'a> PaService<'a> {
             google,
             google_session,
             policy: policy.clone(),
+            owner: None,
+        }
+    }
+
+    /// Creates a message-capable facade with its validated owner address.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_owner(
+        store: &'a PaStore,
+        outlook: &'a dyn OutlookCalendarProvider,
+        outlook_session: &'a ProviderSession,
+        google: &'a dyn GoogleCalendarProvider,
+        google_session: &'a ProviderSession,
+        policy: &AvailabilityPolicy,
+        owner: MailAddress,
+    ) -> Self {
+        Self {
+            store,
+            outlook,
+            outlook_session,
+            google,
+            google_session,
+            policy: policy.clone(),
+            owner: Some(owner),
         }
     }
 
@@ -471,6 +534,102 @@ impl<'a> PaService<'a> {
             recap,
         })
     }
+
+    /// Records one validated voice-call summary and queues its owner-only
+    /// call-summary notification.
+    ///
+    /// The source identity is the sole input to all message, notification,
+    /// and audit idempotency/provider identities. The summary is a validated
+    /// structured value; raw transcripts and message bodies cannot cross this
+    /// boundary. Each local write is independently idempotent, so retries
+    /// resume after any durable prefix left by a failed tail write.
+    pub fn record_message(
+        &self,
+        summary: MessageSummary,
+        source_id: impl AsRef<str>,
+        received_at: OffsetDateTime,
+    ) -> ServiceResult<RecordedMessage> {
+        let owner = self
+            .owner
+            .as_ref()
+            .ok_or(ServiceError::OwnerNotConfigured)?;
+        let source_id = validate_message_source_id(source_id.as_ref().to_owned())
+            .map_err(ServiceError::Store)?;
+        let message_key = format!("pa-voice-message-recorded-{source_id}");
+        let provider_message_id = format!("pa-voice-provider-message-{source_id}");
+        let notification_key = format!("pa-voice-call-summary-notification-{source_id}");
+        let message_audit_key = format!("pa-voice-message-recorded-audit-{source_id}");
+        let notification_audit_key = format!("pa-voice-notification-enqueued-audit-{source_id}");
+
+        // Validate every derived identity before the first write. This keeps
+        // overlong source values from producing a durable partial prefix.
+        validate_message_idempotency_key(message_key.clone()).map_err(ServiceError::Store)?;
+        validate_provider_message_id(provider_message_id.clone()).map_err(ServiceError::Store)?;
+        validate_message_idempotency_key(notification_key.clone()).map_err(ServiceError::Store)?;
+        validate_message_idempotency_key(message_audit_key.clone()).map_err(ServiceError::Store)?;
+        validate_message_idempotency_key(notification_audit_key.clone())
+            .map_err(ServiceError::Store)?;
+
+        let received_at = canonicalize_utc_second(received_at, "received_at")?;
+        let message = self
+            .store
+            .record_message(
+                message_key,
+                &source_id,
+                MessageProvider::Voice,
+                provider_message_id,
+                summary.clone(),
+                None,
+                None,
+                received_at,
+            )
+            .map_err(ServiceError::Store)?;
+        let recipient =
+            NotificationRecipient::new(owner.as_str().to_owned()).map_err(ServiceError::Store)?;
+        let template = NotificationTemplateData::new(
+            Some(summary.as_str().to_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(ServiceError::Store)?;
+        let notification = self
+            .store
+            .enqueue_notification(
+                notification_key,
+                None,
+                None,
+                NotificationKind::CallSummary,
+                recipient,
+                template,
+                received_at,
+            )
+            .map_err(ServiceError::Store)?;
+        self.store
+            .append_audit_event(
+                message_audit_key,
+                AuditEventType::MessageRecorded,
+                AuditEntityType::Message,
+                message.id().to_string(),
+                received_at,
+            )
+            .map_err(ServiceError::Store)?;
+        self.store
+            .append_audit_event(
+                notification_audit_key,
+                AuditEventType::NotificationEnqueued,
+                AuditEntityType::Notification,
+                notification.id().to_string(),
+                received_at,
+            )
+            .map_err(ServiceError::Store)?;
+        Ok(RecordedMessage {
+            message_id: message.id(),
+            notification_id: notification.id(),
+        })
+    }
 }
 
 fn appointment_recap(draft: &AppointmentDraft, timezone: &str) -> ServiceResult<String> {
@@ -505,6 +664,16 @@ fn to_chrono_utc(value: OffsetDateTime) -> ServiceResult<DateTime<Utc>> {
     )
 }
 
+fn canonicalize_utc_second(
+    value: OffsetDateTime,
+    field: &'static str,
+) -> ServiceResult<OffsetDateTime> {
+    value
+        .to_offset(UtcOffset::UTC)
+        .replace_nanosecond(0)
+        .map_err(|_| ServiceError::Store(StoreError::InvalidInput { field }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PaService, ServiceError};
@@ -517,7 +686,7 @@ mod tests {
     };
     use crate::pa::fakes::{FakeControl, FakeGoogleCalendar, FakeOperation, FakeOutlookCalendar};
     use crate::pa::providers::{CalendarChange, ProviderError, ProviderSession, RetryAfter};
-    use crate::pa::store::{PaStore, StoreError};
+    use crate::pa::store::{AuditEntityType, AuditEventType, MessageSummary, PaStore, StoreError};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use time::{Date, Duration, OffsetDateTime, Time, format_description::well_known::Rfc3339};
 
@@ -571,6 +740,25 @@ mod tests {
                 row.get(0)
             })
             .expect("quote row count")
+    }
+
+    fn assert_no_calendar_operations(control: &FakeControl) {
+        for operation in [
+            FakeOperation::CalendarBusy,
+            FakeOperation::CalendarSync,
+            FakeOperation::CalendarOwnerCreate,
+            FakeOperation::CalendarOwnerFind,
+            FakeOperation::CalendarProposalCreate,
+            FakeOperation::CalendarProposalFind,
+            FakeOperation::CalendarPromote,
+            FakeOperation::CalendarDelete,
+        ] {
+            assert_eq!(
+                control.invocation_count(operation).expect("calendar count"),
+                0,
+                "message recording called {operation:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1733,5 +1921,375 @@ mod tests {
                 .expect("google count"),
             0
         );
+    }
+
+    #[test]
+    fn record_message_persists_one_voice_summary_and_owner_notification() {
+        let canonical_received_at = now();
+        let received_at = canonical_received_at
+            .replace_nanosecond(123_456_789)
+            .expect("valid timestamp");
+        let control = control(received_at);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&control, &control, Vec::new(), Vec::new());
+        let owner = crate::pa::providers::MailAddress::new("owner@example.com").expect("owner");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::default(),
+            owner,
+        );
+
+        let result = service
+            .record_message(
+                MessageSummary::new("Caller requested a callback").expect("summary"),
+                "call-1",
+                received_at,
+            )
+            .expect("recorded");
+
+        assert_eq!(result.message_id(), 1);
+        assert_eq!(result.notification_id(), 1);
+        let message = store.load_message_by_id(1).expect("message");
+        assert_eq!(message.provider(), crate::pa::store::MessageProvider::Voice);
+        assert_eq!(message.source_id(), "call-1");
+        assert_eq!(message.summary().as_str(), "Caller requested a callback");
+        assert_eq!(message.subject(), None);
+        assert_eq!(message.sender(), None);
+        assert_eq!(message.received_at(), canonical_received_at);
+        let notifications = store.list_pending_notifications().expect("notifications");
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0].kind(),
+            crate::pa::store::NotificationKind::CallSummary
+        );
+        assert_eq!(notifications[0].recipient().as_str(), "owner@example.com");
+        assert_eq!(
+            notifications[0].template_data().title(),
+            Some("Caller requested a callback")
+        );
+        let audits = store.list_audit_events(None, 10).expect("audits");
+        assert_eq!(audits.len(), 2);
+        assert!(
+            audits
+                .iter()
+                .all(|event| event.occurred_at() == canonical_received_at)
+        );
+        let debug = format!("{result:?}");
+        assert_eq!(
+            debug,
+            "RecordedMessage { message_id: <redacted>, notification_id: <redacted> }"
+        );
+        assert_no_calendar_operations(&control);
+    }
+
+    #[test]
+    fn record_message_exact_retry_is_stable_and_changed_inputs_conflict() {
+        let canonical_received_at = now();
+        let received_at = canonical_received_at
+            .replace_nanosecond(987_654_321)
+            .expect("valid timestamp");
+        let control = control(received_at);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&control, &control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::default(),
+            crate::pa::providers::MailAddress::new("owner@example.com").expect("owner"),
+        );
+        let summary = MessageSummary::new("Stable call summary").expect("summary");
+        let first = service
+            .record_message(summary.clone(), "retry-call", received_at)
+            .expect("first");
+        let retry = service
+            .record_message(summary.clone(), "retry-call", canonical_received_at)
+            .expect("exact source retry");
+        assert_eq!(retry, first);
+        assert!(matches!(
+            service.record_message(
+                MessageSummary::new("Changed call summary").expect("summary"),
+                "retry-call",
+                canonical_received_at,
+            ),
+            Err(ServiceError::Store(StoreError::Conflict {
+                resource: "message"
+            }))
+        ));
+        assert!(matches!(
+            service.record_message(
+                summary.clone(),
+                "retry-call",
+                canonical_received_at + Duration::seconds(1)
+            ),
+            Err(ServiceError::Store(StoreError::Conflict {
+                resource: "message"
+            }))
+        ));
+        assert!(
+            service
+                .record_message(summary, "retry-call-other", received_at)
+                .is_ok()
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("messages"),
+            2
+        );
+        assert_eq!(
+            store
+                .list_pending_notifications()
+                .expect("notifications")
+                .len(),
+            2
+        );
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 4);
+        assert_no_calendar_operations(&control);
+    }
+
+    #[test]
+    fn record_message_owner_is_required_before_any_write_and_debug_is_redacted() {
+        let received_at = now();
+        let control = control(received_at);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&control, &control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::default(),
+        );
+        let summary = MessageSummary::new("private caller summary").expect("summary");
+        let error = service
+            .record_message(summary, "private-call", received_at)
+            .expect_err("owner is required");
+        assert!(matches!(error, ServiceError::OwnerNotConfigured));
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("messages"),
+            0
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM notification_outbox", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("notifications"),
+            0
+        );
+        assert!(!format!("{error}").contains("private-call"));
+        assert!(!format!("{error:?}").contains("private-call"));
+
+        let owner_service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::default(),
+            crate::pa::providers::MailAddress::new("private-owner@example.com").expect("owner"),
+        );
+        let result = owner_service
+            .record_message(
+                MessageSummary::new("private caller summary").expect("summary"),
+                "private-call",
+                received_at,
+            )
+            .expect("recorded");
+        let debug = format!("{result:?}");
+        for secret in [
+            "private caller summary",
+            "private-owner@example.com",
+            "private-call",
+            "message_id: 1",
+            "notification_id: 1",
+        ] {
+            assert!(!debug.contains(secret), "debug leaked {secret}");
+        }
+        assert_no_calendar_operations(&control);
+    }
+
+    #[test]
+    fn record_message_namespaces_submit_flow_identities() {
+        let received_at = now();
+        let control = control(received_at);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&control, &control, Vec::new(), Vec::new());
+        for (key, entity_id) in [
+            (
+                "pa-audit-notification-enqueued-owner-1",
+                "owner-notification-1",
+            ),
+            (
+                "pa-audit-notification-enqueued-requester-1",
+                "requester-notification-1",
+            ),
+        ] {
+            store
+                .append_audit_event(
+                    key,
+                    AuditEventType::NotificationEnqueued,
+                    AuditEntityType::Notification,
+                    entity_id,
+                    received_at,
+                )
+                .expect("seed submit-flow audit identity");
+        }
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::default(),
+            crate::pa::providers::MailAddress::new("owner@example.com").expect("owner"),
+        );
+
+        let owner_result = service
+            .record_message(
+                MessageSummary::new("owner call summary").expect("summary"),
+                "owner-1",
+                received_at,
+            )
+            .expect("owner source must not collide");
+        let requester_result = service
+            .record_message(
+                MessageSummary::new("requester call summary").expect("summary"),
+                "requester-1",
+                received_at,
+            )
+            .expect("requester source must not collide");
+        assert_ne!(owner_result.message_id(), requester_result.message_id());
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("messages"),
+            2
+        );
+        assert_eq!(
+            store
+                .list_pending_notifications()
+                .expect("notifications")
+                .len(),
+            2
+        );
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 6);
+        assert_no_calendar_operations(&control);
+    }
+
+    #[test]
+    fn record_message_tail_failures_preserve_prefix_and_retry_to_complete_state() {
+        struct Checkpoint {
+            name: &'static str,
+            table: &'static str,
+            key: &'static str,
+            notifications: usize,
+            audits: usize,
+        }
+        let checkpoints = [
+            Checkpoint {
+                name: "notification",
+                table: "notification_outbox",
+                key: "pa-voice-call-summary-notification-tail-call",
+                notifications: 0,
+                audits: 0,
+            },
+            Checkpoint {
+                name: "message audit",
+                table: "audit_events",
+                key: "pa-voice-message-recorded-audit-tail-call",
+                notifications: 1,
+                audits: 0,
+            },
+            Checkpoint {
+                name: "notification audit",
+                table: "audit_events",
+                key: "pa-voice-notification-enqueued-audit-tail-call",
+                notifications: 1,
+                audits: 1,
+            },
+        ];
+        for checkpoint in checkpoints {
+            let received_at = now();
+            let control = control(received_at);
+            let (store, outlook, google, outlook_session, google_session) =
+                fixture(&control, &control, Vec::new(), Vec::new());
+            let service = PaService::with_owner(
+                &store,
+                &outlook,
+                &outlook_session,
+                &google,
+                &google_session,
+                &AvailabilityPolicy::default(),
+                crate::pa::providers::MailAddress::new("owner@example.com").expect("owner"),
+            );
+            let trigger = format!("fail_record_message_{}", checkpoint.name.replace(' ', "_"));
+            let condition = format!("NEW.idempotency_key = '{}'", checkpoint.key);
+            store
+                .connection()
+                .execute_batch(&format!(
+                    "CREATE TEMP TRIGGER {trigger} BEFORE INSERT ON {table} WHEN {condition} BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+                    trigger = trigger,
+                    table = checkpoint.table,
+                    condition = condition,
+                ))
+                .expect("install trigger");
+            let summary = MessageSummary::new("tail summary").expect("summary");
+            assert!(matches!(
+                service.record_message(summary.clone(), "tail-call", received_at),
+                Err(ServiceError::Store(_))
+            ));
+            assert_eq!(
+                store
+                    .list_pending_notifications()
+                    .expect("notifications")
+                    .len(),
+                checkpoint.notifications
+            );
+            assert_eq!(
+                store.list_audit_events(None, 10).expect("audits").len(),
+                checkpoint.audits
+            );
+            store
+                .connection()
+                .execute_batch(&format!("DROP TRIGGER {trigger}"))
+                .expect("drop trigger");
+            service
+                .record_message(summary, "tail-call", received_at)
+                .expect("retry");
+            assert_eq!(
+                store
+                    .list_pending_notifications()
+                    .expect("notifications")
+                    .len(),
+                1
+            );
+            assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 2);
+            assert_eq!(
+                store
+                    .connection()
+                    .query_row("SELECT count(*) FROM messages", [], |row| row
+                        .get::<_, i64>(0))
+                    .expect("messages"),
+                1
+            );
+            assert_no_calendar_operations(&control);
+        }
     }
 }
