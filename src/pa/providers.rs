@@ -8,6 +8,7 @@ use std::{fmt, future::Future, pin::Pin};
 
 use chrono::{DateTime, Duration, Utc};
 use chrono_tz::Tz;
+use ring::digest;
 
 use crate::pa::availability::BusyInterval;
 use crate::pa::domain::TaskKind;
@@ -284,13 +285,19 @@ impl EncryptedSnapshot {
                 field: ProviderInputField::Ciphertext,
             });
         }
+        let checksum = validate_sha256_checksum(checksum.into())?;
+        if checksum != lowercase_hex(digest::digest(&digest::SHA256, &ciphertext).as_ref()) {
+            return Err(ProviderError::InvalidInput {
+                field: ProviderInputField::Checksum,
+            });
+        }
         Ok(Self {
             object_key: validate_backup_text(
                 object_key.into(),
                 ProviderInputField::BackupObjectKey,
             )?,
             ciphertext,
-            checksum: validate_sha256_checksum(checksum.into())?,
+            checksum,
             ciphertext_size,
             encryption_format: validate_backup_text(
                 encryption_format.into(),
@@ -469,6 +476,16 @@ fn validate_sha256_checksum(value: String) -> ProviderResult<String> {
     Ok(value)
 }
 
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        result.push(HEX[(byte >> 4) as usize] as char);
+        result.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    result
+}
+
 /// Credentials for one validated provider account.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderSession {
@@ -486,7 +503,7 @@ impl ProviderSession {
     ) -> ProviderResult<Self> {
         let account_id = validate_identifier(account_id.into(), ProviderInputField::AccountId)?;
         let access_token = access_token.into();
-        if access_token.trim().is_empty() {
+        if access_token.trim().is_empty() || access_token.chars().any(char::is_control) {
             return Err(ProviderError::InvalidInput {
                 field: ProviderInputField::AccessToken,
             });
@@ -544,6 +561,8 @@ pub struct TimeRange {
 impl TimeRange {
     /// Constructs a range with a strictly earlier start.
     pub fn new(start: DateTime<Utc>, end: DateTime<Utc>) -> ProviderResult<Self> {
+        let start = validate_timestamp(start, ProviderInputField::TimeRange)?;
+        let end = validate_timestamp(end, ProviderInputField::TimeRange)?;
         if start >= end {
             return Err(ProviderError::InvalidInput {
                 field: ProviderInputField::TimeRange,
@@ -2529,6 +2548,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_access_token_control_characters_but_preserves_arbitrary_length() {
+        for rejected_token in ["access-token\n", "access-token\0"] {
+            assert!(matches!(
+                ProviderSession::new("account-a", rejected_token, None),
+                Err(ProviderError::InvalidInput {
+                    field: ProviderInputField::AccessToken
+                })
+            ));
+        }
+
+        let long_token = format!("access-token-{}", "x".repeat(MAX_PROVIDER_ID_LENGTH * 8));
+        let session = ProviderSession::new("account-a", long_token.clone(), None)
+            .expect("long token without controls remains valid");
+        assert_eq!(session.access_token(), long_token);
+    }
+
+    #[test]
     fn session_and_page_debug_redact_tokens() {
         let session = ProviderSession::new("account-a", TOKEN, None).expect("session");
         assert!(!format!("{session:?}").contains(TOKEN));
@@ -2644,6 +2680,18 @@ mod tests {
         ));
         assert!(matches!(
             TimeRange::new(instant(END), instant(START)),
+            Err(ProviderError::InvalidInput {
+                field: ProviderInputField::TimeRange
+            })
+        ));
+        assert!(matches!(
+            TimeRange::new(DateTime::<Utc>::MIN_UTC, instant(END)),
+            Err(ProviderError::InvalidInput {
+                field: ProviderInputField::TimeRange
+            })
+        ));
+        assert!(matches!(
+            TimeRange::new(instant(START), DateTime::<Utc>::MAX_UTC),
             Err(ProviderError::InvalidInput {
                 field: ProviderInputField::TimeRange
             })
@@ -3865,11 +3913,11 @@ mod tests {
     fn encrypted_snapshot_and_receipt_round_trip_sensitive_values_without_debug_leaks()
     -> ProviderResult<()> {
         let ciphertext = b"ciphertext-sentinel".to_vec();
-        let checksum = "a".repeat(64);
+        let checksum = "2b279f537aecafca5ed03705d91eedcb7e7a7941a5f5146bb1ad41127e32808e";
         let snapshot = EncryptedSnapshot::new(
             "backups/2026-08-30.snapshot",
             ciphertext.clone(),
-            checksum.clone(),
+            checksum,
             ciphertext.len() as u64,
             "age-v1",
             "key-id-sentinel",
@@ -3896,7 +3944,7 @@ mod tests {
         )?;
         assert_eq!(receipt.object_key(), "backups/2026-08-30.snapshot");
         assert_eq!(receipt.provider_version(), "etag-sentinel");
-        assert_eq!(receipt.checksum(), "a".repeat(64));
+        assert_eq!(receipt.checksum(), checksum);
         assert_eq!(receipt.uploaded_at(), uploaded_at);
         assert_eq!(receipt.stored_byte_count(), ciphertext.len() as u64);
 
@@ -3920,6 +3968,49 @@ mod tests {
             assert!(!receipt_debug.contains(sentinel));
         }
         Ok(())
+    }
+
+    #[test]
+    fn encrypted_snapshot_requires_matching_ciphertext_digest_but_receipt_is_shape_only() {
+        let ciphertext = b"digest-check-ciphertext".to_vec();
+        let checksum = "bb22d70df75100fe64e32b1956fce69d3110119e86662fcccbc8a9153dbe02f7";
+        let mismatch = EncryptedSnapshot::new(
+            "snapshot-key",
+            ciphertext.clone(),
+            "a".repeat(64),
+            ciphertext.len() as u64,
+            "age-v1",
+            "key-id",
+            "metadata",
+        )
+        .expect_err("shape-valid checksum must not pass for different ciphertext");
+        assert_eq!(
+            mismatch,
+            ProviderError::InvalidInput {
+                field: ProviderInputField::Checksum
+            }
+        );
+
+        let receipt = BackupReceipt::new(
+            "snapshot-key",
+            "provider-version",
+            "a".repeat(64),
+            instant(START),
+            ciphertext.len() as u64,
+        )
+        .expect("receipt checksum remains shape-only");
+        assert_eq!(receipt.checksum(), "a".repeat(64));
+
+        let _snapshot = EncryptedSnapshot::new(
+            "snapshot-key",
+            ciphertext.clone(),
+            checksum,
+            ciphertext.len() as u64,
+            "age-v1",
+            "key-id",
+            "metadata",
+        )
+        .expect("matching ciphertext digest");
     }
 
     #[test]
@@ -4031,7 +4122,7 @@ mod tests {
         let snapshot = EncryptedSnapshot::new(
             "snapshot-key",
             vec![1, 2, 3],
-            "b".repeat(64),
+            "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81",
             3,
             "age-v1",
             "key-id",
