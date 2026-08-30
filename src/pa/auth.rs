@@ -285,7 +285,7 @@ fn hex_digit(value: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthError, InMemoryReplayGuard, ReplayGuard, X_AV_NONCE, X_AV_SIGNATURE, X_AV_TIMESTAMP,
+        AuthError, InMemoryReplayGuard, X_AV_NONCE, X_AV_SIGNATURE, X_AV_TIMESTAMP,
         canonical_request, sign_request, verify_request,
     };
 
