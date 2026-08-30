@@ -1057,6 +1057,8 @@ fn validate_prepared_request(
         || prepared.requester_included != draft.requester_included()
         || selected_slot.starts_at() != draft.starts_at()
         || selected_slot.ends_at() != draft.ends_at()
+        || draft.starts_at().offset() != UtcOffset::UTC
+        || draft.ends_at().offset() != UtcOffset::UTC
         || expected_recap != prepared.recap
         || draft.quote_id() != quote.quote_id()
         || draft.ends_at() <= draft.starts_at()
@@ -1237,7 +1239,9 @@ mod tests {
         AuditEntityType, AuditEventType, MessageProvider, MessageSummary, PaStore, StoreError,
     };
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    use time::{Date, Duration, OffsetDateTime, Time, format_description::well_known::Rfc3339};
+    use time::{
+        Date, Duration, OffsetDateTime, Time, UtcOffset, format_description::well_known::Rfc3339,
+    };
 
     #[test]
     fn flat_pa_module_exports_service_facade() {
@@ -2611,6 +2615,158 @@ mod tests {
                 .expect("proposal count"),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn non_utc_durable_interval_fails_before_submission_side_effects_and_exact_retry_converges()
+     {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:non-utc-submit",
+                IdempotencyKey::new("appointment:non-utc-submit").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        let non_utc_offset = UtcOffset::from_hms(10, 0, 0).expect("offset");
+        let non_utc_start = prepared
+            .starts_at()
+            .to_offset(non_utc_offset)
+            .format(&Rfc3339)
+            .expect("start text");
+        let non_utc_end = prepared
+            .ends_at()
+            .to_offset(non_utc_offset)
+            .format(&Rfc3339)
+            .expect("end text");
+        store
+            .connection()
+            .execute(
+                "UPDATE appointment_drafts SET starts_at = ?1, ends_at = ?2 WHERE id = ?3",
+                (&non_utc_start, &non_utc_end, prepared.draft_id()),
+            )
+            .expect("corrupt durable offset");
+
+        let error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("non-UTC durable interval must fail closed");
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::Conflict { .. })
+        ));
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            0
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            0
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count"),
+            1
+        );
+        for table in [
+            "proposals",
+            "event_mappings",
+            "notification_outbox",
+            "audit_events",
+        ] {
+            let count = store
+                .connection()
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("side-effect count");
+            assert_eq!(count, 0, "{table} must remain unchanged");
+        }
+
+        let starts_at = prepared
+            .starts_at()
+            .to_offset(UtcOffset::UTC)
+            .format(&Rfc3339)
+            .expect("canonical start text");
+        let ends_at = prepared
+            .ends_at()
+            .to_offset(UtcOffset::UTC)
+            .format(&Rfc3339)
+            .expect("canonical end text");
+        store
+            .connection()
+            .execute(
+                "UPDATE appointment_drafts SET starts_at = ?1, ends_at = ?2 WHERE id = ?3",
+                (&starts_at, &ends_at, prepared.draft_id()),
+            )
+            .expect("restore durable interval");
+
+        let first = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect("valid submission");
+        let retry = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect("exact valid retry");
+        assert_eq!(retry, first);
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
     }
 
     #[tokio::test]
