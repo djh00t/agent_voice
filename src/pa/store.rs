@@ -8819,6 +8819,97 @@ END;
             .expect("idempotency table");
         assert!(table_sql.contains("UNIQUE (scope, idempotency_key)"));
         assert!(table_sql.contains("state IN ('in_progress', 'completed')"));
+        let columns = store
+            .connection()
+            .prepare("PRAGMA table_info('http_idempotency_records')")
+            .expect("idempotency table info")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .expect("idempotency columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("idempotency column rows");
+        assert_eq!(
+            columns,
+            vec![
+                ("id".to_owned(), "INTEGER".to_owned(), 0, None, 1),
+                ("scope".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("idempotency_key".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("fingerprint".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("state".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                (
+                    "lease_generation".to_owned(),
+                    "INTEGER".to_owned(),
+                    1,
+                    None,
+                    0
+                ),
+                ("lease_until".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                (
+                    "response_status".to_owned(),
+                    "INTEGER".to_owned(),
+                    0,
+                    None,
+                    0
+                ),
+                (
+                    "response_content_type".to_owned(),
+                    "TEXT".to_owned(),
+                    0,
+                    None,
+                    0
+                ),
+                ("response_body".to_owned(), "BLOB".to_owned(), 0, None, 0),
+                (
+                    "created_at".to_owned(),
+                    "TEXT".to_owned(),
+                    1,
+                    Some("CURRENT_TIMESTAMP".to_owned()),
+                    0
+                ),
+                (
+                    "updated_at".to_owned(),
+                    "TEXT".to_owned(),
+                    1,
+                    Some("CURRENT_TIMESTAMP".to_owned()),
+                    0
+                ),
+            ]
+        );
+        let indexes = store
+            .connection()
+            .prepare("PRAGMA index_list('http_idempotency_records')")
+            .expect("idempotency index list")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .expect("idempotency indexes")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("idempotency index rows");
+        let lease_index = indexes
+            .iter()
+            .find(|(name, _, _, _)| name == "idx_http_idempotency_records_lease_until")
+            .expect("lease index metadata");
+        assert_eq!(
+            lease_index,
+            &(
+                "idx_http_idempotency_records_lease_until".to_owned(),
+                0,
+                "c".to_owned(),
+                0
+            )
+        );
         assert_named_index(
             &store,
             "idx_http_idempotency_records_lease_until",
@@ -8928,6 +9019,48 @@ END;
                 None,
                 None,
                 None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("in-progress-status-only"),
+                Some("fingerprint"),
+                "in_progress",
+                1,
+                Some("1700000000"),
+                Some(200),
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("in-progress-content-type-only"),
+                Some("fingerprint"),
+                "in_progress",
+                1,
+                Some("1700000000"),
+                None,
+                Some("application/json"),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("in-progress-body-only"),
+                Some("fingerprint"),
+                "in_progress",
+                1,
+                Some("1700000000"),
+                None,
+                None,
+                Some(b"{}"),
             )
             .is_err()
         );
@@ -9141,10 +9274,84 @@ END;
                     ["owner@example.test"],
                 )
                 .expect("seed v13 configuration");
+            connection
+                .execute(
+                    "INSERT INTO replay_nonces (nonce, consumed_at, expires_at)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        "reopen-nonce",
+                        "2025-01-01T00:00:00Z",
+                        "2025-01-01T00:01:00Z"
+                    ],
+                )
+                .expect("seed v13 replay nonce");
         }
 
-        {
-            let store = PaStore::open(&database.path, DATABASE_KEY).expect("upgrade to v14");
+        let v13_table_count: i64 = {
+            let connection = Connection::open(&database.path).expect("open v13 snapshot");
+            apply_sqlcipher_key(&connection, DATABASE_KEY).expect("apply SQLCipher key");
+            verify_sqlcipher(&connection).expect("verify SQLCipher");
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("v13 table count")
+        };
+        let snapshot = |store: &PaStore| {
+            let table_count: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("table count");
+            let index_count: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type = 'index'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("index count");
+            let configuration_rows: i64 = store
+                .connection()
+                .query_row("SELECT count(*) FROM configuration", [], |row| row.get(0))
+                .expect("configuration row count");
+            let replay_rows: i64 = store
+                .connection()
+                .query_row("SELECT count(*) FROM replay_nonces", [], |row| row.get(0))
+                .expect("replay row count");
+            let idempotency_rows: i64 = store
+                .connection()
+                .query_row("SELECT count(*) FROM http_idempotency_records", [], |row| {
+                    row.get(0)
+                })
+                .expect("idempotency row count");
+            let migration_rows: i64 = store
+                .connection()
+                .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .expect("migration row count");
+            (
+                table_count,
+                index_count,
+                configuration_rows,
+                replay_rows,
+                idempotency_rows,
+                migration_rows,
+            )
+        };
+
+        let mut snapshots = Vec::new();
+        for reopen in 0..3 {
+            let store = PaStore::open(&database.path, DATABASE_KEY).expect("open v14 store");
             let owner_email: String = store
                 .connection()
                 .query_row(
@@ -9154,45 +9361,37 @@ END;
                 )
                 .expect("preserved configuration");
             assert_eq!(owner_email, "owner@example.test");
-            store
+            let nonce: String = store
                 .connection()
-                .execute(
-                    "INSERT INTO http_idempotency_records (
-                         scope, idempotency_key, fingerprint, state, lease_generation,
-                         lease_until
-                     ) VALUES (?1, ?2, ?3, 'in_progress', 1, ?4)",
-                    rusqlite::params!["scope", "key", "fingerprint", "1700000000"],
+                .query_row(
+                    "SELECT nonce FROM replay_nonces WHERE nonce = 'reopen-nonce'",
+                    [],
+                    |row| row.get(0),
                 )
-                .expect("insert idempotency row");
+                .expect("preserved replay nonce");
+            assert_eq!(nonce, "reopen-nonce");
+            if reopen == 0 {
+                store
+                    .connection()
+                    .execute(
+                        "INSERT INTO http_idempotency_records (
+                             scope, idempotency_key, fingerprint, state, lease_generation,
+                             lease_until
+                         ) VALUES (?1, ?2, ?3, 'in_progress', 1, ?4)",
+                        rusqlite::params!["scope", "key", "fingerprint", "1700000000"],
+                    )
+                    .expect("insert idempotency row");
+            }
+            snapshots.push(snapshot(&store));
         }
 
-        let reopened = PaStore::open(&database.path, DATABASE_KEY).expect("reopen v14 store");
-        let preserved: (String, String, String) = reopened
-            .connection()
-            .query_row(
-                "SELECT scope, idempotency_key, fingerprint
-                 FROM http_idempotency_records",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("preserved idempotency row");
-        assert_eq!(
-            preserved,
-            (
-                "scope".to_owned(),
-                "key".to_owned(),
-                "fingerprint".to_owned()
-            )
-        );
-        let migration_count: i64 = reopened
-            .connection()
-            .query_row(
-                "SELECT count(*) FROM schema_migrations WHERE version = 14",
-                [],
-                |row| row.get(0),
-            )
-            .expect("v14 migration count");
-        assert_eq!(migration_count, 1);
+        assert_eq!(snapshots[0].0, v13_table_count + 1);
+        assert_eq!(snapshots[0].2, 1);
+        assert_eq!(snapshots[0].3, 1);
+        assert_eq!(snapshots[0].4, 1);
+        assert_eq!(snapshots[0].5, 14);
+        assert_eq!(snapshots[0], snapshots[1]);
+        assert_eq!(snapshots[1], snapshots[2]);
     }
 
     #[test]
