@@ -6,8 +6,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::pa::providers::{
-    BackupReceipt, EncryptedS3BackupProvider, EncryptedSnapshot, ProviderError, ProviderFuture,
-    ProviderResult, ProviderSession,
+    BackupObjectInfo, BackupObjectKey, BackupReceipt, EncryptedS3BackupProvider, EncryptedSnapshot,
+    ProviderError, ProviderFuture, ProviderResult, ProviderSession,
 };
 
 use super::control::{FakeControl, FakeOperation};
@@ -95,6 +95,46 @@ impl FakeEncryptedS3Backup {
         );
         Ok(receipt)
     }
+
+    fn list(&self, prefix: &BackupObjectKey) -> ProviderResult<Vec<BackupObjectInfo>> {
+        let state = self.state.lock().map_err(|_| ProviderError::Unavailable)?;
+        state
+            .objects
+            .iter()
+            .filter(|(key, _)| key_matches_prefix(key, prefix.as_str()))
+            .map(|(key, stored)| {
+                BackupObjectInfo::new(
+                    BackupObjectKey::new(key.clone())?,
+                    stored.receipt.provider_version(),
+                    stored.receipt.checksum(),
+                    stored.receipt.uploaded_at(),
+                    stored.receipt.stored_byte_count(),
+                )
+            })
+            .collect()
+    }
+
+    fn load(&self, key: &BackupObjectKey) -> ProviderResult<EncryptedSnapshot> {
+        let state = self.state.lock().map_err(|_| ProviderError::Unavailable)?;
+        state
+            .objects
+            .get(key.as_str())
+            .map(|stored| stored.snapshot.clone())
+            .ok_or(ProviderError::NotFound)
+    }
+
+    fn remove(&self, key: &BackupObjectKey) -> ProviderResult<()> {
+        let mut state = self.state.lock().map_err(|_| ProviderError::Unavailable)?;
+        state.objects.remove(key.as_str());
+        Ok(())
+    }
+}
+
+fn key_matches_prefix(key: &str, prefix: &str) -> bool {
+    key == prefix
+        || key
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 impl fmt::Debug for FakeEncryptedS3Backup {
@@ -125,6 +165,45 @@ impl EncryptedS3BackupProvider for FakeEncryptedS3Backup {
             fake.store(snapshot)
         })
     }
+
+    fn list_snapshots<'a>(
+        &'a self,
+        _session: &'a ProviderSession,
+        prefix: &'a BackupObjectKey,
+    ) -> ProviderFuture<'a, Vec<BackupObjectInfo>> {
+        let fake = self.clone();
+        let prefix = prefix.clone();
+        Box::pin(async move {
+            fake.control.begin(FakeOperation::BackupPut)?;
+            fake.list(&prefix)
+        })
+    }
+
+    fn get_snapshot<'a>(
+        &'a self,
+        _session: &'a ProviderSession,
+        key: &'a BackupObjectKey,
+    ) -> ProviderFuture<'a, EncryptedSnapshot> {
+        let fake = self.clone();
+        let key = key.clone();
+        Box::pin(async move {
+            fake.control.begin(FakeOperation::BackupPut)?;
+            fake.load(&key)
+        })
+    }
+
+    fn delete_snapshot<'a>(
+        &'a self,
+        _session: &'a ProviderSession,
+        key: &'a BackupObjectKey,
+    ) -> ProviderFuture<'a, ()> {
+        let fake = self.clone();
+        let key = key.clone();
+        Box::pin(async move {
+            fake.control.begin(FakeOperation::BackupPut)?;
+            fake.remove(&key)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -132,8 +211,8 @@ mod tests {
     use super::FakeEncryptedS3Backup;
     use crate::pa::fakes::{FakeControl, FakeOperation};
     use crate::pa::providers::{
-        BackupReceipt, EncryptedS3BackupProvider, EncryptedSnapshot, ProviderError,
-        ProviderSession, RetryAfter,
+        BackupObjectKey, BackupReceipt, EncryptedS3BackupProvider, EncryptedSnapshot,
+        ProviderError, ProviderSession, RetryAfter,
     };
     use chrono::{DateTime, Duration, Utc};
     use std::fmt;
@@ -196,6 +275,122 @@ mod tests {
         assert_eq!(receipt.stored_byte_count(), snapshot.ciphertext_size());
         assert_eq!(fake.put_snapshot(&session(), &snapshot).await, Ok(receipt));
         assert_eq!(control.invocation_count(FakeOperation::BackupPut), Ok(2));
+    }
+
+    #[tokio::test]
+    async fn list_download_and_delete_are_prefix_scoped_deterministic_and_idempotent() {
+        let control = FakeControl::new(now());
+        let fake = FakeEncryptedS3Backup::new(control.clone());
+        let provider: &dyn EncryptedS3BackupProvider = &fake;
+        let values = [
+            snapshot(
+                "backup-sentinel/z/key",
+                b"backup-sentinel-z-ciphertext",
+                "089d76f2759d5f8dc10b541e00875a601890d4fc89dae748261c8f1d64f2a492",
+                "backup-sentinel-encryption-format",
+                "backup-sentinel-key-metadata",
+                "backup-sentinel-encryption-metadata",
+            ),
+            snapshot(
+                "backup-sentinel/a/key",
+                b"backup-sentinel-a-ciphertext",
+                "92762cbb819f1bceef362f2400603f484cee20321497c97f504c8838fc72e5c2",
+                "backup-sentinel-encryption-format",
+                "backup-sentinel-key-metadata",
+                "backup-sentinel-encryption-metadata",
+            ),
+            snapshot(
+                "outside/key",
+                b"backup-sentinel-outside-ciphertext",
+                "20bae8d48a542dd08810d2d96bbb60ad2c0c552d549c845f629f1494770c391b",
+                "backup-sentinel-encryption-format",
+                "backup-sentinel-key-metadata",
+                "backup-sentinel-encryption-metadata",
+            ),
+        ];
+        for value in &values {
+            provider
+                .put_snapshot(&session(), value)
+                .await
+                .expect("receipt");
+        }
+
+        let prefix = BackupObjectKey::new("backup-sentinel").expect("prefix");
+        let listed = provider
+            .list_snapshots(&session(), &prefix)
+            .await
+            .expect("metadata");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|info| info.object_key())
+                .collect::<Vec<_>>(),
+            vec!["backup-sentinel/a/key", "backup-sentinel/z/key"]
+        );
+        assert_eq!(listed[0].checksum(), values[1].checksum());
+        assert_eq!(listed[0].byte_count(), values[1].ciphertext_size());
+        assert!(!format!("{:?}", listed[0]).contains("backup-sentinel-a"));
+
+        let key = BackupObjectKey::new(values[1].object_key()).expect("object key");
+        assert_eq!(
+            provider.get_snapshot(&session(), &key).await,
+            Ok(values[1].clone())
+        );
+        assert_eq!(
+            provider
+                .get_snapshot(
+                    &session(),
+                    &BackupObjectKey::new("backup-sentinel-missing").expect("key")
+                )
+                .await,
+            Err(ProviderError::NotFound)
+        );
+        assert_eq!(provider.delete_snapshot(&session(), &key).await, Ok(()));
+        assert_eq!(provider.delete_snapshot(&session(), &key).await, Ok(()));
+        assert_eq!(
+            fake.stored_receipts()
+                .expect("remaining receipts")
+                .iter()
+                .map(BackupReceipt::object_key)
+                .collect::<Vec<_>>(),
+            vec!["backup-sentinel/z/key", "outside/key"]
+        );
+        assert_eq!(control.invocation_count(FakeOperation::BackupPut), Ok(8));
+    }
+
+    #[tokio::test]
+    async fn list_download_and_delete_fail_before_mutation_when_control_fails() {
+        let control = FakeControl::new(now());
+        let fake = FakeEncryptedS3Backup::new(control.clone());
+        let snapshot = first_snapshot();
+        fake.put_snapshot(&session(), &snapshot)
+            .await
+            .expect("receipt");
+        let key = BackupObjectKey::new(snapshot.object_key()).expect("key");
+        let prefix = BackupObjectKey::new("backup-sentinel").expect("prefix");
+
+        control
+            .queue_failure(FakeOperation::BackupPut, ProviderError::Unavailable)
+            .expect("list failure");
+        assert_eq!(
+            fake.list_snapshots(&session(), &prefix).await,
+            Err(ProviderError::Unavailable)
+        );
+        control
+            .queue_failure(FakeOperation::BackupPut, ProviderError::Unavailable)
+            .expect("get failure");
+        assert_eq!(
+            fake.get_snapshot(&session(), &key).await,
+            Err(ProviderError::Unavailable)
+        );
+        control
+            .queue_failure(FakeOperation::BackupPut, ProviderError::Unavailable)
+            .expect("delete failure");
+        assert_eq!(
+            fake.delete_snapshot(&session(), &key).await,
+            Err(ProviderError::Unavailable)
+        );
+        assert_eq!(fake.get_snapshot(&session(), &key).await, Ok(snapshot));
     }
 
     #[test]
