@@ -544,7 +544,7 @@ impl fmt::Debug for ProviderSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProviderSession")
-            .field("account_id", &self.account_id)
+            .field("account_id", &"<redacted>")
             .field("access_token", &"<redacted>")
             .field("expires_at", &self.expires_at)
             .finish()
@@ -2565,11 +2565,33 @@ mod tests {
     }
 
     #[test]
-    fn session_and_page_debug_redact_tokens() {
-        let session = ProviderSession::new("account-a", TOKEN, None).expect("session");
-        assert!(!format!("{session:?}").contains(TOKEN));
-        let page = SyncPage::new(vec![session], None, vec![failure("event-1")]).expect("page");
-        assert!(!format!("{page:?}").contains(TOKEN));
+    fn session_and_page_debug_redact_accounts_tokens_and_cursors() {
+        let account_id = "owner.pa@example.test";
+        let cursor = "sentinel-provider-cursor";
+        let session =
+            ProviderSession::new(account_id, TOKEN, Some(instant(START))).expect("session");
+        let session_debug = format!("{session:?}");
+        assert!(session_debug.contains("ProviderSession"));
+        assert!(session_debug.contains(r#"account_id: "<redacted>""#));
+        assert!(session_debug.contains(r#"access_token: "<redacted>""#));
+        assert!(session_debug.contains("expires_at"));
+        assert!(!session_debug.contains(account_id));
+        assert!(!session_debug.contains(TOKEN));
+
+        let page = SyncPage::new(
+            vec![session],
+            Some(cursor.to_owned()),
+            vec![failure("event-1")],
+        )
+        .expect("page");
+        let page_debug = format!("{page:?}");
+        assert!(page_debug.contains("SyncPage"));
+        assert!(page_debug.contains("item_count: 1"));
+        assert!(page_debug.contains("has_next_cursor: true"));
+        assert!(page_debug.contains("failure_count: 1"));
+        assert!(!page_debug.contains(account_id));
+        assert!(!page_debug.contains(TOKEN));
+        assert!(!page_debug.contains(cursor));
     }
 
     #[test]
