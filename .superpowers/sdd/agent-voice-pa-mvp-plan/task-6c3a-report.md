@@ -7,7 +7,7 @@
 - **Worktree:** `/private/tmp/agent-voice-pa-06c3-submit-orchestration`
 - **Branch:** `codex/agent-voice-pa-06c3-submit-orchestration`
 - **Base:** `4ba837e6ed7f2cd4ba431660865d902a2787f9eb` (`origin/main`)
-- **Implementation commits:** `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`
+- **Implementation commits:** `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`, `68e8e2e`
 
 ## Scope
 
@@ -84,7 +84,7 @@ the instant made it appear earlier than the fractional `issued_at`.
 | One pending Google proposal, mapping, policy notifications, and audits | `confirmed_submission_creates_one_owner_only_pending_proposal_and_outbox_rows`; Meeting produces owner plus requester rows. |
 | Callback owner-only policy | `callback_submission_notifies_only_the_owner`; requester ID is `None`. |
 | Provider response validation | `mismatched_provider_event_is_rejected_before_mapping`; wrong title/owner is rejected before mapping or tail writes. |
-| Local tail retry | `exact_retry_repairs_a_missing_audit_without_provider_calls`; the audit tail failure leaves the valid prefix and retry repairs it without another provider create. |
+| Local tail retry | `exact_retry_repairs_a_missing_audit_without_provider_calls`, `exact_retry_repairs_a_missing_mapping_without_duplicate_provider_create`, and `exact_retry_repairs_a_missing_notification_without_provider_calls`; audit, mapping, and notification failures leave valid prefixes whose exact retries converge without a duplicate provider create. |
 | Subsecond submission retry | `nonzero_nanosecond_submission_retries_without_partial_state`; a nonzero-nanosecond submission succeeds with a whole-second consumed timestamp, and an exact retry returns the same result without provider calls or duplicate rows. |
 | Fractional quote boundaries | `fractional_issued_at_is_valid_at_exact_issue` and `fractional_expires_at_remains_exclusive`; full-precision validation accepts exact issuance and rejects exact fractional expiry. |
 
@@ -92,12 +92,12 @@ Commands and results:
 
 | Check | Result |
 | --- | --- |
-| `rtk cargo test pa::service::tests::fractional --lib` | PASS — 2 passed, 480 filtered out |
-| `rtk cargo test --lib pa::service::tests` | PASS — 36 passed, 446 filtered out |
+| `rtk cargo test pa::service::tests::fractional --lib` | PASS — 2 passed, 491 filtered out |
+| `rtk cargo test pa::service::tests:: --lib` | PASS — 39 passed, 454 filtered out |
 | `rtk cargo clippy --all-targets --all-features -- -D warnings` | PASS — no issues found |
 | `rtk rustfmt --edition 2024 --check src/pa/service.rs` | PASS |
 | `rtk git diff --check` | PASS |
-| `rtk make check` | PASS — Rust tests, clippy, docs, and Docusaurus build completed; full suite ran 482 tests |
+| `rtk make check` | PASS — Rust tests, clippy, docs, and Docusaurus build completed; full suite ran 493 tests |
 
 The first `rtk make check` attempt stopped at `docs-build` because the clean
 worktree had no installed Docusaurus binary (`docusaurus: command not found`).
@@ -145,7 +145,7 @@ Focused command:
 rtk cargo test pa::service::tests::non_utc_durable_interval_fails_before_submission_side_effects_and_exact_retry_converges --lib
 ```
 
-Result: PASS — 1 passed, 490 filtered out.
+Result: PASS — 1 passed, 492 filtered out.
 
 Current repository gate:
 
@@ -153,10 +153,29 @@ Current repository gate:
 rtk make check
 ```
 
-Result: PASS — 491 unit tests, 3 doctests, strict clippy, Rust API docs, and
+Result: PASS — 493 unit tests, 3 doctests, strict clippy, Rust API docs, and
 the Docusaurus production build. The fresh worktree first lacked the local
 Docusaurus binary; `rtk make docs-install` installed the lockfile-resolved
 website dependencies without changing tracked manifests or lockfiles.
+
+## Reviewer local-tail remediation
+
+The service owns three independently retryable local tail boundaries. Focused
+SQLite trigger regressions now inject failures before mapping insertion and
+notification enqueue, in addition to the existing audit insertion failure.
+The mapping retry is allowed to find the already-created operation-key event,
+but provider busy reads and proposal creation are forced to fail and are not
+repeated. The notification retry forces every provider operation to fail; it
+still repairs the notification and audit rows because its existing valid
+mapping bypasses all provider calls.
+
+Focused command:
+
+```text
+rtk cargo test pa::service::tests::exact_retry_repairs_a_missing_ --lib
+```
+
+Result: PASS — 3 passed, 490 filtered out.
 
 ## Non-claims and residual gates
 
@@ -164,11 +183,8 @@ website dependencies without changing tracked manifests or lockfiles.
   deployment, publication, or authenticated UAT evidence is claimed.
 - #211 owns ambiguous provider-create recovery and its audit/evidence path;
   it remains unimplemented here.
-- Separate focused tests for injected mapping and notification write failures
-  remain useful follow-up coverage; the implementation uses the same
-  idempotent local-tail mechanism for those rows.
-- Rollback is a code revert of `03f4880`, `5b1485a`, and `ee27ebe`; no remote
-  deletion is inferred or attempted.
+- Rollback is a code revert of `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`,
+  and `68e8e2e`; no remote deletion is inferred or attempted.
 
 ## Completion evidence
 
@@ -176,7 +192,8 @@ website dependencies without changing tracked manifests or lockfiles.
 - **Commits:** `5d2d43e` (`feat(service): orchestrate confirmed request submission`),
   `cf72a79` (`fix(service): canonicalize submission audit time`), `5d4efc9`
   (`fix(service): preserve fractional quote boundaries`), `82e6723`
-  (`fix(service): reject non-UTC durable submission intervals`)
-- **Report commit:** added separately after P1 remediation
+  (`fix(service): reject non-UTC durable submission intervals`), `68e8e2e`
+  (`test(service): cover local submission tail repair`)
+- **Report commit:** added separately after reviewer remediation
 - **PR/push:** not created or pushed, per task instruction
 - **Reviewer:** not performed in this lane
