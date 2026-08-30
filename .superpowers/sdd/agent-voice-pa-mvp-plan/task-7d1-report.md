@@ -147,6 +147,44 @@ exited `0` with all 517 tests and repository lint, rustdoc, and documentation
 checks passing. These are LOCAL/STATIC results; CI, LIVE, provider, OAuth,
 cluster, and UAT gates remain residual.
 
+## Final review: isolated fingerprint fixtures and aligned contract
+
+Final review found that the literal `"fingerprint"` was used by v14 negative
+fixtures that were intended to isolate state, response, generation,
+required-field, duplicate-key, and storage-class constraints. The literal is
+not a valid durable fingerprint: it independently fails the exact 64-byte
+lowercase-hex schema check, so those rows could have passed while testing the
+wrong rejection cause. Before the correction, temporary instrumentation of the
+existing invalid-row selector inserted an otherwise-valid in-progress row with
+that literal and observed `is_err()`; the exact selector exited `0` with `1
+passed; 516 filtered out`. This is a focused masking proof, not a manufactured
+RED claim.
+
+Source-only commit `73378004988d78af740ace34e1ccae5beb615581` replaces each
+non-fingerprint-specific v14 negative fixture with
+`VALID_HTTP_FINGERPRINT`, including the duplicate-key row and the
+wrong-storage-class BLOB payload. Explicit absent, empty, whitespace, and
+embedded-NUL fingerprint cases remain invalid by design. A search found no
+remaining literal fingerprint fixture outside explicit schema metadata.
+
+Issue #256 was read back after its external contract-only edit and now states
+that the schema boundary enforces the exact #274 durable grammar/bounds:
+scope is 1-64 ASCII `[A-Za-z0-9._:-]`, key is 1-128 ASCII
+`[A-Za-z0-9._~-]`, fingerprint is exactly 64 lowercase hexadecimal ASCII
+bytes, and every identity rejects embedded NUL. It also states that #274
+exclusively owns public Rust validators/constants and that #256 adds no public
+grammar API or newtype. The #274 readback has the same grammar table and
+result-only/no-newtype validator contract.
+
+At `2026-08-31T06:29:03+1000`, all seven exact v14 selectors exited `0`, each
+with `1 passed; 516 filtered out`; scoped `rtk rustfmt --edition 2024 --check
+src/pa/store.rs` and `rtk git diff --check` exited `0`; and a fresh `rtk make
+check` exited `0` with 517 tests plus Clippy, rustdoc, and locked website
+checks. This is LOCAL/STATIC evidence only. Current-head CI and independent
+review, LIVE/provider/OAuth/cluster/UAT evidence, and the prerequisite
+#265/#255 merge followed by rebase/retarget and current-base rerun remain
+required gates.
+
 ## Evidence records
 
 | evidence_id | order | command | expected_exit | observed_exit | selector_or_diagnostic | evidence_tier | status | artifact_ref | non_claim | reviewer |
@@ -173,6 +211,8 @@ cluster, and UAT gates remain residual.
 | EV-13F-19 | 19 | seven v14 exact selectors after typed-fixture correction | 0 | 0 | valid lease fixtures bind i64; intentional invalid TEXT/BLOB cases remain; each 1 passed, 516 filtered | LOCAL | CONFIRMED | `7911d48d732a23c79d7b0954f5faf80fb3761f52` | does not prove CI or live behavior | independent reviewer |
 | EV-13F-20 | 20 | `rtk rustfmt --edition 2024 --check src/pa/store.rs`; `rtk git diff --check` | 0 | 0 | source formatting and repository whitespace clean | STATIC | CONFIRMED | `7911d48d732a23c79d7b0954f5faf80fb3761f52` | does not prove semantic review or CI | NONE |
 | EV-13F-21 | 21 | `rtk make check` | 0 | 0 | fresh 517-test suite, lint, rustdoc, and documentation checks | LOCAL | CONFIRMED | `7911d48d732a23c79d7b0954f5faf80fb3761f52` | does not prove CI, live, provider, OAuth, cluster, or UAT behavior | NONE |
+| EV-13F-22 | 22 | temporary assertion in `http_idempotency_v14_constraints_reject_invalid_rows` with otherwise-valid row and literal `"fingerprint"` | 0 | 0 | the literal independently violates the fingerprint schema constraint; focused masking proof only | LOCAL | CONFIRMED | `73378004988d78af740ace34e1ccae5beb615581` | is not RED evidence and does not prove the corrected fixtures exercise every intended constraint | final review |
+| EV-13F-23 | 23 | seven exact v14 selectors; scoped rustfmt/diff check; `rtk make check` | 0 | 0 | isolated valid fingerprint fixtures; 517 tests plus Clippy, rustdoc, and website checks | LOCAL/STATIC | CONFIRMED | `73378004988d78af740ace34e1ccae5beb615581` | does not prove current-head CI, independent review, live, provider, OAuth, cluster, or UAT behavior | final review |
 
 ## Round-1 findings and resolutions
 
@@ -239,6 +279,7 @@ Controller review must verify the exact base/stack, one-file source commit, migr
 - Round-7 source remediation: `50f88723c06886b35610cc865d56249dda619191`.
 - Round-8 source remediation: `7ac5cef77b35a8c552e50d0bb1d97b81b2015186`.
 - Fix-round source test correction: `7911d48d732a23c79d7b0954f5faf80fb3761f52`.
+- Final-review source test correction: `73378004988d78af740ace34e1ccae5beb615581`.
 - Prior report commits: `0f711bf03eecf009980de96e8b4990fb5de9389a`, `ddc35eab9aff4955d11b8ac1d54d5557c4bbaa8f`.
 - Report commit state: containing commit; resolve with `rtk git log -1 --format=%H -- .superpowers/sdd/agent-voice-pa-mvp-plan/task-7d1-report.md` after this report is committed.
 - Reviewer: pending controller review.
