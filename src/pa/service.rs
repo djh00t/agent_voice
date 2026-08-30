@@ -1031,6 +1031,7 @@ mod tests {
             .expect_err("store failure must be surfaced");
 
         assert!(matches!(error, ServiceError::Store(StoreError::Sqlite(_))));
+        assert_eq!(appointment_quote_row_count(&store), 0);
         assert_eq!(
             outlook_control
                 .invocation_count(FakeOperation::CalendarBusy)
