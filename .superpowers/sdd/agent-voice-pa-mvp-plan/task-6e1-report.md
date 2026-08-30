@@ -5,12 +5,11 @@
 - **Feature:** [#138](https://github.com/djh00t/agent_voice/issues/138)
 - **Prerequisite:** merged [#210](https://github.com/djh00t/agent_voice/issues/210)
 - **Package:** `task-6e1`
-- **Evidence date:** 2026-08-30 (Australia/Sydney)
+- **Evidence date:** 2026-08-31 (Australia/Sydney)
 - **Worktree:** `/private/tmp/agent-voice-pa-06e1-owner-prepare`
 - **Branch:** `codex/agent-voice-pa-06e1-owner-prepare`
-- **Base at implementation:** `a559829` (`origin/main` before the later main-line rebase)
-- **Rebased onto:** `57643df` (current `origin/main`)
-- **Implementation commit:** `4ed1bc3`
+- **Base:** `76e8df4` (current `origin/main`)
+- **Implementation commit:** `260e501` (rebased onto the current base)
 
 ## Scope
 
@@ -84,11 +83,13 @@ typo or unrelated baseline error.
 | `rtk cargo test --lib pa::service::tests::prepare_owner_task -- --nocapture` | PASS — 5 passed |
 | `rtk cargo test --lib pa::store::tests::owner_task -- --nocapture` | PASS — 9 passed |
 | `rtk cargo test --lib pa::service::tests -- --nocapture` | PASS — 51 passed |
-| `rtk cargo test --lib -- --nocapture` | PASS — 505 passed |
+| `rtk cargo test --lib` | PASS — 515 passed |
+| `rtk cargo test --all-targets` | PASS — 515 passed (2 suites) |
+| `rtk make check` | PASS — all repository checks completed |
 | `rtk cargo clippy --all-targets --all-features -- -D warnings` | PASS — no reported errors |
 | `rtk rustfmt --edition 2024 --check src/pa/service.rs` | PASS |
 | `rtk cargo doc --no-deps --all-features` | PASS — no reported errors |
-| `rtk git diff --check` | PASS |
+| `rtk git diff --check origin/main...HEAD` | PASS |
 
 The focused owner tests also exercise the existing fake controls and assert
 zero calendar operations. The race test uses two file-backed `PaStore`
@@ -117,13 +118,13 @@ both service calls return the same result.
   deployment, publication, authenticated UAT, or live-provider evidence.
 - The later owner-task submission/provider package remains responsible for
   consuming this projection and performing any external calendar mutation.
-- Rollback is a code revert of `4ed1bc3`; no database deletion or remote
+- Rollback is a code revert of `260e501`; no database deletion or remote
   provider cleanup is inferred or attempted.
 
 ## Completion evidence
 
 - **Implementer:** delegated service lane for #212
-- **Implementation commit:** `4ed1bc3`
+- **Implementation commit:** `260e501`
 - **Report commit:** added separately after implementation
 - **PR/push:** not created or pushed, per task instruction
 - **Reviewer:** pending independent review
