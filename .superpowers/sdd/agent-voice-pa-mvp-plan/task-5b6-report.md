@@ -52,13 +52,13 @@ against the current Task 5 provider/fake sources.
 
 ```text
 rtk cargo test --lib pa::fakes::contract_tests -- --nocapture
-cargo test: 8 passed, 426 filtered out (1 suite, 0.00s)
+cargo test: 8 passed, 428 filtered out (1 suite, 0.00s)
 
 rtk cargo test --lib pa::fakes -- --nocapture
-cargo test: 109 passed, 325 filtered out (1 suite, 0.01s)
+cargo test: 109 passed, 327 filtered out (1 suite, 0.01s)
 
 rtk cargo test --lib
-cargo test: 434 passed (1 suite, 7.59s)
+cargo test: 436 passed (2 suites, 7.30s)
 
 rtk cargo test --doc
 cargo test: 3 passed (1 suite, 2.16s)
