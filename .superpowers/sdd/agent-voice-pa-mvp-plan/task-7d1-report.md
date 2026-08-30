@@ -60,6 +60,18 @@ nonzero RED remains recorded above.
 
 After the round-2 source follow-up commit, all four exact selectors exited `0`, each with `1 passed; 513 filtered out`. `rtk rustfmt --edition 2024 --check src/pa/store.rs` exited `0`; unscoped `rtk git diff --check` exited `0`; and a fresh `rtk make check` exited `0`, including the observed `514`-test suite, Clippy, rustdoc, and locked website checks.
 
+## Round-3 pull-request review remediation
+
+Codex review on PR #273 correctly identified that `NOT NULL` alone accepted
+blank durable identities. The focused constraint selector first exited `101`
+with `empty scope was accepted`. Source-only commit `7a874473ae32d179d9f5068dfafe81afe7bb91c9`
+adds trimmed non-blank checks for scope, idempotency key, and fingerprint and
+covers empty and whitespace-only values for all three fields. All four exact
+schema selectors then exited `0`; a fresh controller `rtk make check` exited
+`0` with 514 tests, three compile-fail doctests, Clippy, rustdoc, and the
+locked website build. The separate cumulative-diff commit-splitting finding
+was answered with GitHub metadata proving every PR commit changes one file.
+
 ## Evidence records
 
 | evidence_id | order | command | expected_exit | observed_exit | selector_or_diagnostic | evidence_tier | status | artifact_ref | non_claim | reviewer |
@@ -73,6 +85,8 @@ After the round-2 source follow-up commit, all four exact selectors exited `0`, 
 | EV-13F-06 | 6 | `rtk git diff --check -- src/pa/store.rs` | 0 | 0 | owned source whitespace | STATIC | CONFIRMED | `NONE` | does not prove semantic review by another person | NONE |
 | EV-13F-07 | 7 | `rtk git diff --check` | 0 | 0 | unscoped repository whitespace | STATIC | CONFIRMED | `NONE` | does not prove excluded untracked artifacts are safe | NONE |
 | EV-13F-08 | 8 | `rtk make check` | 0 | 0 | 514-test suite, Clippy, rustdoc, docs | LOCAL | CONFIRMED | `NONE` | does not prove CI, live, provider, OAuth, cluster, or UAT behavior | NONE |
+| EV-13F-09 | 9 | `rtk cargo test --lib pa::store::tests::http_idempotency_v14_constraints_reject_invalid_rows -- --exact` | nonzero then 0 | 101 then 0 | empty and whitespace-only scope/key/fingerprint rejected | LOCAL | CONFIRMED | `7a874473ae32d179d9f5068dfafe81afe7bb91c9` | does not prove runtime decoding or reservation behavior | Codex PR review |
+| EV-13F-10 | 10 | `rtk make check` | 0 | 0 | post-review 514-test suite, compile-fail doctests, Clippy, rustdoc, docs | LOCAL | CONFIRMED | `7a874473ae32d179d9f5068dfafe81afe7bb91c9` | does not prove current-head CI or live behavior | controller |
 
 ## Round-1 findings and resolutions
 
@@ -94,7 +108,11 @@ After the round-2 source follow-up commit, all four exact selectors exited `0`, 
 ## Schema and scope review
 
 - `CURRENT_SCHEMA_VERSION` is 14 and v13 remains an explicit preceding migration.
-- v14 creates `http_idempotency_records` with required scope/key/fingerprint/state/generation/lease fields, the unique `(scope, idempotency_key)` invariant, explicit in-progress/completed response nullability/status/content-type checks, and `idx_http_idempotency_records_lease_until`.
+- v14 creates `http_idempotency_records` with required, trimmed non-blank
+  scope/key/fingerprint fields, state/generation/lease fields, the unique
+  `(scope, idempotency_key)` invariant, explicit in-progress/completed response
+  nullability/status/content-type checks, and
+  `idx_http_idempotency_records_lease_until`.
 - Migration execution remains transactional through the existing migration runner; `schema_migrations` records version 14 once.
 - Source diff is limited to v14 registration/body, four v14 schema tests with
   strengthened structural/partial/reopen assertions, and the two existing
@@ -108,10 +126,14 @@ Malformed schema assumptions, failed constraints, duplicate migration/index, une
 
 - `LOCAL`: RED, focused tests, rustfmt, diff check, and `rtk make check` above.
 - `STATIC`: source diff and schema/scope review; independent reviewer still required.
-- `CI`: `UNEXECUTED`; no CI run was produced here.
+- `CI`: the pre-remediation PR head passed five checks; current-head CI and
+  re-review were triggered after `7a874473` and remain required before handoff.
 - `LIVE`: `UNEXECUTED`; no deployment, provider, OAuth, cluster, or UAT evidence exists or is claimed.
 
-Residual gates: #255 must be merged/verified before delivery; independent review and current-base rerun remain required; #269 and later transition packages remain separate. The issue/PR lifecycle was not changed by this work, and no PR was created or pushed.
+Residual gates: #255/PR #265 must be merged and verified before delivery;
+current-head CI and re-review must pass; rebase/retarget and current-base rerun
+remain required after the prerequisite merges; #269 and later transition
+packages remain separate. PR #273 is pushed, open, and stacked on PR #265.
 
 ## Reviewer and lifecycle
 
@@ -122,6 +144,7 @@ Controller review must verify the exact base/stack, one-file source commit, migr
 - Implementer: isolated stack owner; exact identity not recorded.
 - Source commit: `25a905225f34641699d5fa08fc3da3110ca6e2c6`.
 - Round-2 source follow-up: `25074b38e5a0e0bfe9c2505bb669badddbc740e7`.
+- Round-3 source remediation: `7a874473ae32d179d9f5068dfafe81afe7bb91c9`.
 - Prior report commits: `0f711bf03eecf009980de96e8b4990fb5de9389a`, `ddc35eab9aff4955d11b8ac1d54d5557c4bbaa8f`.
 - Report commit state: containing commit; resolve with `rtk git log -1 --format=%H -- .superpowers/sdd/agent-voice-pa-mvp-plan/task-7d1-report.md` after this report is committed.
 - Reviewer: pending controller review.
