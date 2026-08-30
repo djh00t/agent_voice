@@ -8,6 +8,7 @@
 - **Branch:** `codex/agent-voice-pa-06-service-layer`
 - **Implementation commits:** `bb10f2d`, `1512f9e`, `3a9180c`
 - **Evidence commit:** `687567e`
+- **Review remediation commits:** `3a9180c`, `fbd03fd`
 
 ## Prerequisite evidence
 
@@ -163,6 +164,15 @@ The implementation is ready for the package PR review boundary. This report
 does not self-approve the code and does not claim remote review or workflow
 results.
 
+### Phase-stack assembly note
+
+Task 6 is delivered as one phase-level stacked PR rather than a standalone
+Task 6c1 PR. Fresh review occurred after Task 6c2 commit `e8ab117` had been
+assembled, so Task 6c1 remediation commits `3a9180c` and `fbd03fd` follow that
+commit in branch history. Their diffs remain one-file and reference only #178,
+but rollback must use the complete Task 6 phase PR so the intervening Task 6c2
+commit and its evidence are not orphaned.
+
 The next dependency is [#179](https://github.com/djh00t/agent_voice/issues/179)
 (`Task 6c2`, prepare request service boundary), which depends on this facade
 and the atomic prepare contract from #176. It must load the durable quote,
@@ -178,9 +188,10 @@ calls.
   behavior was exercised.
 - **Backup/retention/observability:** owned by later packages and not claimed
   here.
-- **Rollback:** revert the complete Task 6c1 PR, including `bb10f2d`,
-  `1512f9e`, `687567e`, and `3a9180c`, if the service facade must be withdrawn;
-  no provider-side data is created by these commits.
+- **Rollback:** revert the complete Task 6 phase PR, including the intervening
+  Task 6c2 commits, if the service facade must be withdrawn. The Task 6c1-owned
+  set is `bb10f2d`, `1512f9e`, `687567e`, `3a9180c`, and `fbd03fd`; no
+  provider-side data is created by these commits.
 
 ## PR linkage and completion evidence
 
@@ -191,7 +202,7 @@ Closes #178
 ```
 
 It must also reference feature #138 and identify commits `bb10f2d`, `1512f9e`,
-`687567e`, and `3a9180c`. Issue #178 should remain open until that linked PR is reviewed,
+`687567e`, `3a9180c`, and `fbd03fd`. Issue #178 should remain open until that linked PR is reviewed,
 all findings are resolved, CI is green, and the PR is merged.
 
 **Package status:** `status:review` / locally verified; CI and LIVE remain
@@ -200,7 +211,7 @@ explicitly unverified.
 ## Completion evidence record
 
 - **Implementer:** Task 6c1 implementation lane
-- **Commits:** `bb10f2d`, `1512f9e`, `687567e`, `3a9180c`
+- **Commits:** `bb10f2d`, `1512f9e`, `687567e`, `3a9180c`, `fbd03fd`
 - **PR:** to be opened with `Closes #178`
 - **Commands/results:** listed in the LOCAL evidence table
 - **Reviewer:** pending independent review
