@@ -85,7 +85,7 @@ typo or unrelated baseline error.
 | `rtk cargo test --lib pa::service::tests -- --nocapture` | PASS — 51 passed |
 | `rtk cargo test --lib` | PASS — 515 passed |
 | `rtk cargo test --all-targets` | PASS — 515 passed (2 suites) |
-| `rtk make check` | PASS — all repository checks completed |
+| `rtk make docs-install && rtk make check` (controller, head `a627b94`) | PASS — 515 library tests, 3 compile-fail doctests, strict Clippy, Rust docs, and Docusaurus |
 | `rtk cargo clippy --all-targets --all-features -- -D warnings` | PASS — no reported errors |
 | `rtk rustfmt --edition 2024 --check src/pa/service.rs` | PASS |
 | `rtk cargo doc --no-deps --all-features` | PASS — no reported errors |
@@ -95,6 +95,9 @@ The focused owner tests also exercise the existing fake controls and assert
 zero calendar operations. The race test uses two file-backed `PaStore`
 connections and verifies one durable draft and one durable placement after
 both service calls return the same result.
+
+The controller's `npm ci` docs setup reported 24 existing advisories (7
+moderate, 17 high). This package makes no dependency changes.
 
 ## Security and failure review
 
@@ -114,8 +117,11 @@ both service calls return the same result.
 
 ## Non-claims and residual gates
 
-- Evidence is LOCAL only. This report does not claim CI, peer review,
-  deployment, publication, authenticated UAT, or live-provider evidence.
+- Evidence is LOCAL/controller plus independent final review. This report does
+  not claim deployment, publication, authenticated UAT, or live-provider
+  evidence.
+- Independent final review: SPEC PASS and QUALITY PASS, with no residual P0-P3
+  findings.
 - The later owner-task submission/provider package remains responsible for
   consuming this projection and performing any external calendar mutation.
 - Rollback is a code revert of `260e501`; no database deletion or remote
@@ -126,7 +132,8 @@ both service calls return the same result.
 - **Implementer:** delegated service lane for #212
 - **Implementation commit:** `260e501`
 - **Report commit:** added separately after implementation
-- **PR/push:** not created or pushed, per task instruction
-- **Reviewer:** pending independent review
-- **Residual LIVE gates:** CI, review, deployment, authenticated UAT, and
-  live-provider verification
+- **PR/push:** pending controller publication
+- **Reviewer:** independent final review complete — SPEC PASS, QUALITY PASS,
+  no residual P0-P3 findings
+- **Residual gates:** controller publication, deployment, authenticated UAT,
+  and live-provider verification
