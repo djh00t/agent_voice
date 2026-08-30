@@ -204,3 +204,127 @@ fn debug_and_error_redact_sentinels() {
         assert!(!debug.contains(SENTINEL), "leaked sentinel: {debug}");
     }
 }
+
+#[test]
+fn timestamp_applies_full_gregorian_leap_year_rules() {
+    for (timestamp, valid) in [
+        ("20230229T000000Z", false),
+        ("20240229T000000Z", true),
+        ("21000229T000000Z", false),
+        ("20000229T000000Z", true),
+    ] {
+        let mut headers = fixture_headers();
+        replace_header(&mut headers, "x-amz-date", timestamp);
+        let result = sign_request(&fixture_request(headers), &fixture_credentials(), timestamp);
+        assert_eq!(result.is_ok(), valid, "unexpected validity for {timestamp}");
+    }
+}
+
+#[test]
+fn session_token_header_must_be_present_unique_and_exact() {
+    let token = "SESSION_TOKEN_SENTINEL";
+    let mut credentials = fixture_credentials();
+    credentials.session_token = Some(token.into());
+
+    let mut valid_headers = fixture_headers();
+    valid_headers.push(("x-amz-security-token".into(), token.into()));
+    assert!(
+        sign_request(
+            &fixture_request(valid_headers.clone()),
+            &credentials,
+            TIMESTAMP
+        )
+        .is_ok()
+    );
+
+    let mut missing_headers = fixture_headers();
+    let missing_error = sign_request(
+        &fixture_request(std::mem::take(&mut missing_headers)),
+        &credentials,
+        TIMESTAMP,
+    )
+    .unwrap_err();
+    assert_eq!(missing_error.kind, SigV4ErrorKind::MissingRequiredHeader);
+
+    let mut wrong_headers = valid_headers.clone();
+    replace_header(
+        &mut wrong_headers,
+        "x-amz-security-token",
+        "different-session-token",
+    );
+    let wrong_error =
+        sign_request(&fixture_request(wrong_headers), &credentials, TIMESTAMP).unwrap_err();
+    assert_eq!(wrong_error.kind, SigV4ErrorKind::InvalidCredential);
+
+    let mut duplicate_headers = valid_headers;
+    duplicate_headers.push(("X-Amz-Security-Token".into(), token.into()));
+    let duplicate_error =
+        sign_request(&fixture_request(duplicate_headers), &credentials, TIMESTAMP).unwrap_err();
+    assert_eq!(duplicate_error.kind, SigV4ErrorKind::DuplicateHeader);
+}
+
+#[test]
+fn preexisting_authorization_header_is_rejected() {
+    let mut headers = fixture_headers();
+    headers.push(("Authorization".into(), "preexisting-signature".into()));
+    let error =
+        sign_request(&fixture_request(headers), &fixture_credentials(), TIMESTAMP).unwrap_err();
+    assert_eq!(error.kind, SigV4ErrorKind::UnsupportedHeader);
+}
+
+#[test]
+fn required_signed_headers_cannot_be_omitted() {
+    for missing_name in ["host", "x-amz-content-sha256", "x-amz-date"] {
+        let mut headers = fixture_headers();
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case(missing_name));
+        let error = canonical_request("GET", "/test.txt", &headers, PAYLOAD_HASH).unwrap_err();
+        assert_eq!(error.kind, SigV4ErrorKind::MissingRequiredHeader);
+    }
+}
+
+#[test]
+fn mutation_of_any_signed_value_changes_signature() {
+    let credentials = fixture_credentials();
+    let baseline = sign_request(&fixture_request(fixture_headers()), &credentials, TIMESTAMP)
+        .expect("baseline")
+        .authorization;
+
+    let mut host = fixture_request(fixture_headers());
+    replace_header(&mut host.headers, "host", "otherbucket.s3.amazonaws.com");
+    let host_signature = sign_request(&host, &credentials, TIMESTAMP)
+        .expect("host mutation")
+        .authorization;
+    assert_ne!(host_signature, baseline);
+
+    let mut range = fixture_request(fixture_headers());
+    replace_header(&mut range.headers, "range", "bytes=1-9");
+    let range_signature = sign_request(&range, &credentials, TIMESTAMP)
+        .expect("range mutation")
+        .authorization;
+    assert_ne!(range_signature, baseline);
+
+    let mut payload = fixture_request(fixture_headers());
+    let changed_hash = "0".repeat(64);
+    payload.payload_sha256 = changed_hash.clone();
+    replace_header(&mut payload.headers, "x-amz-content-sha256", &changed_hash);
+    let payload_signature = sign_request(&payload, &credentials, TIMESTAMP)
+        .expect("payload mutation")
+        .authorization;
+    assert_ne!(payload_signature, baseline);
+
+    let changed_timestamp = "20130524T000001Z";
+    let mut date = fixture_request(fixture_headers());
+    replace_header(&mut date.headers, "x-amz-date", changed_timestamp);
+    let date_signature = sign_request(&date, &credentials, changed_timestamp)
+        .expect("date mutation")
+        .authorization;
+    assert_ne!(date_signature, baseline);
+}
+
+fn replace_header(headers: &mut [(String, String)], name: &str, value: &str) {
+    let (_, current_value) = headers
+        .iter_mut()
+        .find(|(current_name, _)| current_name.eq_ignore_ascii_case(name))
+        .expect("header exists");
+    *current_value = value.into();
+}
