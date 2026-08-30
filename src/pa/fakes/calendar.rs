@@ -510,27 +510,25 @@ impl CalendarReadProvider for FakeCalendarRead {
             for change in state.changes.iter().take(start) {
                 remember_change_range(change, &mut prior_event_ranges);
             }
-            let matching_positions: Vec<_> = state
-                .changes
-                .iter()
-                .enumerate()
-                .skip(start)
-                .filter_map(|(position, change)| {
-                    change_matches_time_range(change, &time_range, &mut prior_event_ranges)
-                        .then_some(position)
-                })
-                .collect();
-            let available = matching_positions.len();
+            let mut matching_changes = Vec::new();
+            for (position, change) in state.changes.iter().enumerate().skip(start) {
+                if let Some(change) =
+                    change_for_sync(change, &time_range, &mut prior_event_ranges)?
+                {
+                    matching_changes.push((position, change));
+                }
+            }
+            let available = matching_changes.len();
             let page_count = available.min(limit);
             let failure_after = partial_after.filter(|after| *after < page_count);
             let successful_count = failure_after.unwrap_or(page_count);
-            let items = matching_positions[..successful_count]
+            let items = matching_changes[..successful_count]
                 .iter()
-                .map(|position| state.changes[*position].clone())
+                .map(|(_, change)| change.clone())
                 .collect();
             let item_failures = match failure_after {
                 Some(_) => {
-                    let failed = &state.changes[matching_positions[successful_count]];
+                    let failed = &state.changes[matching_changes[successful_count].0];
                     vec![ProviderItemFailure::new(
                         FAILURE_SOURCE_ID,
                         failed.provider_event_id(),
@@ -540,10 +538,10 @@ impl CalendarReadProvider for FakeCalendarRead {
                 None => Vec::new(),
             };
             let next_position = failure_after
-                .map(|_| matching_positions[successful_count])
+                .map(|_| matching_changes[successful_count].0)
                 .or_else(|| {
                     (page_count < available)
-                        .then(|| matching_positions[page_count - 1].saturating_add(1))
+                        .then(|| matching_changes[page_count - 1].0.saturating_add(1))
                 });
             let next_cursor = next_position
                 .filter(|position| *position < state.changes.len())
@@ -1019,27 +1017,41 @@ fn remember_change_range(change: &CalendarChange, event_ranges: &mut BTreeMap<St
     }
 }
 
-fn change_matches_time_range(
+fn change_for_sync(
     change: &CalendarChange,
     requested_range: &TimeRange,
     event_ranges: &mut BTreeMap<String, TimeRange>,
-) -> bool {
+) -> ProviderResult<Option<CalendarChange>> {
     if let Some(event) = change.event() {
+        let was_matching = event_ranges
+            .get(event.provider_event_id())
+            .is_some_and(|range| ranges_overlap(range, requested_range));
         let matches = ranges_overlap(event.time_range(), requested_range);
         event_ranges.insert(
             event.provider_event_id().to_owned(),
             event.time_range().clone(),
         );
-        return matches;
+        if matches {
+            return Ok(Some(change.clone()));
+        }
+        if was_matching {
+            return CalendarChange::deleted(
+                event.provider_event_id(),
+                event.last_modified_at(),
+            )
+            .map(Some);
+        }
+        return Ok(None);
     }
 
     // A deletion tombstone has no event window. When its preceding upsert is
     // known, scope it to that event's window; otherwise retain it as an
     // unscoped invalidation signal so a consumer cannot miss the deletion.
-    event_ranges
+    Ok(event_ranges
         .remove(change.provider_event_id())
         .map(|event_range| ranges_overlap(&event_range, requested_range))
         .unwrap_or(true)
+        .then_some(change.clone()))
 }
 
 fn ranges_overlap(left: &TimeRange, right: &TimeRange) -> bool {
@@ -1117,6 +1129,26 @@ mod tests {
                 Rsvp::Accepted,
             )
             .expect("attendee")],
+            now(),
+        )
+        .expect("event");
+        CalendarChange::upsert(event).expect("upsert")
+    }
+
+    fn event_change_with_range(
+        id: &str,
+        operation_key: &str,
+        title: &str,
+        start: &str,
+        end: &str,
+    ) -> CalendarChange {
+        let event = CalendarEvent::new(
+            id,
+            operation_key,
+            title,
+            range(start, end),
+            "Australia/Sydney",
+            std::iter::empty::<CalendarAttendee>(),
             now(),
         )
         .expect("event");
@@ -1311,6 +1343,69 @@ mod tests {
             .await
             .expect("same filtered cursor retry");
         assert_eq!(retry, second);
+    }
+
+    #[tokio::test]
+    async fn sync_emits_invalidation_when_event_moves_outside_window() {
+        let fake = FakeCalendarRead::new(
+            FakeControl::new(now()),
+            Vec::<BusyInterval>::new(),
+            [
+                event_change_with_range(
+                    "moving-event",
+                    "moving-operation",
+                    "Inside",
+                    "2026-08-29T10:00:00Z",
+                    "2026-08-29T10:30:00Z",
+                ),
+                event_change_with_range(
+                    "moving-event",
+                    "moving-operation",
+                    "Moved outside",
+                    "2026-08-29T12:00:00Z",
+                    "2026-08-29T12:30:00Z",
+                ),
+                change("moving-event", "2026-08-29T12:31:00Z"),
+            ],
+        );
+        let request = |cursor: Option<String>, limit| {
+            CalendarSyncRequest::new(
+                range("2026-08-29T09:00:00Z", "2026-08-29T11:00:00Z"),
+                cursor,
+                limit,
+            )
+            .expect("request")
+        };
+
+        let first = fake
+            .sync_calendar(&session(), &request(None, 1))
+            .await
+            .expect("initial page");
+        assert_eq!(first.items().len(), 1);
+        assert!(first.items()[0].is_upsert());
+        let cursor = first.next_cursor().expect("move cursor").to_owned();
+
+        let second = fake
+            .sync_calendar(&session(), &request(Some(cursor.clone()), 1))
+            .await
+            .expect("invalidation page");
+        assert_eq!(second.items().len(), 1);
+        assert!(second.items()[0].is_deleted());
+        assert_eq!(second.items()[0].provider_event_id(), "moving-event");
+        assert_eq!(second.next_cursor(), None);
+        assert_eq!(
+            fake.sync_calendar(&session(), &request(Some(cursor), 1))
+                .await
+                .expect("same-cursor retry"),
+            second
+        );
+
+        let all = fake
+            .sync_calendar(&session(), &request(None, 10))
+            .await
+            .expect("full history");
+        assert_eq!(all.items().len(), 2);
+        assert!(all.items()[1].is_deleted());
     }
 
     #[tokio::test]
