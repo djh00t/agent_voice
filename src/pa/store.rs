@@ -9152,7 +9152,7 @@ END;
             insert(
                 Some("scope"),
                 Some("bad-state"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "unknown",
                 1,
                 Some(1_700_000_000_i64),
@@ -9166,7 +9166,7 @@ END;
             insert(
                 Some("scope"),
                 Some("in-progress-status-only"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "in_progress",
                 1,
                 Some(1_700_000_000_i64),
@@ -9180,7 +9180,7 @@ END;
             insert(
                 Some("scope"),
                 Some("in-progress-content-type-only"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "in_progress",
                 1,
                 Some(1_700_000_000_i64),
@@ -9194,7 +9194,7 @@ END;
             insert(
                 Some("scope"),
                 Some("in-progress-body-only"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "in_progress",
                 1,
                 Some(1_700_000_000_i64),
@@ -9208,7 +9208,7 @@ END;
             insert(
                 Some("scope"),
                 Some("bad-generation"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "in_progress",
                 0,
                 Some(1_700_000_000_i64),
@@ -9222,7 +9222,7 @@ END;
             insert(
                 None,
                 Some("missing-scope"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "in_progress",
                 1,
                 Some(1_700_000_000_i64),
@@ -9236,7 +9236,7 @@ END;
             insert(
                 Some("scope"),
                 None,
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "in_progress",
                 1,
                 Some(1_700_000_000_i64),
@@ -9264,7 +9264,7 @@ END;
             insert(
                 Some("scope"),
                 Some("missing-lease"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "in_progress",
                 1,
                 None,
@@ -9279,13 +9279,13 @@ END;
                 "empty scope",
                 Some(""),
                 Some("empty-scope-key"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
             ),
             (
                 "whitespace-only scope",
                 Some("   "),
                 Some("whitespace-scope-key"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
             ),
             (
                 "empty idempotency key",
@@ -9315,37 +9315,37 @@ END;
                 "tab-only scope",
                 Some("\t"),
                 Some("tab-scope-key"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
             ),
             (
                 "newline-only scope",
                 Some("\n"),
                 Some("newline-scope-key"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
             ),
             (
                 "non-breaking-space-only scope",
                 Some("\u{00a0}"),
                 Some("nbsp-scope-key"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
             ),
             (
                 "tab-only idempotency key",
                 Some("scope"),
                 Some("\t"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
             ),
             (
                 "newline-only idempotency key",
                 Some("scope"),
                 Some("\n"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
             ),
             (
                 "non-breaking-space-only idempotency key",
                 Some("scope"),
                 Some("\u{00a0}"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
             ),
             (
                 "tab-only fingerprint",
@@ -9386,7 +9386,7 @@ END;
             insert(
                 Some("scope"),
                 Some("in-progress-response"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "in_progress",
                 1,
                 Some(1_700_000_000_i64),
@@ -9400,7 +9400,7 @@ END;
             insert(
                 Some("scope"),
                 Some("completed-status-null"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "completed",
                 1,
                 Some(1_700_000_000_i64),
@@ -9414,7 +9414,7 @@ END;
             insert(
                 Some("scope"),
                 Some("completed-type-null"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "completed",
                 1,
                 Some(1_700_000_000_i64),
@@ -9428,7 +9428,7 @@ END;
             insert(
                 Some("scope"),
                 Some("completed-body-null"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "completed",
                 1,
                 Some(1_700_000_000_i64),
@@ -9442,7 +9442,7 @@ END;
             insert(
                 Some("scope"),
                 Some("completed-status-low"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "completed",
                 1,
                 Some(1_700_000_000_i64),
@@ -9456,7 +9456,7 @@ END;
             insert(
                 Some("scope"),
                 Some("completed-status-high"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "completed",
                 1,
                 Some(1_700_000_000_i64),
@@ -9470,7 +9470,7 @@ END;
             insert(
                 Some("scope"),
                 Some("completed-type-invalid"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "completed",
                 1,
                 Some(1_700_000_000_i64),
@@ -9522,7 +9522,7 @@ END;
             insert(
                 Some("scope"),
                 Some("in-progress"),
-                Some("fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
                 "in_progress",
                 1,
                 Some(1_700_000_000_i64),
@@ -9601,7 +9601,11 @@ END;
         for (label, index, value) in [
             ("scope", 0, Value::Blob(b"scope".to_vec())),
             ("idempotency key", 1, Value::Blob(b"key".to_vec())),
-            ("fingerprint", 2, Value::Blob(b"fingerprint".to_vec())),
+            (
+                "fingerprint",
+                2,
+                Value::Blob(VALID_HTTP_FINGERPRINT.as_bytes().to_vec()),
+            ),
             ("state", 3, Value::Blob(b"in_progress".to_vec())),
             ("lease generation", 4, Value::Text("abc".to_owned())),
             ("lease until", 5, Value::Blob(b"1700000000".to_vec())),
