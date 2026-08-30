@@ -185,6 +185,30 @@ review, LIVE/provider/OAuth/cluster/UAT evidence, and the prerequisite
 #265/#255 merge followed by rebase/retarget and current-base rerun remain
 required gates.
 
+## Final review follow-up: key-specific fixture masking
+
+The re-review found that the two non-fingerprint-specific empty and
+whitespace-only idempotency-key fixtures still used short literals
+(`"empty-key-fingerprint"` and `"whitespace-key-fingerprint"`). Those values
+fail the fingerprint constraint first and could mask the intended key
+constraint. The required invalid-row selector passed before the correction;
+this was a fixture-proof correction, not RED evidence.
+
+Source-only commit `15eb56e` replaces both literals with
+`VALID_HTTP_FINGERPRINT`. A search/readback of the v14 fixture block found no
+other non-fingerprint-specific case with a short literal fingerprint. The
+explicit tab/newline/non-breaking-space fingerprint cases and embedded-NUL
+invalid-fingerprint suffix remain intentionally invalid.
+
+At `2026-08-31T06:37:51+1000`, all seven exact v14 selectors exited `0`, each
+with `1 passed; 516 filtered out`; scoped
+`rtk rustfmt --edition 2024 --check src/pa/store.rs` and
+`rtk git diff --check` exited `0`; and a fresh `rtk make check` exited `0`.
+The unscoped `cargo fmt -- --check` reports pre-existing formatting drift in
+unrelated files; no such drift is present in the owned source file. This is
+LOCAL/STATIC evidence only and does not claim CI, LIVE, provider, OAuth,
+cluster, or UAT evidence.
+
 ## Evidence records
 
 | evidence_id | order | command | expected_exit | observed_exit | selector_or_diagnostic | evidence_tier | status | artifact_ref | non_claim | reviewer |
@@ -213,6 +237,8 @@ required gates.
 | EV-13F-21 | 21 | `rtk make check` | 0 | 0 | fresh 517-test suite, lint, rustdoc, and documentation checks | LOCAL | CONFIRMED | `7911d48d732a23c79d7b0954f5faf80fb3761f52` | does not prove CI, live, provider, OAuth, cluster, or UAT behavior | NONE |
 | EV-13F-22 | 22 | temporary assertion in `http_idempotency_v14_constraints_reject_invalid_rows` with otherwise-valid row and literal `"fingerprint"` | 0 | 0 | the literal independently violates the fingerprint schema constraint; focused masking proof only | LOCAL | CONFIRMED | `73378004988d78af740ace34e1ccae5beb615581` | is not RED evidence and does not prove the corrected fixtures exercise every intended constraint | final review |
 | EV-13F-23 | 23 | seven exact v14 selectors; scoped rustfmt/diff check; `rtk make check` | 0 | 0 | isolated valid fingerprint fixtures; 517 tests plus Clippy, rustdoc, and website checks | LOCAL/STATIC | CONFIRMED | `73378004988d78af740ace34e1ccae5beb615581` | does not prove current-head CI, independent review, live, provider, OAuth, cluster, or UAT behavior | final review |
+| EV-13F-24 | 24 | `rtk cargo test --lib pa::store::tests::http_idempotency_v14_constraints_reject_invalid_rows -- --exact` before fixture correction | 0 | 0 | baseline invalid-row selector passed; correction was not RED evidence | LOCAL | CONFIRMED | `NONE` | does not prove the masked fixture exercised key validation | final re-review |
+| EV-13F-25 | 25 | seven exact v14 selectors; scoped rustfmt; `rtk git diff --check`; `rtk make check` | 0 | 0 | empty/whitespace key fixtures use `VALID_HTTP_FINGERPRINT`; no other short non-fingerprint fixture found; 517-test full gate passed | LOCAL/STATIC | CONFIRMED | `15eb56e` | does not prove current-head CI, independent review, live, provider, OAuth, cluster, or UAT behavior | final re-review |
 
 ## Round-1 findings and resolutions
 
@@ -278,6 +304,7 @@ Controller review must verify the exact base/stack, one-file source commit, migr
 - Round-6 source remediation: `c64dd7f2c3f77c18155b428fd66670965776eb06`.
 - Round-7 source remediation: `50f88723c06886b35610cc865d56249dda619191`.
 - Round-8 source remediation: `7ac5cef77b35a8c552e50d0bb1d97b81b2015186`.
+- Final review fixture correction: `15eb56e`.
 - Fix-round source test correction: `7911d48d732a23c79d7b0954f5faf80fb3761f52`.
 - Final-review source test correction: `73378004988d78af740ace34e1ccae5beb615581`.
 - Prior report commits: `0f711bf03eecf009980de96e8b4990fb5de9389a`, `ddc35eab9aff4955d11b8ac1d54d5557c4bbaa8f`.
