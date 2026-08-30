@@ -13061,8 +13061,8 @@ END;
                 first_start.as_str(),
                 second_start.as_str(),
             ] {
-                assert!(!display.contains(secret), "display leaked {secret}");
-                assert!(!debug.contains(secret), "debug leaked {secret}");
+                assert!(!display.contains(secret), "display leaked sensitive value");
+                assert!(!debug.contains(secret), "debug leaked sensitive value");
             }
 
             let check = PaStore::open(&database.path, DATABASE_KEY).expect("reopen winner store");
@@ -13305,12 +13305,12 @@ END;
                 ] {
                     assert!(
                         !display.contains(secret),
-                        "{}: display leaked {secret}",
+                        "{}: display leaked sensitive value",
                         case.label
                     );
                     assert!(
                         !debug.contains(secret),
-                        "{}: debug leaked {secret}",
+                        "{}: debug leaked sensitive value",
                         case.label
                     );
                 }
@@ -13745,8 +13745,8 @@ END;
             "submit-concurrent-key-b",
             "proposal:submit-concurrent-key",
         ] {
-            assert!(!display.contains(secret), "display leaked {secret}");
-            assert!(!debug.contains(secret), "debug leaked {secret}");
+            assert!(!display.contains(secret), "display leaked sensitive value");
+            assert!(!debug.contains(secret), "debug leaked sensitive value");
         }
 
         let reopened = PaStore::open(&database.path, DATABASE_KEY).expect("reopen key race store");
@@ -13854,8 +13854,8 @@ END;
             "proposal:submit-concurrent-source-a",
             "proposal:submit-concurrent-source-b",
         ] {
-            assert!(!display.contains(secret), "display leaked {secret}");
-            assert!(!debug.contains(secret), "debug leaked {secret}");
+            assert!(!display.contains(secret), "display leaked sensitive value");
+            assert!(!debug.contains(secret), "debug leaked sensitive value");
         }
 
         let reopened =
@@ -19493,7 +19493,7 @@ END;
             "private@example.com",
             "private-draft-source",
         ] {
-            assert!(!debug.contains(secret), "debug redacts {secret}");
+            assert!(!debug.contains(secret), "debug redacts sensitive value");
         }
         assert!(debug.contains("Consumed"));
         assert!(debug.contains("1"));
