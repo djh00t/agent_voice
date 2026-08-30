@@ -511,21 +511,31 @@ fn validate_scope_date(date: &str) -> Result<(), SigV4Error> {
     if bytes.len() != 8 || !bytes.iter().all(u8::is_ascii_digit) {
         return Err(SigV4Error::new(SigV4ErrorKind::InvalidTimestamp));
     }
+    let year = four_digits(&bytes[..4]);
     let month = two_digits(&bytes[4..6]);
     let day = two_digits(&bytes[6..8]);
-    if month == 0 || month > 12 || day == 0 || day > days_in_month(two_digits(&bytes[..2]), month) {
+    if month == 0 || month > 12 || day == 0 || day > days_in_month(year, month) {
         return Err(SigV4Error::new(SigV4ErrorKind::InvalidTimestamp));
     }
     Ok(())
+}
+
+fn four_digits(bytes: &[u8]) -> u16 {
+    (bytes[0] - b'0') as u16 * 1_000
+        + (bytes[1] - b'0') as u16 * 100
+        + (bytes[2] - b'0') as u16 * 10
+        + (bytes[3] - b'0') as u16
 }
 
 fn two_digits(bytes: &[u8]) -> u8 {
     (bytes[0] - b'0') * 10 + bytes[1] - b'0'
 }
 
-fn days_in_month(year_suffix: u8, month: u8) -> u8 {
+fn days_in_month(year: u16, month: u8) -> u8 {
     match month {
-        2 if year_suffix.is_multiple_of(4) => 29,
+        2 if year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100)) => {
+            29
+        }
         2 => 28,
         4 | 6 | 9 | 11 => 30,
         _ => 31,
