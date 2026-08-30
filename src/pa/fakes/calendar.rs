@@ -39,6 +39,7 @@ struct CalendarState {
     google_proposal_create_drafts: Vec<GoogleProposalDraft>,
     google_proposal_events: Vec<CalendarEvent>,
     next_google_event_sequence: u64,
+    next_outlook_event_sequence: u64,
     /// Google busy contributions are keyed by provider event ID. This keeps
     /// event mutations/deletions independent of event-vector ordering.
     google_proposal_busy: BTreeMap<String, BusyInterval>,
@@ -94,6 +95,7 @@ impl FakeCalendarRead {
                 google_proposal_create_drafts: Vec::new(),
                 google_proposal_events: Vec::new(),
                 next_google_event_sequence: 1,
+                next_outlook_event_sequence: 1,
                 google_proposal_busy: BTreeMap::new(),
                 google_promotion_requests: Vec::new(),
                 deleted_google_proposal_ids: BTreeSet::new(),
@@ -149,10 +151,23 @@ impl FakeCalendarRead {
             return Err(ProviderError::Conflict);
         }
 
-        let provider_event_id = format!(
-            "{OUTLOOK_OWNER_EVENT_PREFIX}{}",
-            state.owner_events.len().saturating_add(1)
-        );
+        let mut sequence = state.next_outlook_event_sequence;
+        let provider_event_id = loop {
+            let candidate = format!("{OUTLOOK_OWNER_EVENT_PREFIX}{sequence}");
+            let already_used = state
+                .changes
+                .iter()
+                .any(|change| change.provider_event_id() == candidate.as_str())
+                || state
+                    .owner_events
+                    .iter()
+                    .any(|event| event.provider_event_id() == candidate.as_str());
+            if !already_used {
+                break candidate;
+            }
+            sequence = sequence.checked_add(1).ok_or(ProviderError::Unavailable)?;
+        };
+        let next_sequence = sequence.checked_add(1).ok_or(ProviderError::Unavailable)?;
         let event = CalendarEvent::new(
             provider_event_id,
             draft.operation_key(),
@@ -166,6 +181,7 @@ impl FakeCalendarRead {
         let change = CalendarChange::upsert(event.clone())?;
 
         state.owner_events.push(event.clone());
+        state.next_outlook_event_sequence = next_sequence;
         state.unkeyed_busy.push(busy);
         rebuild_busy(&mut state);
         state.changes.push(change);
@@ -3360,6 +3376,39 @@ mod tests {
             .expect("sync");
         assert_eq!(page.items().len(), 1);
         assert_eq!(page.items()[0].event(), Some(&event));
+    }
+
+    #[tokio::test]
+    async fn outlook_create_skips_seeded_owner_ids_and_syncs_distinct_identity() {
+        let control = FakeControl::new(now());
+        let fake = FakeOutlookCalendar::new(
+            control,
+            Vec::<BusyInterval>::new(),
+            [event_change(
+                "fake-outlook-owner-event-1",
+                "Seeded owner event",
+            )],
+        );
+        let created = fake
+            .create_owner_event(&session(), &owner_draft("outlook-sequence-1", "Focus time"))
+            .await
+            .expect("owner event");
+
+        assert_eq!(created.provider_event_id(), "fake-outlook-owner-event-2");
+        let page = fake
+            .sync_calendar(&session(), &sync_request())
+            .await
+            .expect("sync");
+        assert_eq!(page.items().len(), 2);
+        assert_eq!(
+            page.items()[0].provider_event_id(),
+            "fake-outlook-owner-event-1"
+        );
+        assert_eq!(
+            page.items()[1].provider_event_id(),
+            created.provider_event_id()
+        );
+        assert_eq!(page.items()[1].event(), Some(&created));
     }
 
     #[tokio::test]
