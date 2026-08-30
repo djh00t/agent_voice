@@ -1,8 +1,12 @@
-//! Inert boundary for the future OpenAI Realtime provider integration.
+//! Bounded value boundary for the OpenAI Realtime provider integration.
 //!
-//! The bootstrap boundary deliberately performs no I/O, payload processing,
-//! or legacy integration. Later packages may add value and dispatch modules
-//! without changing this module's side-effect-free registration contract.
+//! The registered values are provider-independent and deterministic. Loading
+//! this module performs no I/O, payload processing, or legacy integration;
+//! later event and dispatch packages can build on the same side-effect-free
+//! boundary.
+
+/// Bounded, provider-independent Realtime values and redacted errors.
+pub mod values;
 
 #[cfg(test)]
 mod tests {
