@@ -2390,6 +2390,12 @@ mod tests {
                 ),
             ]
         );
+        for original in &audits {
+            let reloaded = store
+                .load_audit_event_by_idempotency_key(original.idempotency_key())
+                .expect("audit reload");
+            assert_eq!(&reloaded, original);
+        }
 
         let stable_retry = service
             .submit_request(
@@ -2400,6 +2406,15 @@ mod tests {
             .await
             .expect("stable exact retry");
         assert_eq!(stable_retry, recovered);
+        let audits_after_retry = store.list_audit_events(None, 10).expect("audits");
+        assert_eq!(audits_after_retry, audits);
+        for (original, after_retry) in audits.iter().zip(&audits_after_retry) {
+            assert_eq!(after_retry, original);
+            let reloaded = store
+                .load_audit_event_by_idempotency_key(after_retry.idempotency_key())
+                .expect("audit reload after retry");
+            assert_eq!(&reloaded, original);
+        }
         assert_eq!(count("proposals"), 1);
         assert_eq!(count("event_mappings"), 1);
         assert_eq!(count("notification_outbox"), 2);
