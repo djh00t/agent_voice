@@ -642,7 +642,7 @@ impl fmt::Debug for StoredTask {
     }
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 13;
+const CURRENT_SCHEMA_VERSION: i64 = 14;
 const BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 struct Migration {
@@ -700,8 +700,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: apply_schema_v12,
     },
     Migration {
-        version: CURRENT_SCHEMA_VERSION,
+        version: 13,
         apply: apply_schema_v13,
+    },
+    Migration {
+        version: CURRENT_SCHEMA_VERSION,
+        apply: apply_schema_v14,
     },
 ];
 
@@ -7796,6 +7800,44 @@ ALTER TABLE configuration ADD COLUMN version INTEGER NOT NULL DEFAULT 1
     Ok(())
 }
 
+fn apply_schema_v14(transaction: &Transaction<'_>) -> StoreResult<()> {
+    transaction.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS http_idempotency_records (
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('in_progress', 'completed')),
+    lease_generation INTEGER NOT NULL CHECK (lease_generation > 0),
+    lease_until TEXT NOT NULL,
+    response_status INTEGER,
+    response_content_type TEXT,
+    response_body BLOB,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (scope, idempotency_key),
+    CHECK (
+      (state = 'in_progress'
+       AND response_status IS NULL
+       AND response_content_type IS NULL
+       AND response_body IS NULL)
+      OR
+      (state = 'completed'
+       AND response_status IS NOT NULL
+       AND response_status BETWEEN 200 AND 599
+       AND response_content_type IS NOT NULL
+       AND response_content_type = 'application/json'
+       AND response_body IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_http_idempotency_records_lease_until
+    ON http_idempotency_records(lease_until);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn normalize_legacy_audit_timestamp(value: &str) -> StoreResult<String> {
     let parsed = OffsetDateTime::parse(value, &Rfc3339)
         .map(|value| value.to_offset(time::UtcOffset::UTC))
@@ -8756,6 +8798,404 @@ END;
     }
 
     #[test]
+    fn http_idempotency_v14_migration_creates_schema() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let schema_version: i64 = store
+            .connection()
+            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("schema version");
+        assert_eq!(schema_version, 14);
+
+        let table_sql: String = store
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'http_idempotency_records'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("idempotency table");
+        assert!(table_sql.contains("UNIQUE (scope, idempotency_key)"));
+        assert!(table_sql.contains("state IN ('in_progress', 'completed')"));
+        assert_named_index(
+            &store,
+            "idx_http_idempotency_records_lease_until",
+            "http_idempotency_records",
+            &["lease_until"],
+        );
+    }
+
+    #[test]
+    fn http_idempotency_v14_migration_is_idempotent() {
+        let mut connection = keyed_connection_for_migration_test();
+        run_migrations_with(&mut connection, MIGRATIONS).expect("apply v14 schema");
+        run_migrations_with(&mut connection, MIGRATIONS).expect("reapply v14 schema");
+
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM schema_migrations WHERE version = 14",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v14 migration count");
+        assert_eq!(migration_count, 1);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'http_idempotency_records'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("idempotency table count");
+        assert_eq!(table_count, 1);
+        let index_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_http_idempotency_records_lease_until'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("lease index count");
+        assert_eq!(index_count, 1);
+    }
+
+    #[test]
+    fn http_idempotency_v14_constraints_reject_invalid_rows() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let insert = |scope: Option<&str>,
+                      key: Option<&str>,
+                      fingerprint: Option<&str>,
+                      state: &str,
+                      lease_generation: i64,
+                      lease_until: Option<&str>,
+                      response_status: Option<i64>,
+                      response_content_type: Option<&str>,
+                      response_body: Option<&[u8]>| {
+            store.connection().execute(
+                "INSERT INTO http_idempotency_records (
+                     scope, idempotency_key, fingerprint, state, lease_generation,
+                     lease_until, response_status, response_content_type, response_body
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    scope,
+                    key,
+                    fingerprint,
+                    state,
+                    lease_generation,
+                    lease_until,
+                    response_status,
+                    response_content_type,
+                    response_body,
+                ],
+            )
+        };
+
+        insert(
+            Some("scope"),
+            Some("in-progress"),
+            Some("fingerprint"),
+            "in_progress",
+            1,
+            Some("1700000000"),
+            None,
+            None,
+            None,
+        )
+        .expect("valid in-progress row");
+        insert(
+            Some("scope"),
+            Some("completed"),
+            Some("fingerprint"),
+            "completed",
+            1,
+            Some("1700000000"),
+            Some(200),
+            Some("application/json"),
+            Some(b"{}"),
+        )
+        .expect("valid completed row");
+
+        assert!(
+            insert(
+                Some("scope"),
+                Some("bad-state"),
+                Some("fingerprint"),
+                "unknown",
+                1,
+                Some("1700000000"),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("bad-generation"),
+                Some("fingerprint"),
+                "in_progress",
+                0,
+                Some("1700000000"),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                None,
+                Some("missing-scope"),
+                Some("fingerprint"),
+                "in_progress",
+                1,
+                Some("1700000000"),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                None,
+                Some("fingerprint"),
+                "in_progress",
+                1,
+                Some("1700000000"),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("missing-fingerprint"),
+                None,
+                "in_progress",
+                1,
+                Some("1700000000"),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("missing-lease"),
+                Some("fingerprint"),
+                "in_progress",
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("in-progress-response"),
+                Some("fingerprint"),
+                "in_progress",
+                1,
+                Some("1700000000"),
+                Some(200),
+                Some("application/json"),
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("completed-status-null"),
+                Some("fingerprint"),
+                "completed",
+                1,
+                Some("1700000000"),
+                None,
+                Some("application/json"),
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("completed-type-null"),
+                Some("fingerprint"),
+                "completed",
+                1,
+                Some("1700000000"),
+                Some(200),
+                None,
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("completed-body-null"),
+                Some("fingerprint"),
+                "completed",
+                1,
+                Some("1700000000"),
+                Some(200),
+                Some("application/json"),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("completed-status-low"),
+                Some("fingerprint"),
+                "completed",
+                1,
+                Some("1700000000"),
+                Some(199),
+                Some("application/json"),
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("completed-status-high"),
+                Some("fingerprint"),
+                "completed",
+                1,
+                Some("1700000000"),
+                Some(600),
+                Some("application/json"),
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("completed-type-invalid"),
+                Some("fingerprint"),
+                "completed",
+                1,
+                Some("1700000000"),
+                Some(200),
+                Some("text/plain"),
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("in-progress"),
+                Some("fingerprint"),
+                "in_progress",
+                1,
+                Some("1700000000"),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+
+        let row_count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM http_idempotency_records", [], |row| {
+                row.get(0)
+            })
+            .expect("row count");
+        assert_eq!(row_count, 2);
+    }
+
+    #[test]
+    fn http_idempotency_v14_reopen_preserves_rows() {
+        let database = TempDatabase::new();
+        let v13_migrations = &MIGRATIONS[..MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 14)
+            .expect("v14 migration")];
+        {
+            let mut connection = Connection::open(&database.path).expect("open v13 database");
+            apply_sqlcipher_key(&connection, DATABASE_KEY).expect("apply SQLCipher key");
+            verify_sqlcipher(&connection).expect("verify SQLCipher");
+            run_migrations_with(&mut connection, v13_migrations).expect("apply v13 schema");
+            connection
+                .execute(
+                    "UPDATE configuration SET owner_email = ?1 WHERE id = 1",
+                    ["owner@example.test"],
+                )
+                .expect("seed v13 configuration");
+        }
+
+        {
+            let store = PaStore::open(&database.path, DATABASE_KEY).expect("upgrade to v14");
+            let owner_email: String = store
+                .connection()
+                .query_row(
+                    "SELECT owner_email FROM configuration WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("preserved configuration");
+            assert_eq!(owner_email, "owner@example.test");
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO http_idempotency_records (
+                         scope, idempotency_key, fingerprint, state, lease_generation,
+                         lease_until
+                     ) VALUES (?1, ?2, ?3, 'in_progress', 1, ?4)",
+                    rusqlite::params!["scope", "key", "fingerprint", "1700000000"],
+                )
+                .expect("insert idempotency row");
+        }
+
+        let reopened = PaStore::open(&database.path, DATABASE_KEY).expect("reopen v14 store");
+        let preserved: (String, String, String) = reopened
+            .connection()
+            .query_row(
+                "SELECT scope, idempotency_key, fingerprint
+                 FROM http_idempotency_records",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("preserved idempotency row");
+        assert_eq!(
+            preserved,
+            (
+                "scope".to_owned(),
+                "key".to_owned(),
+                "fingerprint".to_owned()
+            )
+        );
+        let migration_count: i64 = reopened
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM schema_migrations WHERE version = 14",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v14 migration count");
+        assert_eq!(migration_count, 1);
+    }
+
+    #[test]
     fn configuration_version_survives_file_reopen() {
         let database = TempDatabase::new();
         let v12_migrations = &MIGRATIONS[..MIGRATIONS
@@ -8806,14 +9246,14 @@ END;
                 row.get(0)
             })
             .expect("schema version");
-        assert_eq!(schema_version, 13);
+        assert_eq!(schema_version, 14);
         let migration_count: i64 = store
             .connection()
             .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
                 row.get(0)
             })
             .expect("migration count");
-        assert_eq!(migration_count, 13);
+        assert_eq!(migration_count, 14);
         let version: i64 = store
             .connection()
             .query_row(
@@ -11713,6 +12153,7 @@ END;
                 "audit_events",
                 "configuration",
                 "event_mappings",
+                "http_idempotency_records",
                 "messages",
                 "notification_outbox",
                 "oauth_credentials",
