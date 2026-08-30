@@ -254,6 +254,166 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 /// A provider operation future that can be returned from an object-safe trait.
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = ProviderResult<T>> + Send + 'a>>;
 
+/// A validated relative key for one encrypted backup object or prefix.
+///
+/// Keys are opaque provider identifiers. They may contain path separators for
+/// prefix matching, but never a traversal component or leading slash.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BackupObjectKey(String);
+
+impl BackupObjectKey {
+    /// Constructs a validated relative object key or prefix.
+    pub fn new(value: impl Into<String>) -> ProviderResult<Self> {
+        let value = value.into();
+        if !is_valid_backup_object_key(&value) {
+            return Err(ProviderError::InvalidInput {
+                field: ProviderInputField::BackupObjectKey,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Alias for [`Self::new`].
+    pub fn try_new(value: impl Into<String>) -> ProviderResult<Self> {
+        Self::new(value)
+    }
+
+    /// Returns the validated provider object key or prefix.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Alias for [`Self::as_str`].
+    pub fn key(&self) -> &str {
+        self.as_str()
+    }
+
+    /// Alias for [`Self::as_str`].
+    pub fn object_key(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for BackupObjectKey {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<BackupObjectKey> for String {
+    fn from(value: BackupObjectKey) -> Self {
+        value.0
+    }
+}
+
+impl PartialEq<str> for BackupObjectKey {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl fmt::Debug for BackupObjectKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BackupObjectKey(<redacted>)")
+    }
+}
+
+/// Validated provider metadata for one encrypted backup object.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BackupObjectInfo {
+    key: BackupObjectKey,
+    provider_version: String,
+    checksum: String,
+    uploaded_at: DateTime<Utc>,
+    byte_count: u64,
+}
+
+impl BackupObjectInfo {
+    /// Constructs validated metadata without accepting ciphertext or plaintext.
+    pub fn new(
+        key: impl Into<String>,
+        provider_version: impl Into<String>,
+        checksum: impl Into<String>,
+        uploaded_at: DateTime<Utc>,
+        byte_count: u64,
+    ) -> ProviderResult<Self> {
+        if byte_count == 0 {
+            return Err(ProviderError::InvalidInput {
+                field: ProviderInputField::StoredByteCount,
+            });
+        }
+        Ok(Self {
+            key: BackupObjectKey::new(key.into())?,
+            provider_version: validate_backup_text(
+                provider_version.into(),
+                ProviderInputField::ProviderVersion,
+            )?,
+            checksum: validate_sha256_checksum(checksum.into())?,
+            uploaded_at: validate_timestamp(uploaded_at, ProviderInputField::UploadedAt)?,
+            byte_count,
+        })
+    }
+
+    /// Alias for [`Self::new`].
+    pub fn try_new(
+        key: impl Into<String>,
+        provider_version: impl Into<String>,
+        checksum: impl Into<String>,
+        uploaded_at: DateTime<Utc>,
+        byte_count: u64,
+    ) -> ProviderResult<Self> {
+        Self::new(key, provider_version, checksum, uploaded_at, byte_count)
+    }
+
+    /// Returns the validated typed object key.
+    pub fn key(&self) -> &BackupObjectKey {
+        &self.key
+    }
+
+    /// Returns the validated object key text.
+    pub fn object_key(&self) -> &str {
+        self.key.as_str()
+    }
+
+    /// Returns the provider version or ETag.
+    pub fn provider_version(&self) -> &str {
+        &self.provider_version
+    }
+
+    /// Returns the checksum of the stored encrypted bytes.
+    pub fn checksum(&self) -> &str {
+        &self.checksum
+    }
+
+    /// Returns the UTC upload timestamp.
+    pub fn uploaded_at(&self) -> DateTime<Utc> {
+        self.uploaded_at
+    }
+
+    /// Returns the stored encrypted byte count.
+    pub const fn byte_count(&self) -> u64 {
+        self.byte_count
+    }
+
+    /// Alias for [`Self::byte_count`].
+    pub const fn stored_byte_count(&self) -> u64 {
+        self.byte_count()
+    }
+}
+
+impl fmt::Debug for BackupObjectInfo {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackupObjectInfo")
+            .field("key", &"<redacted>")
+            .field("provider_version", &"<redacted>")
+            .field("checksum", &"<redacted>")
+            .field("uploaded_at", &self.uploaded_at)
+            .field("byte_count", &"<redacted>")
+            .finish()
+    }
+}
+
 /// An already-encrypted database snapshot ready for provider upload.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EncryptedSnapshot {
@@ -291,11 +451,9 @@ impl EncryptedSnapshot {
                 field: ProviderInputField::Checksum,
             });
         }
+        let object_key = BackupObjectKey::new(object_key.into())?;
         Ok(Self {
-            object_key: validate_backup_text(
-                object_key.into(),
-                ProviderInputField::BackupObjectKey,
-            )?,
+            object_key: object_key.as_str().to_owned(),
             ciphertext,
             checksum,
             ciphertext_size,
@@ -389,11 +547,9 @@ impl BackupReceipt {
                 field: ProviderInputField::StoredByteCount,
             });
         }
+        let object_key = BackupObjectKey::new(object_key.into())?;
         Ok(Self {
-            object_key: validate_backup_text(
-                object_key.into(),
-                ProviderInputField::BackupObjectKey,
-            )?,
+            object_key: object_key.as_str().to_owned(),
             provider_version: validate_backup_text(
                 provider_version.into(),
                 ProviderInputField::ProviderVersion,
@@ -451,6 +607,27 @@ pub trait EncryptedS3BackupProvider: Send + Sync {
         session: &'a ProviderSession,
         snapshot: &'a EncryptedSnapshot,
     ) -> ProviderFuture<'a, BackupReceipt>;
+
+    /// Lists metadata for objects whose validated key starts with `prefix`.
+    fn list_snapshots<'a>(
+        &'a self,
+        session: &'a ProviderSession,
+        prefix: &'a BackupObjectKey,
+    ) -> ProviderFuture<'a, Vec<BackupObjectInfo>>;
+
+    /// Downloads one explicitly named encrypted object.
+    fn get_snapshot<'a>(
+        &'a self,
+        session: &'a ProviderSession,
+        key: &'a BackupObjectKey,
+    ) -> ProviderFuture<'a, EncryptedSnapshot>;
+
+    /// Deletes one explicitly named encrypted object.
+    fn delete_snapshot<'a>(
+        &'a self,
+        session: &'a ProviderSession,
+        key: &'a BackupObjectKey,
+    ) -> ProviderFuture<'a, ()>;
 }
 
 fn validate_backup_text(value: String, field: ProviderInputField) -> ProviderResult<String> {
@@ -461,6 +638,14 @@ fn validate_backup_text(value: String, field: ProviderInputField) -> ProviderRes
         return Err(ProviderError::InvalidInput { field });
     }
     Ok(value)
+}
+
+fn is_valid_backup_object_key(value: &str) -> bool {
+    !value.starts_with('/')
+        && validate_backup_text(value.to_owned(), ProviderInputField::BackupObjectKey).is_ok()
+        && !value
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
 }
 
 fn validate_sha256_checksum(value: String) -> ProviderResult<String> {
@@ -2516,6 +2701,26 @@ mod tests {
 
     fn assert_send_sync<T: Send + Sync>() {}
 
+    mod backup_object_seam {
+        use super::super::{BackupObjectInfo, BackupObjectKey};
+
+        #[test]
+        fn backup_keys_reject_traversal_and_object_info_is_typed() {
+            assert!(BackupObjectKey::new("backups/../outside").is_err());
+            let key = BackupObjectKey::new("backups/2026/08/snapshot").expect("valid key");
+            let info = BackupObjectInfo::new(
+                key.clone(),
+                "version-1",
+                "a".repeat(64),
+                "2026-08-30T12:00:00Z".parse().expect("timestamp"),
+                42,
+            )
+            .expect("metadata");
+            assert_eq!(info.key(), &key);
+            assert_eq!(info.byte_count(), 42);
+        }
+    }
+
     #[test]
     fn rejects_invalid_session_inputs_without_echoing_token() {
         assert!(matches!(
@@ -4127,6 +4332,30 @@ mod tests {
                 snapshot.ciphertext_size(),
             );
             Box::pin(async move { receipt })
+        }
+
+        fn list_snapshots<'a>(
+            &'a self,
+            _session: &'a ProviderSession,
+            _prefix: &'a super::BackupObjectKey,
+        ) -> ProviderFuture<'a, Vec<super::BackupObjectInfo>> {
+            Box::pin(async { Err(ProviderError::Unavailable) })
+        }
+
+        fn get_snapshot<'a>(
+            &'a self,
+            _session: &'a ProviderSession,
+            _key: &'a super::BackupObjectKey,
+        ) -> ProviderFuture<'a, EncryptedSnapshot> {
+            Box::pin(async { Err(ProviderError::Unavailable) })
+        }
+
+        fn delete_snapshot<'a>(
+            &'a self,
+            _session: &'a ProviderSession,
+            _key: &'a super::BackupObjectKey,
+        ) -> ProviderFuture<'a, ()> {
+            Box::pin(async { Err(ProviderError::Unavailable) })
         }
     }
 
