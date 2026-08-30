@@ -156,7 +156,7 @@ impl FakeEncryptedS3Backup {
         state
             .objects
             .iter()
-            .filter(|(key, _)| key_matches_prefix(key, prefix.as_str()))
+            .filter(|(key, _)| key.starts_with(prefix.as_str()))
             .map(|(key, stored)| {
                 BackupObjectInfo::new(
                     BackupObjectKey::new(key.clone())?,
@@ -201,7 +201,19 @@ impl fmt::Debug for FakeEncryptedS3Backup {
         };
         let mut debug = formatter.debug_struct("FakeEncryptedS3Backup");
         debug.field("object_count", &object_count);
-        match self.control.invocation_count(FakeOperation::BackupPut) {
+        let lifecycle_call_count = [
+            FakeOperation::BackupPut,
+            FakeOperation::BackupList,
+            FakeOperation::BackupGet,
+            FakeOperation::BackupDelete,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, operation| {
+            total
+                .checked_add(self.control.invocation_count(operation)?)
+                .ok_or(ProviderError::Unavailable)
+        });
+        match lifecycle_call_count {
             Ok(count) => debug.field("lifecycle_call_count", &count).finish(),
             Err(_) => debug
                 .field("lifecycle_call_count", &"<unavailable>")
@@ -235,7 +247,7 @@ impl EncryptedS3BackupProvider for FakeEncryptedS3Backup {
         let prefix = prefix.clone();
         Box::pin(async move {
             fake.ensure_configured_prefix(&prefix)?;
-            fake.control.begin(FakeOperation::BackupPut)?;
+            fake.control.begin(FakeOperation::BackupList)?;
             fake.list(&prefix)
         })
     }
@@ -249,7 +261,7 @@ impl EncryptedS3BackupProvider for FakeEncryptedS3Backup {
         let key = key.clone();
         Box::pin(async move {
             fake.ensure_configured_prefix(&key)?;
-            fake.control.begin(FakeOperation::BackupPut)?;
+            fake.control.begin(FakeOperation::BackupGet)?;
             fake.load(&key)
         })
     }
@@ -263,7 +275,7 @@ impl EncryptedS3BackupProvider for FakeEncryptedS3Backup {
         let key = key.clone();
         Box::pin(async move {
             fake.ensure_configured_prefix(&key)?;
-            fake.control.begin(FakeOperation::BackupPut)?;
+            fake.control.begin(FakeOperation::BackupDelete)?;
             fake.remove(&key)
         })
     }
@@ -394,6 +406,61 @@ mod tests {
         );
         assert_eq!(fake.stored_receipts(), Ok(vec![receipt]));
         assert_eq!(control.invocation_count(FakeOperation::BackupPut), Ok(1));
+    }
+
+    #[tokio::test]
+    async fn admitted_partial_list_prefix_uses_literal_s3_starts_with_matching() {
+        let fake =
+            FakeEncryptedS3Backup::new_with_prefix(FakeControl::new(now()), "backup-sentinel")
+                .expect("configured prefix");
+        let snapshots = [
+            snapshot(
+                "backup-sentinel/2026-08/snapshot",
+                b"backup-sentinel-a-ciphertext",
+                "92762cbb819f1bceef362f2400603f484cee20321497c97f504c8838fc72e5c2",
+                "backup-sentinel-encryption-format",
+                "backup-sentinel-key-metadata",
+                "backup-sentinel-encryption-metadata",
+            ),
+            snapshot(
+                "backup-sentinel/2026-09/snapshot",
+                b"backup-sentinel-z-ciphertext",
+                "089d76f2759d5f8dc10b541e00875a601890d4fc89dae748261c8f1d64f2a492",
+                "backup-sentinel-encryption-format",
+                "backup-sentinel-key-metadata",
+                "backup-sentinel-encryption-metadata",
+            ),
+            snapshot(
+                "backup-sentinel/2025-12/snapshot",
+                b"backup-sentinel-outside-ciphertext",
+                "20bae8d48a542dd08810d2d96bbb60ad2c0c552d549c845f629f1494770c391b",
+                "backup-sentinel-encryption-format",
+                "backup-sentinel-key-metadata",
+                "backup-sentinel-encryption-metadata",
+            ),
+        ];
+        for snapshot in &snapshots {
+            fake.put_snapshot(&session(), snapshot)
+                .await
+                .expect("receipt");
+        }
+
+        let partial_prefix = BackupObjectKey::new("backup-sentinel/2026-0").expect("prefix");
+        let listed = fake
+            .list_snapshots(&session(), &partial_prefix)
+            .await
+            .expect("metadata");
+
+        assert_eq!(
+            listed
+                .iter()
+                .map(|info| info.object_key())
+                .collect::<Vec<_>>(),
+            vec![
+                "backup-sentinel/2026-08/snapshot",
+                "backup-sentinel/2026-09/snapshot",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -560,11 +627,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["backup-other/key", "backup-sentinel/z/key"]
         );
-        assert_eq!(control.invocation_count(FakeOperation::BackupPut), Ok(8));
+        assert_eq!(control.invocation_count(FakeOperation::BackupPut), Ok(3));
+        assert_eq!(control.invocation_count(FakeOperation::BackupList), Ok(1));
+        assert_eq!(control.invocation_count(FakeOperation::BackupGet), Ok(2));
+        assert_eq!(control.invocation_count(FakeOperation::BackupDelete), Ok(2));
     }
 
     #[tokio::test]
-    async fn list_download_and_delete_fail_before_mutation_when_control_fails() {
+    async fn backup_lifecycle_operations_have_independent_failures_and_counts() {
         let control = FakeControl::new(now());
         let fake = FakeEncryptedS3Backup::new(control.clone());
         let snapshot = first_snapshot();
@@ -575,27 +645,53 @@ mod tests {
         let prefix = BackupObjectKey::new("backup-sentinel").expect("prefix");
 
         control
-            .queue_failure(FakeOperation::BackupPut, ProviderError::Unavailable)
+            .queue_failure(FakeOperation::BackupPut, ProviderError::Conflict)
+            .expect("put failure");
+        assert_eq!(
+            fake.list_snapshots(&session(), &prefix)
+                .await
+                .map(|objects| objects.len()),
+            Ok(1)
+        );
+        assert_eq!(control.invocation_count(FakeOperation::BackupPut), Ok(1));
+        assert_eq!(control.invocation_count(FakeOperation::BackupList), Ok(1));
+        control
+            .queue_failure(FakeOperation::BackupList, ProviderError::Unavailable)
             .expect("list failure");
         assert_eq!(
             fake.list_snapshots(&session(), &prefix).await,
             Err(ProviderError::Unavailable)
         );
         control
-            .queue_failure(FakeOperation::BackupPut, ProviderError::Unavailable)
+            .queue_failure(FakeOperation::BackupGet, ProviderError::NotFound)
             .expect("get failure");
         assert_eq!(
             fake.get_snapshot(&session(), &key).await,
-            Err(ProviderError::Unavailable)
+            Err(ProviderError::NotFound)
+        );
+        assert_eq!(
+            fake.get_snapshot(&session(), &key).await,
+            Ok(snapshot.clone())
         );
         control
-            .queue_failure(FakeOperation::BackupPut, ProviderError::Unavailable)
+            .queue_failure(FakeOperation::BackupDelete, ProviderError::Unavailable)
             .expect("delete failure");
         assert_eq!(
             fake.delete_snapshot(&session(), &key).await,
             Err(ProviderError::Unavailable)
         );
-        assert_eq!(fake.get_snapshot(&session(), &key).await, Ok(snapshot));
+        assert_eq!(
+            fake.get_snapshot(&session(), &key).await,
+            Ok(snapshot.clone())
+        );
+        assert_eq!(
+            fake.put_snapshot(&session(), &snapshot).await,
+            Err(ProviderError::Conflict)
+        );
+        assert_eq!(control.invocation_count(FakeOperation::BackupPut), Ok(2));
+        assert_eq!(control.invocation_count(FakeOperation::BackupList), Ok(2));
+        assert_eq!(control.invocation_count(FakeOperation::BackupGet), Ok(3));
+        assert_eq!(control.invocation_count(FakeOperation::BackupDelete), Ok(1));
     }
 
     #[test]
