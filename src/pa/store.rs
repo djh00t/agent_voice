@@ -6747,6 +6747,7 @@ fn reject_empty_key(key: &[u8]) -> StoreResult<()> {
 fn initialize(connection: &mut Connection, key: &[u8], file_store: bool) -> StoreResult<()> {
     apply_sqlcipher_key(connection, key)?;
     verify_sqlcipher(connection)?;
+    connection.pragma_update(None, "recursive_triggers", true)?;
 
     connection.pragma_update(None, "foreign_keys", true)?;
     connection.busy_timeout(BUSY_TIMEOUT)?;
@@ -10691,6 +10692,44 @@ END;
                 .expect("original event after rejected delete"),
             event
         );
+
+        let recursive_triggers: i64 = store
+            .connection()
+            .pragma_query_value(None, "recursive_triggers", |row| row.get(0))
+            .expect("read recursive trigger setting");
+        assert_eq!(recursive_triggers, 1, "recursive triggers must be enabled");
+
+        for (statement, replacement_entity_id) in [
+            ("INSERT OR REPLACE", "message-replaced-by-insert"),
+            ("REPLACE", "message-replaced-by-replace"),
+        ] {
+            let sql = format!(
+                "{statement} INTO audit_events (
+                     idempotency_key, event_type, entity_type, entity_id, details,
+                     occurred_at, created_at
+                 ) VALUES (?1, 'message_recorded', 'message', ?2, NULL, ?3, ?3)"
+            );
+            assert!(
+                store
+                    .connection()
+                    .execute(
+                        &sql,
+                        rusqlite::params![
+                            "audit-append-only",
+                            replacement_entity_id,
+                            "2025-01-02T03:04:05Z"
+                        ],
+                    )
+                    .is_err(),
+                "{statement} must not bypass audit immutability"
+            );
+            assert_eq!(
+                store
+                    .load_audit_event_by_idempotency_key("audit-append-only")
+                    .expect("original event after rejected replacement"),
+                event
+            );
+        }
     }
 
     #[test]
@@ -15143,6 +15182,13 @@ END;
     #[test]
     fn appointment_retry_returns_the_row_when_an_identical_write_wins_the_race() {
         let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        // This fixture injects a competing insert from another trigger. Keep
+        // recursion disabled only for the fixture; production connections
+        // enable it so REPLACE cannot bypass audit append-only guards.
+        store
+            .connection()
+            .pragma_update(None, "recursive_triggers", false)
+            .expect("disable recursive triggers for race fixture");
         store
             .connection()
             .execute_batch(
@@ -15172,6 +15218,10 @@ END;
         let stored = store
             .save_appointment_draft("phone:retry-race", &draft)
             .expect("an exact raced retry returns the stored row");
+        store
+            .connection()
+            .pragma_update(None, "recursive_triggers", true)
+            .expect("restore recursive triggers after race fixture");
 
         assert_eq!(stored.source_id(), "phone:retry-race");
         assert_eq!(stored.draft(), &draft);
@@ -15393,6 +15443,13 @@ END;
     #[test]
     fn owner_task_retry_returns_the_row_when_an_identical_write_wins_the_race() {
         let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        // This fixture injects a competing insert from another trigger. Keep
+        // recursion disabled only for the fixture; production connections
+        // enable it so REPLACE cannot bypass audit append-only guards.
+        store
+            .connection()
+            .pragma_update(None, "recursive_triggers", false)
+            .expect("disable recursive triggers for race fixture");
         store
             .connection()
             .execute_batch(
@@ -15420,6 +15477,10 @@ END;
         let stored = store
             .save_owner_task_draft(None, &draft)
             .expect("an exact raced retry returns the stored row");
+        store
+            .connection()
+            .pragma_update(None, "recursive_triggers", true)
+            .expect("restore recursive triggers after race fixture");
 
         assert_eq!(stored.source_id(), None);
         assert_eq!(stored.draft(), &draft);
