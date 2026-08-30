@@ -22,8 +22,6 @@ struct BackupState {
     next_provider_version: u64,
 }
 
-const DEFAULT_CONFIGURED_PREFIX: &str = "backup";
-
 /// Cloneable deterministic encrypted-object backup fake.
 ///
 /// Clones share a mutex-protected transient object map. The fake accepts only
@@ -32,21 +30,27 @@ const DEFAULT_CONFIGURED_PREFIX: &str = "backup";
 #[derive(Clone)]
 pub struct FakeEncryptedS3Backup {
     control: FakeControl,
-    configured_prefix: BackupObjectKey,
+    configured_prefix: Option<BackupObjectKey>,
     state: Arc<Mutex<BackupState>>,
 }
 
 impl FakeEncryptedS3Backup {
     /// Creates an empty fake using the supplied shared deterministic control.
     ///
-    /// The compatibility constructor scopes objects to the `backup` prefix;
-    /// use [`Self::new_with_prefix`] when a test needs a different prefix.
+    /// The compatibility constructor leaves the object namespace unrestricted;
+    /// use [`Self::new_with_prefix`] to enforce a configured prefix.
     pub fn new<C>(control: C) -> Self
     where
         C: Borrow<FakeControl>,
     {
-        Self::new_with_prefix(control, DEFAULT_CONFIGURED_PREFIX)
-            .expect("static default backup prefix is valid")
+        Self {
+            control: control.borrow().clone(),
+            configured_prefix: None,
+            state: Arc::new(Mutex::new(BackupState {
+                objects: BTreeMap::new(),
+                next_provider_version: 1,
+            })),
+        }
     }
 
     /// Creates an empty fake scoped to one validated object-key prefix.
@@ -58,7 +62,7 @@ impl FakeEncryptedS3Backup {
         let configured_prefix = BackupObjectKey::new(prefix.into())?;
         Ok(Self {
             control: control.borrow().clone(),
-            configured_prefix,
+            configured_prefix: Some(configured_prefix),
             state: Arc::new(Mutex::new(BackupState {
                 objects: BTreeMap::new(),
                 next_provider_version: 1,
@@ -90,8 +94,8 @@ impl FakeEncryptedS3Backup {
     }
 
     /// Returns the configured prefix enforced for object operations.
-    pub fn configured_prefix(&self) -> &BackupObjectKey {
-        &self.configured_prefix
+    pub fn configured_prefix(&self) -> Option<&BackupObjectKey> {
+        self.configured_prefix.as_ref()
     }
 
     /// Returns cloned stored receipts in deterministic object-key order.
@@ -138,12 +142,12 @@ impl FakeEncryptedS3Backup {
     }
 
     fn ensure_configured_prefix(&self, key: &BackupObjectKey) -> ProviderResult<()> {
-        if key_matches_prefix(key.as_str(), self.configured_prefix.as_str()) {
-            Ok(())
-        } else {
-            Err(ProviderError::InvalidInput {
+        match self.configured_prefix.as_ref() {
+            None => Ok(()),
+            Some(prefix) if key_matches_prefix(key.as_str(), prefix.as_str()) => Ok(()),
+            Some(_) => Err(ProviderError::InvalidInput {
                 field: crate::pa::providers::ProviderInputField::BackupObjectKey,
-            })
+            }),
         }
     }
 
@@ -182,7 +186,11 @@ impl FakeEncryptedS3Backup {
 }
 
 fn key_matches_prefix(key: &str, prefix: &str) -> bool {
-    key.starts_with(prefix)
+    key == prefix
+        || (prefix.ends_with('/') && key.starts_with(prefix))
+        || key
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 impl fmt::Debug for FakeEncryptedS3Backup {
@@ -282,6 +290,12 @@ mod tests {
         ProviderSession::new("backup-account", "backup-session-token", None).expect("session")
     }
 
+    fn invalid_key<T>() -> Result<T, ProviderError> {
+        Err(ProviderError::InvalidInput {
+            field: crate::pa::providers::ProviderInputField::BackupObjectKey,
+        })
+    }
+
     fn snapshot(
         object_key: &str,
         ciphertext: &[u8],
@@ -313,6 +327,18 @@ mod tests {
         )
     }
 
+    fn configured_snapshot() -> EncryptedSnapshot {
+        let original = first_snapshot();
+        snapshot(
+            "backup-sentinel/object",
+            original.ciphertext(),
+            original.checksum(),
+            original.encryption_format(),
+            original.key_metadata(),
+            original.encryption_metadata(),
+        )
+    }
+
     #[tokio::test]
     async fn upload_returns_a_stable_exact_retry_receipt() {
         let control = FakeControl::new(now());
@@ -337,23 +363,26 @@ mod tests {
         let control = FakeControl::new(now());
         let fake = FakeEncryptedS3Backup::new_with_prefix(control.clone(), "backup-sentinel")
             .expect("configured prefix");
-        assert_eq!(fake.configured_prefix().as_str(), "backup-sentinel");
-        let snapshot = first_snapshot();
+        assert_eq!(
+            fake.configured_prefix()
+                .expect("configured prefix")
+                .as_str(),
+            "backup-sentinel"
+        );
+        let snapshot = configured_snapshot();
         let receipt = fake
             .put_snapshot(&session(), &snapshot)
             .await
             .expect("receipt");
         let foreign_key = BackupObjectKey::new("other-prefix/object").expect("foreign key");
-        fn invalid<T>() -> Result<T, ProviderError> {
-            Err(ProviderError::InvalidInput {
-                field: crate::pa::providers::ProviderInputField::BackupObjectKey,
-            })
-        }
 
-        assert_eq!(fake.get_snapshot(&session(), &foreign_key).await, invalid());
+        assert_eq!(
+            fake.get_snapshot(&session(), &foreign_key).await,
+            invalid_key()
+        );
         assert_eq!(
             fake.delete_snapshot(&session(), &foreign_key).await,
-            invalid()
+            invalid_key()
         );
         assert_eq!(
             fake.list_snapshots(
@@ -361,9 +390,79 @@ mod tests {
                 &BackupObjectKey::new("other-prefix").expect("foreign prefix")
             )
             .await,
-            invalid()
+            invalid_key()
         );
         assert_eq!(fake.stored_receipts(), Ok(vec![receipt]));
+        assert_eq!(control.invocation_count(FakeOperation::BackupPut), Ok(1));
+    }
+
+    #[tokio::test]
+    async fn configured_prefix_rejects_near_prefix_put_list_get_and_delete() {
+        let control = FakeControl::new(now());
+        let fake = FakeEncryptedS3Backup::new_with_prefix(control.clone(), "backup-sentinel")
+            .expect("configured prefix");
+        let snapshot = configured_snapshot();
+        let near_snapshot = EncryptedSnapshot::new(
+            "backup-sentinel-evil/object",
+            snapshot.ciphertext().to_vec(),
+            snapshot.checksum(),
+            snapshot.ciphertext_size(),
+            snapshot.encryption_format(),
+            snapshot.key_metadata(),
+            snapshot.encryption_metadata(),
+        )
+        .expect("near-prefix snapshot");
+        let near_key = BackupObjectKey::new(near_snapshot.object_key()).expect("near key");
+        let near_prefix = BackupObjectKey::new("backup-sentinel-evil").expect("near prefix");
+
+        assert_eq!(
+            fake.put_snapshot(&session(), &near_snapshot).await,
+            invalid_key()
+        );
+        assert_eq!(
+            fake.list_snapshots(&session(), &near_prefix).await,
+            invalid_key()
+        );
+        assert_eq!(
+            fake.get_snapshot(&session(), &near_key).await,
+            invalid_key()
+        );
+        assert_eq!(
+            fake.delete_snapshot(&session(), &near_key).await,
+            invalid_key()
+        );
+        assert_eq!(control.invocation_count(FakeOperation::BackupPut), Ok(0));
+        assert!(fake.stored_receipts().expect("receipts").is_empty());
+
+        fake.put_snapshot(&session(), &snapshot)
+            .await
+            .expect("in-prefix receipt");
+        assert_eq!(control.invocation_count(FakeOperation::BackupPut), Ok(1));
+        assert_eq!(fake.stored_receipts().expect("receipts").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_constructor_keeps_arbitrary_valid_keys_usable() {
+        let control = FakeControl::new(now());
+        let fake = FakeEncryptedS3Backup::new(control);
+        let snapshot = EncryptedSnapshot::new(
+            "snapshot-key",
+            first_snapshot().ciphertext().to_vec(),
+            first_snapshot().checksum(),
+            first_snapshot().ciphertext_size(),
+            first_snapshot().encryption_format(),
+            first_snapshot().key_metadata(),
+            first_snapshot().encryption_metadata(),
+        )
+        .expect("legacy snapshot");
+        let key = BackupObjectKey::new("snapshot-key").expect("legacy key");
+
+        fake.put_snapshot(&session(), &snapshot)
+            .await
+            .expect("legacy receipt");
+        assert_eq!(fake.get_snapshot(&session(), &key).await, Ok(snapshot));
+        assert_eq!(fake.delete_snapshot(&session(), &key).await, Ok(()));
+        assert!(fake.stored_receipts().expect("receipts").is_empty());
     }
 
     #[tokio::test]
@@ -371,7 +470,7 @@ mod tests {
         let control = FakeControl::new(now());
         let fake = FakeEncryptedS3Backup::new_with_prefix(control, "backup-sentinel")
             .expect("configured prefix");
-        fake.put_snapshot(&session(), &first_snapshot())
+        fake.put_snapshot(&session(), &configured_snapshot())
             .await
             .expect("receipt");
         let prefix = BackupObjectKey::new("backup-sentinel").expect("prefix");
