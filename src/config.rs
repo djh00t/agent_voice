@@ -1548,6 +1548,9 @@ fn normalize_scopes(provider: OAuthProvider, scopes: &mut Vec<String>) -> Result
         if scope.is_empty() {
             bail!("{} must not contain blank items", path);
         }
+        if scope.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            bail!("{} must not contain ASCII whitespace", path);
+        }
     }
     scopes.sort();
     scopes.dedup();
@@ -2691,6 +2694,17 @@ microsoft:
         let error = forbidden.normalize_and_validate().unwrap_err().to_string();
         assert!(error.contains("agent_api.oauth.google.scopes"));
         assert!(error.contains("offline_access"));
+    }
+
+    #[test]
+    fn oauth_scopes_reject_internal_ascii_whitespace() {
+        let mut config = PaOAuthConfig::default();
+        config.google.scopes = vec!["offline_access openid".to_string()];
+
+        let error = config.normalize_and_validate().unwrap_err().to_string();
+
+        assert!(error.contains("agent_api.oauth.google.scopes"));
+        assert!(error.contains("whitespace"));
     }
 
     #[test]
