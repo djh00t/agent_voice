@@ -7,7 +7,7 @@
 - **Worktree:** `/private/tmp/agent-voice-pa-06c3-submit-orchestration`
 - **Branch:** `codex/agent-voice-pa-06c3-submit-orchestration`
 - **Base:** `4ba837e6ed7f2cd4ba431660865d902a2787f9eb` (`origin/main`)
-- **Implementation commits:** `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`, `68e8e2e`
+- **Implementation commits:** `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`, `68e8e2e`, `499adc5`
 
 ## Scope
 
@@ -92,12 +92,12 @@ Commands and results:
 
 | Check | Result |
 | --- | --- |
-| `rtk cargo test pa::service::tests::fractional --lib` | PASS — 2 passed, 491 filtered out |
-| `rtk cargo test pa::service::tests:: --lib` | PASS — 39 passed, 454 filtered out |
+| `rtk cargo test pa::service::tests::fractional --lib` | PASS — 2 passed, 492 filtered out |
+| `rtk cargo test pa::service::tests:: --lib` | PASS — 40 passed, 454 filtered out |
 | `rtk cargo clippy --all-targets --all-features -- -D warnings` | PASS — no issues found |
 | `rtk rustfmt --edition 2024 --check src/pa/service.rs` | PASS |
 | `rtk git diff --check` | PASS |
-| `rtk make check` | PASS — Rust tests, clippy, docs, and Docusaurus build completed; full suite ran 493 tests |
+| `rtk make check` | PASS — Rust tests, clippy, docs, and Docusaurus build completed; full suite ran 494 tests |
 
 The first `rtk make check` attempt stopped at `docs-build` because the clean
 worktree had no installed Docusaurus binary (`docusaurus: command not found`).
@@ -145,7 +145,7 @@ Focused command:
 rtk cargo test pa::service::tests::non_utc_durable_interval_fails_before_submission_side_effects_and_exact_retry_converges --lib
 ```
 
-Result: PASS — 1 passed, 492 filtered out.
+Result: PASS — 1 passed, 493 filtered out.
 
 Current repository gate:
 
@@ -153,7 +153,7 @@ Current repository gate:
 rtk make check
 ```
 
-Result: PASS — 493 unit tests, 3 doctests, strict clippy, Rust API docs, and
+Result: PASS — 494 unit tests, 3 doctests, strict clippy, Rust API docs, and
 the Docusaurus production build. The fresh worktree first lacked the local
 Docusaurus binary; `rtk make docs-install` installed the lockfile-resolved
 website dependencies without changing tracked manifests or lockfiles.
@@ -175,7 +175,30 @@ Focused command:
 rtk cargo test pa::service::tests::exact_retry_repairs_a_missing_ --lib
 ```
 
-Result: PASS — 3 passed, 490 filtered out.
+Result: PASS — 3 passed, 491 filtered out.
+
+## Reviewer owner-binding remediation
+
+Each event mapping now persists a SHA-256 fingerprint of the owner address in
+its redacted source identity. The existing-mapping tail-repair path recomputes
+that identity from the configured owner before notification enqueue. A changed
+owner therefore returns a redacted mapping conflict before provider calls or
+local notification writes; an unchanged owner retains the provider-free tail
+repair path.
+
+`owner_change_after_mapping_fails_closed_without_provider_calls_or_misrouting`
+injects a notification failure after the original owner's mapping succeeds,
+reconstructs the service with a replacement owner, forces each provider
+operation to fail, and verifies the retry fails closed with no notification,
+calendar lookup, busy read, or duplicate create.
+
+Focused command:
+
+```text
+rtk cargo test pa::service::tests::owner_change_after_mapping_fails_closed_without_provider_calls_or_misrouting --lib
+```
+
+Result: PASS — 1 passed, 493 filtered out.
 
 ## Non-claims and residual gates
 
@@ -184,7 +207,7 @@ Result: PASS — 3 passed, 490 filtered out.
 - #211 owns ambiguous provider-create recovery and its audit/evidence path;
   it remains unimplemented here.
 - Rollback is a code revert of `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`,
-  and `68e8e2e`; no remote deletion is inferred or attempted.
+  `68e8e2e`, and `499adc5`; no remote deletion is inferred or attempted.
 
 ## Completion evidence
 
@@ -193,7 +216,8 @@ Result: PASS — 3 passed, 490 filtered out.
   `cf72a79` (`fix(service): canonicalize submission audit time`), `5d4efc9`
   (`fix(service): preserve fractional quote boundaries`), `82e6723`
   (`fix(service): reject non-UTC durable submission intervals`), `68e8e2e`
-  (`test(service): cover local submission tail repair`)
+  (`test(service): cover local submission tail repair`), `499adc5`
+  (`fix(service): bind mapping retries to proposal owner`)
 - **Report commit:** added separately after reviewer remediation
 - **PR/push:** not created or pushed, per task instruction
 - **Reviewer:** not performed in this lane
