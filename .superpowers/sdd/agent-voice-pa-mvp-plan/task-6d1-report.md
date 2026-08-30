@@ -6,7 +6,7 @@
 - **Evidence date:** 2026-08-30 (Australia/Sydney)
 - **Worktree:** `/private/tmp/agent-voice-pa-task6-build`
 - **Branch:** `codex/agent-voice-pa-06-service-layer`
-- **Implementation commit:** `f498999`
+- **Implementation commit:** `a636fa8`
 
 ## Prerequisite evidence
 
@@ -189,7 +189,7 @@ audits without storing a raw transcript.
 ## RED evidence
 
 No historical failing-first output was captured in this handoff. The expected
-RED condition is reconstructed context: before `f498999`,
+RED condition is reconstructed context: before `a636fa8`,
 `PaService::record_message` and its five focused tests were absent. The issue's
 failing-first command was expected to fail because that service symbol did not
 exist, but the original command output is unavailable. This report does not
@@ -217,7 +217,7 @@ namespace isolation, tail repair, output redaction, and zero calendar calls.
 
 ## Handoff and rollback
 
-The implementation commit is `f498999` (`feat(service): record redacted
+The implementation commit is `a636fa8` (`feat(service): record redacted
 voice-message summaries`). The next service-layer work can consume the
 `RecordedMessage` result when wiring voice runtime message capture; it must
 keep transcript ingestion and notification delivery outside this persistence
@@ -233,7 +233,7 @@ It must also reference feature #138 and prerequisite #178. Issue #181 should
 remain open until the linked PR is reviewed, all findings are resolved, CI is
 green, and the PR is merged.
 
-Rollback is a code revert of `f498999` and removal of calls to
+Rollback is a code revert of `a636fa8` and removal of calls to
 `record_message`. The commit makes no calendar, Gmail, network, or provider
 side effect; existing local message/outbox/audit rows are not destructively
 removed by rollback and remain available for a controlled recovery decision.
@@ -256,7 +256,7 @@ and LIVE remain explicitly unverified.
 ## Completion evidence record
 
 - **Implementer:** Task 6d1 service lane
-- **Commit:** `f498999`
+- **Commit:** `a636fa8`
 - **PR:** to be opened with `Closes #181`
 - **Commands/results:** listed in the LOCAL evidence table
 - **Reviewer:** pending independent review
