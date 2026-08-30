@@ -44,6 +44,9 @@ struct CalendarState {
     google_proposal_busy: BTreeMap<String, BusyInterval>,
     google_promotion_requests: Vec<Option<GoogleProposalPromotion>>,
     deleted_google_proposal_ids: BTreeSet<String>,
+    /// Operation keys for deleted proposals remain tombstoned so a delayed
+    /// exact create cannot be mistaken for a new remote event.
+    deleted_google_proposal_operation_keys: BTreeSet<String>,
     ambiguous_google_create_failures: VecDeque<ProviderError>,
     google_create_response_overrides: VecDeque<CalendarEvent>,
     ambiguous_owner_create_failures: VecDeque<ProviderError>,
@@ -94,6 +97,7 @@ impl FakeCalendarRead {
                 google_proposal_busy: BTreeMap::new(),
                 google_promotion_requests: Vec::new(),
                 deleted_google_proposal_ids: BTreeSet::new(),
+                deleted_google_proposal_operation_keys: BTreeSet::new(),
                 ambiguous_google_create_failures: VecDeque::new(),
                 google_create_response_overrides: VecDeque::new(),
                 ambiguous_owner_create_failures: VecDeque::new(),
@@ -177,6 +181,12 @@ impl FakeCalendarRead {
     fn create_google_proposal(&self, draft: &GoogleProposalDraft) -> ProviderResult<CalendarEvent> {
         self.control.begin(FakeOperation::CalendarProposalCreate)?;
         let mut state = self.state.lock().map_err(|_| ProviderError::Unavailable)?;
+        if state
+            .deleted_google_proposal_operation_keys
+            .contains(draft.operation_key())
+        {
+            return Err(ProviderError::Conflict);
+        }
         if let Some(event_index) = state
             .google_proposal_create_drafts
             .iter()
@@ -366,6 +376,12 @@ impl FakeCalendarRead {
         {
             return Err(ProviderError::Conflict);
         }
+        let operation_key = state
+            .google_proposal_create_drafts
+            .get(event_index)
+            .ok_or(ProviderError::Conflict)?
+            .operation_key()
+            .to_owned();
         let change = CalendarChange::deleted(provider_event_id.as_str(), self.control.now())?;
 
         state.google_proposal_events.remove(event_index);
@@ -378,6 +394,9 @@ impl FakeCalendarRead {
         state
             .deleted_google_proposal_ids
             .insert(provider_event_id.as_str().to_owned());
+        state
+            .deleted_google_proposal_operation_keys
+            .insert(operation_key);
         state.changes.push(change);
         Ok(())
     }
@@ -439,6 +458,7 @@ impl CalendarReadProvider for FakeCalendarRead {
         let state = Arc::clone(&self.state);
         let cursor = request.cursor().map(str::to_owned);
         let limit = request.limit();
+        let time_range = request.time_range().clone();
         Box::pin(async move {
             control.begin(FakeOperation::CalendarSync)?;
             let partial_after = control.partial_failure_after(FakeOperation::CalendarSync)?;
@@ -448,14 +468,31 @@ impl CalendarReadProvider for FakeCalendarRead {
                 Some(cursor) => parse_cursor(&cursor, &state)?,
             };
 
-            let available = state.changes.len().saturating_sub(start);
+            let mut prior_event_ranges = BTreeMap::new();
+            for change in state.changes.iter().take(start) {
+                remember_change_range(change, &mut prior_event_ranges);
+            }
+            let matching_positions: Vec<_> = state
+                .changes
+                .iter()
+                .enumerate()
+                .skip(start)
+                .filter_map(|(position, change)| {
+                    change_matches_time_range(change, &time_range, &mut prior_event_ranges)
+                        .then_some(position)
+                })
+                .collect();
+            let available = matching_positions.len();
             let page_count = available.min(limit);
             let failure_after = partial_after.filter(|after| *after < page_count);
             let successful_count = failure_after.unwrap_or(page_count);
-            let items = state.changes[start..start + successful_count].to_vec();
+            let items = matching_positions[..successful_count]
+                .iter()
+                .map(|position| state.changes[*position].clone())
+                .collect();
             let item_failures = match failure_after {
                 Some(_) => {
-                    let failed = &state.changes[start + successful_count];
+                    let failed = &state.changes[matching_positions[successful_count]];
                     vec![ProviderItemFailure::new(
                         FAILURE_SOURCE_ID,
                         failed.provider_event_id(),
@@ -464,11 +501,19 @@ impl CalendarReadProvider for FakeCalendarRead {
                 }
                 None => Vec::new(),
             };
-            let next_position = start + successful_count;
-            let next_cursor =
-                (next_position < state.changes.len()).then(|| cursor_for(next_position));
+            let next_position = failure_after
+                .map(|_| matching_positions[successful_count])
+                .or_else(|| {
+                    (page_count < available)
+                        .then(|| matching_positions[page_count - 1].saturating_add(1))
+                });
+            let next_cursor = next_position
+                .filter(|position| *position < state.changes.len())
+                .map(cursor_for);
             let page = SyncPage::new(items, next_cursor, item_failures)?;
-            if next_position < state.changes.len() {
+            if let Some(next_position) = next_position
+                && next_position < state.changes.len()
+            {
                 state.emitted_cursors.insert(next_position);
             }
             Ok(page)
@@ -925,6 +970,45 @@ fn parse_cursor(cursor: &str, state: &CalendarState) -> ProviderResult<usize> {
     Ok(position)
 }
 
+fn remember_change_range(change: &CalendarChange, event_ranges: &mut BTreeMap<String, TimeRange>) {
+    if let Some(event) = change.event() {
+        event_ranges.insert(
+            event.provider_event_id().to_owned(),
+            event.time_range().clone(),
+        );
+    } else {
+        event_ranges.remove(change.provider_event_id());
+    }
+}
+
+fn change_matches_time_range(
+    change: &CalendarChange,
+    requested_range: &TimeRange,
+    event_ranges: &mut BTreeMap<String, TimeRange>,
+) -> bool {
+    if let Some(event) = change.event() {
+        let matches = ranges_overlap(event.time_range(), requested_range);
+        event_ranges.insert(
+            event.provider_event_id().to_owned(),
+            event.time_range().clone(),
+        );
+        return matches;
+    }
+
+    // A deletion tombstone has no event window. When its preceding upsert is
+    // known, scope it to that event's window; otherwise retain it as an
+    // unscoped invalidation signal so a consumer cannot miss the deletion.
+    event_ranges
+        .remove(change.provider_event_id())
+        .map(|event_range| ranges_overlap(&event_range, requested_range))
+        .unwrap_or(true)
+}
+
+fn ranges_overlap(left: &TimeRange, right: &TimeRange) -> bool {
+    chrono_key(left.start()) < chrono_key(right.end())
+        && chrono_key(left.end()) > chrono_key(right.start())
+}
+
 fn chrono_key(value: DateTime<Utc>) -> (i64, u32) {
     (value.timestamp(), value.timestamp_subsec_nanos())
 }
@@ -1084,6 +1168,111 @@ mod tests {
                 .expect("count"),
             4
         );
+    }
+
+    #[tokio::test]
+    async fn sync_filters_upserts_to_the_requested_half_open_window() {
+        let control = FakeControl::new(now());
+        let fake = FakeCalendarRead::new(
+            control,
+            Vec::<BusyInterval>::new(),
+            [
+                CalendarChange::upsert(
+                    CalendarEvent::new(
+                        "outside-before",
+                        "operation-outside-before",
+                        "outside before",
+                        range("2026-08-29T08:00:00Z", "2026-08-29T09:00:00Z"),
+                        "Australia/Sydney",
+                        std::iter::empty::<CalendarAttendee>(),
+                        now(),
+                    )
+                    .expect("outside-before event"),
+                )
+                .expect("outside-before change"),
+                CalendarChange::upsert(
+                    CalendarEvent::new(
+                        "inside-first",
+                        "operation-inside-first",
+                        "inside first",
+                        range("2026-08-29T10:00:00Z", "2026-08-29T10:30:00Z"),
+                        "Australia/Sydney",
+                        std::iter::empty::<CalendarAttendee>(),
+                        now(),
+                    )
+                    .expect("inside-first event"),
+                )
+                .expect("inside-first change"),
+                CalendarChange::upsert(
+                    CalendarEvent::new(
+                        "outside-after",
+                        "operation-outside-after",
+                        "outside after",
+                        range("2026-08-29T11:00:00Z", "2026-08-29T12:00:00Z"),
+                        "Australia/Sydney",
+                        std::iter::empty::<CalendarAttendee>(),
+                        now(),
+                    )
+                    .expect("outside-after event"),
+                )
+                .expect("outside-after change"),
+                CalendarChange::upsert(
+                    CalendarEvent::new(
+                        "inside-second",
+                        "operation-inside-second",
+                        "inside second",
+                        range("2026-08-29T10:30:00Z", "2026-08-29T11:00:00Z"),
+                        "Australia/Sydney",
+                        std::iter::empty::<CalendarAttendee>(),
+                        now(),
+                    )
+                    .expect("inside-second event"),
+                )
+                .expect("inside-second change"),
+            ],
+        );
+        let request = |cursor: Option<String>, limit| {
+            CalendarSyncRequest::new(
+                range("2026-08-29T10:00:00Z", "2026-08-29T11:00:00Z"),
+                cursor,
+                limit,
+            )
+            .expect("request")
+        };
+
+        let first = fake
+            .sync_calendar(&session(), &request(None, 1))
+            .await
+            .expect("first filtered page");
+        assert_eq!(
+            first
+                .items()
+                .iter()
+                .map(CalendarChange::provider_event_id)
+                .collect::<Vec<_>>(),
+            vec!["inside-first"]
+        );
+        let cursor = first.next_cursor().expect("filtered cursor").to_owned();
+
+        let second = fake
+            .sync_calendar(&session(), &request(Some(cursor.clone()), 1))
+            .await
+            .expect("second filtered page");
+        assert_eq!(
+            second
+                .items()
+                .iter()
+                .map(CalendarChange::provider_event_id)
+                .collect::<Vec<_>>(),
+            vec!["inside-second"]
+        );
+        assert_eq!(second.next_cursor(), None);
+
+        let retry = fake
+            .sync_calendar(&session(), &request(Some(cursor), 1))
+            .await
+            .expect("same filtered cursor retry");
+        assert_eq!(retry, second);
     }
 
     #[tokio::test]
@@ -1793,6 +1982,55 @@ mod tests {
                 .expect("state")
                 .google_proposal_events,
             vec![promoted]
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_google_proposal_operation_key_cannot_be_recreated() {
+        let control = FakeControl::new(now());
+        let fake = FakeGoogleCalendar::new(
+            control.clone(),
+            Vec::<BusyInterval>::new(),
+            Vec::<CalendarChange>::new(),
+        );
+        let draft = google_proposal_draft("google-deleted-retry", "Discuss");
+        let created = fake.create_proposal(&draft).expect("proposal");
+        let id = provider_event_id(&created);
+
+        fake.delete_proposal(&id).expect("delete proposal");
+        let before_retry = fake
+            .sync_calendar(&session(), &sync_request())
+            .await
+            .expect("delete history");
+        assert_eq!(before_retry.items().len(), 2);
+
+        assert_eq!(
+            fake.create_proposal(&draft),
+            Err(ProviderError::Conflict),
+            "deleted operation keys must fail closed"
+        );
+        {
+            let state = fake.read.state.lock().expect("state");
+            assert!(state.google_proposal_events.is_empty());
+            assert!(state.google_proposal_create_drafts.is_empty());
+            assert_eq!(state.next_google_event_sequence, 2);
+            assert!(
+                state
+                    .deleted_google_proposal_operation_keys
+                    .contains(draft.operation_key())
+            );
+        }
+
+        let after_retry = fake
+            .sync_calendar(&session(), &sync_request())
+            .await
+            .expect("unchanged delete history");
+        assert_eq!(after_retry, before_retry);
+        assert_eq!(
+            control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            2
         );
     }
 
