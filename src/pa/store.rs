@@ -8785,13 +8785,14 @@ END;
                             booking_horizon_days, meeting_buffer_minutes, retention_days,
                             task_duration_bill_minutes, task_duration_callback_minutes,
                             task_duration_reading_minutes, task_duration_email_reply_minutes,
-                            task_duration_preparation_minutes, email_triage_model
+                            task_duration_preparation_minutes, email_triage_model,
+                            created_at, updated_at
                      FROM configuration WHERE id = 1",
                 )
                 .expect("configuration snapshot query");
             statement
                 .query_row([], |row| {
-                    (0..16)
+                    (0..18)
                         .map(|column| row.get::<_, Value>(column))
                         .collect::<rusqlite::Result<Vec<_>>>()
                 })
@@ -8830,12 +8831,13 @@ END;
                         booking_horizon_days, meeting_buffer_minutes, retention_days,
                         task_duration_bill_minutes, task_duration_callback_minutes,
                         task_duration_reading_minutes, task_duration_email_reply_minutes,
-                        task_duration_preparation_minutes, email_triage_model
+                        task_duration_preparation_minutes, email_triage_model,
+                        created_at, updated_at
                  FROM configuration WHERE id = 1",
             )
             .expect("configuration snapshot query")
             .query_row([], |row| {
-                (0..16)
+                (0..18)
                     .map(|column| row.get::<_, Value>(column))
                     .collect::<rusqlite::Result<Vec<_>>>()
             })
@@ -11955,6 +11957,20 @@ END;
         assert_eq!(defaults.task_duration_email_reply_minutes, 30);
         assert_eq!(defaults.task_duration_preparation_minutes, 60);
         assert_eq!(defaults.email_triage_model, "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn fresh_store_starts_configuration_version_at_one() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open current store");
+        let version: i64 = store
+            .connection()
+            .query_row(
+                "SELECT version FROM configuration WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fresh configuration version");
+        assert_eq!(version, 1);
     }
 
     #[test]
