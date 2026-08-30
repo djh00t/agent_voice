@@ -64,8 +64,8 @@ evidence tier only.
 
 | Check | Command | Result |
 | --- | --- | --- |
-| Focused fake tests | `rtk cargo test --lib pa::fakes::triage` | `8 passed, 426 filtered out` |
-| Full library tests | `rtk cargo test --lib` | `434 passed` |
+| Focused fake tests | `rtk cargo test --lib pa::fakes::triage` | `8 passed, 428 filtered out` |
+| Full library tests | `rtk cargo test --lib` | `436 passed` |
 | Doctests | `rtk cargo test --doc` | `3 passed` |
 | Warning-denied Rust docs | `rtk env RUSTDOCFLAGS=-Dwarnings cargo doc --no-deps` | Finished; docs generated at `target/doc/agent_voice/index.html` |
 | Scoped formatting | `rtk rustfmt --edition 2024 --check src/pa/fakes/triage.rs` | Passed |
