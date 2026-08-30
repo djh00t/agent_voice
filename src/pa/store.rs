@@ -9291,13 +9291,13 @@ END;
                 "empty idempotency key",
                 Some("scope"),
                 Some(""),
-                Some("empty-key-fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
             ),
             (
                 "whitespace-only idempotency key",
                 Some("scope"),
                 Some("   "),
-                Some("whitespace-key-fingerprint"),
+                Some(VALID_HTTP_FINGERPRINT),
             ),
             (
                 "empty fingerprint",
