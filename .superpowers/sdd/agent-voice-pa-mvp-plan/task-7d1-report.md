@@ -72,6 +72,18 @@ schema selectors then exited `0`; a fresh controller `rtk make check` exited
 locked website build. The separate cumulative-diff commit-splitting finding
 was answered with GitHub metadata proving every PR commit changes one file.
 
+## Round-4 SQLite storage hardening
+
+Current-head review found that one-argument SQLite `trim()` removes only ASCII
+space and that column affinity alone does not enforce storage classes. RED
+coverage proved tab-only identities and wrong-type fields were accepted.
+Source-only commit `6d5657468cd5168bd35e85b02c7c7712b4b68faa` now enforces the exact bounded ASCII identifier
+grammars at the schema boundary and requires the contracted SQLite storage
+class for every required field and each present response field. All five v14
+selectors passed after the fix. A fresh controller `rtk make check` exited `0`
+with 515 tests, three compile-fail doctests, Clippy, rustdoc, and the locked
+website build.
+
 ## Evidence records
 
 | evidence_id | order | command | expected_exit | observed_exit | selector_or_diagnostic | evidence_tier | status | artifact_ref | non_claim | reviewer |
@@ -87,6 +99,8 @@ was answered with GitHub metadata proving every PR commit changes one file.
 | EV-13F-08 | 8 | `rtk make check` | 0 | 0 | 514-test suite, Clippy, rustdoc, docs | LOCAL | CONFIRMED | `NONE` | does not prove CI, live, provider, OAuth, cluster, or UAT behavior | NONE |
 | EV-13F-09 | 9 | `rtk cargo test --lib pa::store::tests::http_idempotency_v14_constraints_reject_invalid_rows -- --exact` | nonzero then 0 | 101 then 0 | empty and whitespace-only scope/key/fingerprint rejected | LOCAL | CONFIRMED | `7a874473ae32d179d9f5068dfafe81afe7bb91c9` | does not prove runtime decoding or reservation behavior | Codex PR review |
 | EV-13F-10 | 10 | `rtk make check` | 0 | 0 | post-review 514-test suite, compile-fail doctests, Clippy, rustdoc, docs | LOCAL | CONFIRMED | `7a874473ae32d179d9f5068dfafe81afe7bb91c9` | does not prove current-head CI or live behavior | controller |
+| EV-13F-11 | 11 | v14 invalid-row and wrong-storage-class exact selectors | nonzero then 0 | 101 then 0 | non-space whitespace and wrong SQLite storage classes rejected | LOCAL | CONFIRMED | `6d5657468cd5168bd35e85b02c7c7712b4b68faa` | does not prove runtime decoding | Codex PR review |
+| EV-13F-12 | 12 | `rtk make check` | 0 | 0 | post-hardening 515-test suite, compile-fail doctests, Clippy, rustdoc, docs | LOCAL | CONFIRMED | `6d5657468cd5168bd35e85b02c7c7712b4b68faa` | does not prove current-head CI or live behavior | controller |
 
 ## Round-1 findings and resolutions
 
@@ -145,6 +159,7 @@ Controller review must verify the exact base/stack, one-file source commit, migr
 - Source commit: `25a905225f34641699d5fa08fc3da3110ca6e2c6`.
 - Round-2 source follow-up: `25074b38e5a0e0bfe9c2505bb669badddbc740e7`.
 - Round-3 source remediation: `7a874473ae32d179d9f5068dfafe81afe7bb91c9`.
+- Round-4 source remediation: `6d5657468cd5168bd35e85b02c7c7712b4b68faa`.
 - Prior report commits: `0f711bf03eecf009980de96e8b4990fb5de9389a`, `ddc35eab9aff4955d11b8ac1d54d5557c4bbaa8f`.
 - Report commit state: containing commit; resolve with `rtk git log -1 --format=%H -- .superpowers/sdd/agent-voice-pa-mvp-plan/task-7d1-report.md` after this report is committed.
 - Reviewer: pending controller review.
