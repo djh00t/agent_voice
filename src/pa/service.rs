@@ -7,22 +7,26 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
+use ring::digest;
 use time::{OffsetDateTime, UtcOffset};
 
 use super::availability::{AvailabilityError, AvailabilityPolicy};
 use super::domain::{
     AppointmentDraft, AppointmentKind, AppointmentSlot, CallerIdentity, DomainError,
-    IdempotencyKey, Quote, QuoteId,
+    IdempotencyKey, ProposalState, Quote, QuoteId,
 };
 use super::providers::{
-    GoogleCalendarProvider, MailAddress, OutlookCalendarProvider, ProviderError, ProviderSession,
-    TimeRange,
+    CalendarAttendee, CalendarEvent, GoogleCalendarProvider, GoogleProposalDraft, MailAddress,
+    OutlookCalendarProvider, ProviderError, ProviderSession, TimeRange,
 };
 use super::store::{
     AuditEntityType, AuditEventType, MAX_APPOINTMENT_QUOTE_SLOTS, MessageProvider, MessageSummary,
     NotificationKind, NotificationRecipient, NotificationTemplateData, PaStore, StoreError,
-    validate_message_idempotency_key, validate_message_source_id, validate_provider_message_id,
+    StoredAppointmentQuoteState, validate_message_idempotency_key, validate_message_source_id,
+    validate_provider_message_id,
 };
+
+const PENDING_PROPOSAL_TITLE: &str = "Pending assistant request";
 
 /// The result type returned by personal-assistant services.
 pub type ServiceResult<T> = Result<T, ServiceError>;
@@ -146,6 +150,8 @@ impl fmt::Debug for AvailabilitySearch {
 pub struct PreparedRequest {
     draft_id: i64,
     quote_id: QuoteId,
+    source_id: String,
+    idempotency_key: IdempotencyKey,
     caller: CallerIdentity,
     kind: AppointmentKind,
     starts_at: OffsetDateTime,
@@ -153,6 +159,95 @@ pub struct PreparedRequest {
     timezone: String,
     requester_included: bool,
     recap: String,
+}
+
+/// A capability minted by the trusted affirmative voice/HTTP boundary.
+///
+/// The constructor is crate-private so transcripts, booleans, and external
+/// request payloads cannot manufacture confirmation outside the application.
+pub struct ExplicitConfirmation(());
+
+impl ExplicitConfirmation {
+    /// Mints one confirmation capability after the affirmative boundary has
+    /// already made its own policy decision.
+    #[allow(dead_code)]
+    pub(crate) fn new() -> Self {
+        Self(())
+    }
+}
+
+impl fmt::Debug for ExplicitConfirmation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ExplicitConfirmation(<redacted>)")
+    }
+}
+
+/// The exact prepared request that crossed the explicit confirmation gate.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConfirmedPreparedRequest(PreparedRequest);
+
+impl ConfirmedPreparedRequest {
+    /// Consumes the exact prepared recap and a trusted affirmative capability.
+    pub fn new(
+        prepared: PreparedRequest,
+        _confirmation: ExplicitConfirmation,
+    ) -> ServiceResult<Self> {
+        Ok(Self(prepared))
+    }
+}
+
+impl fmt::Debug for ConfirmedPreparedRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConfirmedPreparedRequest(<redacted>)")
+    }
+}
+
+/// The durable result of submitting one confirmed request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SubmittedRequest {
+    proposal_id: i64,
+    event_mapping_id: i64,
+    owner_notification_id: i64,
+    requester_notification_id: Option<i64>,
+    state: ProposalState,
+}
+
+impl SubmittedRequest {
+    /// Returns the durable pending proposal identity.
+    pub const fn proposal_id(&self) -> i64 {
+        self.proposal_id
+    }
+
+    /// Returns the durable event-mapping identity.
+    pub const fn event_mapping_id(&self) -> i64 {
+        self.event_mapping_id
+    }
+
+    /// Returns the durable owner-notification identity.
+    pub const fn owner_notification_id(&self) -> i64 {
+        self.owner_notification_id
+    }
+
+    /// Returns the requester notification identity when policy includes it.
+    pub const fn requester_notification_id(&self) -> Option<i64> {
+        self.requester_notification_id
+    }
+
+    /// Returns the durable proposal lifecycle state.
+    pub const fn state(&self) -> ProposalState {
+        self.state
+    }
+
+    /// Submission always means pending/requested, never booked.
+    pub const fn is_pending(&self) -> bool {
+        matches!(self.state, ProposalState::Pending)
+    }
+}
+
+impl fmt::Debug for SubmittedRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SubmittedRequest { ids: <redacted>, state: Pending }")
+    }
 }
 
 impl PreparedRequest {
@@ -517,12 +612,12 @@ impl<'a> PaService<'a> {
                 now.to_offset(UtcOffset::UTC),
             )
             .map_err(ServiceError::Store)?;
-        let stored_draft =
-            prepared
-                .draft()
-                .ok_or(ServiceError::Store(StoreError::StoredRecordInvalid {
-                    resource: "appointment quote",
-                }))?;
+        let stored_draft_record = prepared.appointment_draft().ok_or(ServiceError::Store(
+            StoreError::StoredRecordInvalid {
+                resource: "appointment quote",
+            },
+        ))?;
+        let stored_draft = stored_draft_record.draft();
         let draft_id = prepared.appointment_draft_id().ok_or(ServiceError::Store(
             StoreError::StoredRecordInvalid {
                 resource: "appointment quote",
@@ -533,6 +628,8 @@ impl<'a> PaService<'a> {
         Ok(PreparedRequest {
             draft_id,
             quote_id: prepared.quote_id(),
+            source_id: stored_draft_record.source_id().to_owned(),
+            idempotency_key: stored_draft.idempotency_key().clone(),
             caller: stored_draft.caller().clone(),
             kind: stored_draft.kind(),
             starts_at: stored_draft.starts_at(),
@@ -642,6 +739,479 @@ impl<'a> PaService<'a> {
             notification_id: notification.id(),
         })
     }
+
+    /// Submits one explicitly confirmed prepared request as a pending Google
+    /// proposal. Calendar availability is rechecked immediately before a new
+    /// external create, while every local tail write is independently
+    /// idempotent and therefore repairable after a partial failure.
+    pub async fn submit_request(
+        &self,
+        confirmed: ConfirmedPreparedRequest,
+        now: OffsetDateTime,
+    ) -> ServiceResult<SubmittedRequest> {
+        let owner = self
+            .owner
+            .as_ref()
+            .ok_or(ServiceError::OwnerNotConfigured)?;
+        let prepared = confirmed.0;
+        let validation_now = now.to_offset(UtcOffset::UTC);
+        let quote = self
+            .store
+            .load_appointment_quote_by_draft_id(prepared.draft_id)
+            .map_err(ServiceError::Store)?;
+        let stored_draft = quote.appointment_draft().ok_or(ServiceError::Store(
+            StoreError::StoredRecordInvalid {
+                resource: "appointment quote",
+            },
+        ))?;
+        validate_prepared_request(&prepared, &quote, stored_draft)?;
+        match quote.state() {
+            StoredAppointmentQuoteState::Prepared if validation_now < quote.quote().issued_at() => {
+                return Err(ServiceError::Store(StoreError::AppointmentQuoteNotYetValid));
+            }
+            StoredAppointmentQuoteState::Prepared
+                if validation_now >= quote.quote().expires_at() =>
+            {
+                return Err(ServiceError::Store(StoreError::AppointmentQuoteExpired));
+            }
+            StoredAppointmentQuoteState::Prepared | StoredAppointmentQuoteState::Consumed => {}
+            StoredAppointmentQuoteState::Issued => {
+                return Err(ServiceError::Store(StoreError::Conflict {
+                    resource: "appointment quote",
+                }));
+            }
+        }
+        let durable_now = canonicalize_submission_timestamp(
+            validation_now,
+            quote.quote().issued_at(),
+            quote.quote().expires_at(),
+        )?;
+
+        let draft = stored_draft.draft();
+        let draft_id = stored_draft.id();
+        let proposal_key = format!("pa-proposal-draft-{draft_id}");
+        let proposal_source = format!("pa-proposal-source-draft-{draft_id}");
+        let mapping_source = |proposal_id| event_mapping_source(proposal_id, owner);
+
+        let existing_proposal = match quote.proposal_id() {
+            Some(proposal_id) => {
+                let proposal = self
+                    .store
+                    .load_proposal_by_id(proposal_id)
+                    .map_err(ServiceError::Store)?;
+                validate_existing_proposal(&proposal, draft_id, &proposal_key, &proposal_source)?;
+                Some(proposal)
+            }
+            None => None,
+        };
+
+        let existing_mapping = if let Some(proposal) = &existing_proposal {
+            match self.store.load_event_mapping_by_proposal_id(proposal.id()) {
+                Ok(mapping) => {
+                    validate_existing_mapping(
+                        &mapping,
+                        proposal.id(),
+                        &mapping_source(proposal.id()),
+                        draft,
+                    )?;
+                    Some(mapping)
+                }
+                Err(StoreError::NotFound {
+                    resource: "event mapping",
+                }) => None,
+                Err(error) => return Err(ServiceError::Store(error)),
+            }
+        } else {
+            None
+        };
+
+        let (proposal, mapping) = if let Some(mapping) = existing_mapping {
+            (existing_proposal.expect("mapping has a proposal"), mapping)
+        } else {
+            if existing_proposal.is_none() {
+                let recheck_start = draft
+                    .starts_at()
+                    .checked_sub(self.policy.meeting_buffer())
+                    .ok_or(ServiceError::Availability(
+                        AvailabilityError::DateTimeOverflow,
+                    ))?;
+                let recheck_end = draft
+                    .ends_at()
+                    .checked_add(self.policy.meeting_buffer())
+                    .ok_or(ServiceError::Availability(
+                        AvailabilityError::DateTimeOverflow,
+                    ))?;
+                let recheck =
+                    TimeRange::new(to_chrono_utc(recheck_start)?, to_chrono_utc(recheck_end)?)
+                        .map_err(|_| ServiceError::InvalidInput {
+                            field: "time_range",
+                        })?;
+                let outlook_busy = self
+                    .outlook
+                    .list_busy(self.outlook_session, &recheck)
+                    .await
+                    .map_err(ServiceError::OutlookCalendar)?;
+                let google_busy = self
+                    .google
+                    .list_busy(self.google_session, &recheck)
+                    .await
+                    .map_err(ServiceError::GoogleCalendar)?;
+                if busy_overlaps(&outlook_busy, recheck_start, recheck_end)
+                    || busy_overlaps(&google_busy, recheck_start, recheck_end)
+                {
+                    return Err(ServiceError::NoAvailability);
+                }
+            }
+            let time_range = TimeRange::new(
+                to_chrono_utc(draft.starts_at())?,
+                to_chrono_utc(draft.ends_at())?,
+            )
+            .map_err(|_| ServiceError::InvalidInput {
+                field: "time_range",
+            })?;
+            let proposal_draft = GoogleProposalDraft::from_owner(
+                proposal_operation_key(draft_id),
+                PENDING_PROPOSAL_TITLE,
+                time_range,
+                quote.timezone(),
+                CalendarAttendee::needs_action(owner.clone()),
+            )
+            .map_err(ServiceError::GoogleCalendar)?;
+
+            let found = match self
+                .google
+                .find_proposal(self.google_session, &proposal_draft)
+                .await
+            {
+                Ok(event) => {
+                    validate_pending_google_event(&event, &proposal_draft, owner)?;
+                    Some(event)
+                }
+                Err(ProviderError::NotFound) => None,
+                Err(error) => return Err(ServiceError::GoogleCalendar(error)),
+            };
+
+            let (proposal, event) = if let Some(event) = found {
+                let proposal = match existing_proposal {
+                    Some(proposal) => proposal,
+                    None => self
+                        .store
+                        .submit_appointment_quote(
+                            quote.quote_id(),
+                            draft_id,
+                            &proposal_key,
+                            &proposal_source,
+                            durable_now,
+                        )
+                        .map_err(ServiceError::Store)?,
+                };
+                (proposal, event)
+            } else {
+                if existing_proposal.is_some() {
+                    let recheck_start = draft
+                        .starts_at()
+                        .checked_sub(self.policy.meeting_buffer())
+                        .ok_or(ServiceError::Availability(
+                            AvailabilityError::DateTimeOverflow,
+                        ))?;
+                    let recheck_end = draft
+                        .ends_at()
+                        .checked_add(self.policy.meeting_buffer())
+                        .ok_or(ServiceError::Availability(
+                            AvailabilityError::DateTimeOverflow,
+                        ))?;
+                    let recheck =
+                        TimeRange::new(to_chrono_utc(recheck_start)?, to_chrono_utc(recheck_end)?)
+                            .map_err(|_| ServiceError::InvalidInput {
+                                field: "time_range",
+                            })?;
+                    let outlook_busy = self
+                        .outlook
+                        .list_busy(self.outlook_session, &recheck)
+                        .await
+                        .map_err(ServiceError::OutlookCalendar)?;
+                    let google_busy = self
+                        .google
+                        .list_busy(self.google_session, &recheck)
+                        .await
+                        .map_err(ServiceError::GoogleCalendar)?;
+                    if busy_overlaps(&outlook_busy, recheck_start, recheck_end)
+                        || busy_overlaps(&google_busy, recheck_start, recheck_end)
+                    {
+                        return Err(ServiceError::NoAvailability);
+                    }
+                }
+                let proposal = match existing_proposal {
+                    Some(proposal) => proposal,
+                    None => self
+                        .store
+                        .submit_appointment_quote(
+                            quote.quote_id(),
+                            draft_id,
+                            &proposal_key,
+                            &proposal_source,
+                            durable_now,
+                        )
+                        .map_err(ServiceError::Store)?,
+                };
+                let event = self
+                    .google
+                    .create_proposal(self.google_session, &proposal_draft)
+                    .await
+                    .map_err(ServiceError::GoogleCalendar)?;
+                validate_pending_google_event(&event, &proposal_draft, owner)?;
+                (proposal, event)
+            };
+
+            let mapping = self
+                .store
+                .attach_event_mapping(
+                    proposal.id(),
+                    "google_calendar",
+                    event.provider_event_id(),
+                    mapping_source(proposal.id()),
+                    Some(draft.starts_at()),
+                    Some(draft.ends_at()),
+                )
+                .map_err(ServiceError::Store)?;
+            (proposal, mapping)
+        };
+
+        let consumed_at = self
+            .store
+            .load_appointment_quote_by_id(quote.quote_id())
+            .map_err(ServiceError::Store)?
+            .consumed_at()
+            .ok_or(ServiceError::Store(StoreError::StoredRecordInvalid {
+                resource: "appointment quote",
+            }))?;
+        let template = NotificationTemplateData::new(
+            Some(PENDING_PROPOSAL_TITLE.to_owned()),
+            Some(draft.starts_at()),
+            Some(draft.ends_at()),
+            Some(quote.timezone().to_owned()),
+            Some(draft.kind()),
+            Some(ProposalState::Pending),
+        )
+        .map_err(ServiceError::Store)?;
+        let owner_recipient =
+            NotificationRecipient::new(owner.as_str().to_owned()).map_err(ServiceError::Store)?;
+        let owner_notification = self
+            .store
+            .enqueue_notification(
+                format!("pa-notify-owner-{}", proposal.id()),
+                Some(proposal.id()),
+                Some(mapping.id()),
+                NotificationKind::ProposalRequested,
+                owner_recipient,
+                template.clone(),
+                consumed_at,
+            )
+            .map_err(ServiceError::Store)?;
+        let requester_notification = if draft.requester_included() {
+            let requester = NotificationRecipient::new(draft.caller().email().to_owned())
+                .map_err(ServiceError::Store)?;
+            Some(
+                self.store
+                    .enqueue_notification(
+                        format!("pa-notify-requester-{}", proposal.id()),
+                        Some(proposal.id()),
+                        Some(mapping.id()),
+                        NotificationKind::ProposalRequested,
+                        requester,
+                        template,
+                        consumed_at,
+                    )
+                    .map_err(ServiceError::Store)?,
+            )
+        } else {
+            None
+        };
+
+        append_submission_audit(
+            self.store,
+            format!("pa-audit-request-submitted-{draft_id}"),
+            AuditEventType::RequestSubmitted,
+            AuditEntityType::AppointmentRequest,
+            draft_id.to_string(),
+            consumed_at,
+        )?;
+        append_submission_audit(
+            self.store,
+            format!("pa-audit-proposal-created-{}", proposal.id()),
+            AuditEventType::ProposalCreated,
+            AuditEntityType::Proposal,
+            proposal.id().to_string(),
+            consumed_at,
+        )?;
+        append_submission_audit(
+            self.store,
+            format!("pa-audit-notification-enqueued-owner-{}", proposal.id()),
+            AuditEventType::NotificationEnqueued,
+            AuditEntityType::Notification,
+            owner_notification.id().to_string(),
+            consumed_at,
+        )?;
+        if let Some(requester_notification) = &requester_notification {
+            append_submission_audit(
+                self.store,
+                format!("pa-audit-notification-enqueued-requester-{}", proposal.id()),
+                AuditEventType::NotificationEnqueued,
+                AuditEntityType::Notification,
+                requester_notification.id().to_string(),
+                consumed_at,
+            )?;
+        }
+
+        Ok(SubmittedRequest {
+            proposal_id: proposal.id(),
+            event_mapping_id: mapping.id(),
+            owner_notification_id: owner_notification.id(),
+            requester_notification_id: requester_notification.map(|notification| notification.id()),
+            state: ProposalState::Pending,
+        })
+    }
+}
+
+fn proposal_operation_key(draft_id: i64) -> String {
+    format!("pa-google-proposal-draft-{draft_id}")
+}
+
+fn event_mapping_source(proposal_id: i64, owner: &MailAddress) -> String {
+    format!(
+        "pa-event-source-{proposal_id}-{}",
+        owner_fingerprint(owner.as_str())
+    )
+}
+
+fn owner_fingerprint(owner: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = digest::digest(&digest::SHA256, owner.as_bytes());
+    let mut fingerprint = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        fingerprint.push(char::from(HEX[usize::from(byte >> 4)]));
+        fingerprint.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    fingerprint
+}
+
+fn validate_prepared_request(
+    prepared: &PreparedRequest,
+    quote: &super::store::StoredAppointmentQuote,
+    stored_draft: &super::store::StoredAppointmentDraft,
+) -> ServiceResult<()> {
+    let draft = stored_draft.draft();
+    let selected_slot = quote
+        .selected_slot_index()
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| quote.offered_slots().get(index))
+        .ok_or(ServiceError::Store(StoreError::StoredRecordInvalid {
+            resource: "appointment quote",
+        }))?;
+    let expected_recap = appointment_recap(draft, quote.timezone())?;
+    if prepared.draft_id != stored_draft.id()
+        || prepared.quote_id != quote.quote_id()
+        || prepared.source_id != stored_draft.source_id()
+        || prepared.idempotency_key != *draft.idempotency_key()
+        || prepared.caller != *draft.caller()
+        || prepared.kind != draft.kind()
+        || prepared.starts_at != draft.starts_at()
+        || prepared.ends_at != draft.ends_at()
+        || prepared.timezone != quote.timezone()
+        || prepared.requester_included != draft.requester_included()
+        || selected_slot.starts_at() != draft.starts_at()
+        || selected_slot.ends_at() != draft.ends_at()
+        || draft.starts_at().offset() != UtcOffset::UTC
+        || draft.ends_at().offset() != UtcOffset::UTC
+        || expected_recap != prepared.recap
+        || draft.quote_id() != quote.quote_id()
+        || draft.ends_at() <= draft.starts_at()
+    {
+        return Err(ServiceError::Store(StoreError::Conflict {
+            resource: "prepared appointment request",
+        }));
+    }
+    Ok(())
+}
+
+fn validate_existing_proposal(
+    proposal: &super::store::StoredProposal,
+    draft_id: i64,
+    proposal_key: &str,
+    proposal_source: &str,
+) -> ServiceResult<()> {
+    if proposal.source().appointment_draft_id() != Some(draft_id)
+        || proposal.idempotency_key() != proposal_key
+        || proposal.source_id() != proposal_source
+        || proposal.state() != ProposalState::Pending
+    {
+        return Err(ServiceError::Store(StoreError::Conflict {
+            resource: "appointment request proposal",
+        }));
+    }
+    Ok(())
+}
+
+fn validate_existing_mapping(
+    mapping: &super::store::StoredEventMapping,
+    proposal_id: i64,
+    expected_source: &str,
+    draft: &AppointmentDraft,
+) -> ServiceResult<()> {
+    if mapping.proposal_id() != proposal_id
+        || mapping.provider() != "google_calendar"
+        || mapping.source_id() != expected_source
+        || mapping.starts_at() != Some(draft.starts_at())
+        || mapping.ends_at() != Some(draft.ends_at())
+    {
+        return Err(ServiceError::Store(StoreError::Conflict {
+            resource: "appointment request mapping",
+        }));
+    }
+    Ok(())
+}
+
+fn validate_pending_google_event(
+    event: &CalendarEvent,
+    draft: &GoogleProposalDraft,
+    owner: &MailAddress,
+) -> ServiceResult<()> {
+    let valid = event.operation_key() == draft.operation_key()
+        && event.title() == draft.pending_title()
+        && event.time_range() == draft.time_range()
+        && event.timezone() == draft.timezone()
+        && event.attendees().len() == 1
+        && event.attendees()[0].address() == owner
+        && event.attendees()[0].rsvp().is_needs_action();
+    if valid {
+        Ok(())
+    } else {
+        Err(ServiceError::GoogleCalendar(ProviderError::Conflict))
+    }
+}
+
+fn busy_overlaps(
+    intervals: &[super::availability::BusyInterval],
+    starts_at: OffsetDateTime,
+    ends_at: OffsetDateTime,
+) -> bool {
+    intervals
+        .iter()
+        .any(|interval| interval.starts_at() < ends_at && interval.ends_at() > starts_at)
+}
+
+fn append_submission_audit(
+    store: &PaStore,
+    key: String,
+    event_type: AuditEventType,
+    entity_type: AuditEntityType,
+    entity_id: String,
+    occurred_at: OffsetDateTime,
+) -> ServiceResult<()> {
+    store
+        .append_audit_event(key, event_type, entity_type, entity_id, occurred_at)
+        .map(|_| ())
+        .map_err(ServiceError::Store)
 }
 
 fn appointment_recap(draft: &AppointmentDraft, timezone: &str) -> ServiceResult<String> {
@@ -686,9 +1256,37 @@ fn canonicalize_utc_second(
         .map_err(|_| ServiceError::Store(StoreError::InvalidInput { field }))
 }
 
+fn canonicalize_submission_timestamp(
+    validation_now: OffsetDateTime,
+    issued_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+) -> ServiceResult<OffsetDateTime> {
+    let durable_now = canonicalize_utc_second(validation_now, "now")?;
+    if durable_now >= issued_at {
+        return Ok(durable_now);
+    }
+
+    // A fractional issue instant can be later than the truncated second even
+    // though validation_now is already within the quote's validity window.
+    // Carry the durable timestamp to the next whole second while retaining
+    // the full-precision boundary decision above.
+    let next_second =
+        durable_now
+            .checked_add(time::Duration::seconds(1))
+            .ok_or(ServiceError::Availability(
+                AvailabilityError::DateTimeOverflow,
+            ))?;
+    if next_second >= expires_at {
+        return Err(ServiceError::Store(StoreError::Conflict {
+            resource: "appointment quote",
+        }));
+    }
+    Ok(next_second)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PaService, ServiceError};
+    use super::{ConfirmedPreparedRequest, ExplicitConfirmation, PaService, ServiceError};
     use crate::pa::availability::{
         AvailabilityError, AvailabilityPolicy, BusyInterval, default_working_windows,
     };
@@ -697,12 +1295,17 @@ mod tests {
         QuoteId,
     };
     use crate::pa::fakes::{FakeControl, FakeGoogleCalendar, FakeOperation, FakeOutlookCalendar};
-    use crate::pa::providers::{CalendarChange, ProviderError, ProviderSession, RetryAfter};
+    use crate::pa::providers::{
+        CalendarAttendee, CalendarChange, CalendarEvent, GoogleCalendarProvider,
+        GoogleProposalDraft, MailAddress, ProviderError, ProviderSession, RetryAfter, TimeRange,
+    };
     use crate::pa::store::{
         AuditEntityType, AuditEventType, MessageProvider, MessageSummary, PaStore, StoreError,
     };
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    use time::{Date, Duration, OffsetDateTime, Time, format_description::well_known::Rfc3339};
+    use time::{
+        Date, Duration, OffsetDateTime, Time, UtcOffset, format_description::well_known::Rfc3339,
+    };
 
     #[test]
     fn flat_pa_module_exports_service_facade() {
@@ -1773,6 +2376,1501 @@ mod tests {
                 .invocation_count(FakeOperation::CalendarBusy)
                 .expect("google count"),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_submission_creates_one_owner_only_pending_proposal_and_outbox_rows() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let owner = MailAddress::new("owner@example.test").expect("owner");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            owner,
+        );
+        let caller = CallerIdentity::new(
+            "Ada Lovelace",
+            ConfirmedEmail::confirm("ada@example.test").expect("email"),
+        )
+        .expect("caller");
+        let search = service
+            .search_slots(AppointmentKind::Meeting, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                caller,
+                AppointmentKind::Meeting,
+                None,
+                "voice:submit-1",
+                IdempotencyKey::new("appointment:submit-1").expect("key"),
+                now,
+            )
+            .expect("prepare");
+
+        let submitted = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect("submit");
+
+        assert_eq!(submitted.state(), crate::pa::domain::ProposalState::Pending);
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM event_mappings", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("mapping count"),
+            1
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM notification_outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("notification count"),
+            2
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM audit_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("audit count"),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_submission_notifies_only_the_owner() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:callback-submit",
+                IdempotencyKey::new("appointment:callback-submit").expect("key"),
+                now,
+            )
+            .expect("prepare");
+
+        let result = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect("submit");
+
+        assert!(result.is_pending());
+        assert_eq!(result.requester_notification_id(), None);
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn newly_busy_slot_fails_before_local_proposal_creation() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let owner = MailAddress::new("owner@example.test").expect("owner");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            owner.clone(),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:busy-submit",
+                IdempotencyKey::new("appointment:busy-submit").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        let range = TimeRange::new(
+            super::to_chrono_utc(prepared.starts_at()).expect("start"),
+            super::to_chrono_utc(prepared.ends_at()).expect("end"),
+        )
+        .expect("range");
+        let occupied = GoogleProposalDraft::from_owner(
+            "unrelated-proposal",
+            super::PENDING_PROPOSAL_TITLE,
+            range,
+            prepared.timezone(),
+            CalendarAttendee::needs_action(owner),
+        )
+        .expect("occupied draft");
+        google
+            .create_proposal(&google_session, &occupied)
+            .await
+            .expect("occupy slot");
+
+        let error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("busy slot must fail closed");
+        assert!(matches!(error, ServiceError::NoAvailability));
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM proposals", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("proposal count"),
+            0
+        );
+        assert!(
+            store
+                .list_audit_events(None, 10)
+                .expect("audits")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_pending_notifications()
+                .expect("outbox")
+                .is_empty()
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_recheck_enforces_pre_and_post_buffer_but_zero_buffer_is_unchanged() {
+        for (name, pre_buffer, buffer, expected_blocked) in [
+            ("pre", true, Duration::minutes(15), true),
+            ("post", false, Duration::minutes(15), true),
+            ("zero", true, Duration::ZERO, false),
+        ] {
+            let now = now();
+            let outlook_control = control(now);
+            let google_control = control(now);
+            let (store, outlook, google, outlook_session, google_session) =
+                fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+            let owner = MailAddress::new("owner@example.test").expect("owner");
+            let policy = AvailabilityPolicy::new(
+                "UTC",
+                default_working_windows(),
+                Duration::ZERO,
+                Duration::hours(2),
+                buffer,
+            )
+            .expect("policy");
+            let service = PaService::with_owner(
+                &store,
+                &outlook,
+                &outlook_session,
+                &google,
+                &google_session,
+                &policy,
+                owner.clone(),
+            );
+            let search = service
+                .search_slots(AppointmentKind::Callback, now, 1)
+                .await
+                .expect("search");
+            let prepared = service
+                .prepare_request(
+                    search.quote().id(),
+                    0,
+                    CallerIdentity::new(
+                        "Ada Lovelace",
+                        ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                    )
+                    .expect("caller"),
+                    AppointmentKind::Callback,
+                    None,
+                    format!("voice:buffer-{name}"),
+                    IdempotencyKey::new(format!("appointment:buffer-{name}")).expect("key"),
+                    now,
+                )
+                .expect("prepare");
+            let (busy_start, busy_end) = if pre_buffer {
+                (
+                    prepared.starts_at() - Duration::minutes(10),
+                    prepared.starts_at() - Duration::minutes(5),
+                )
+            } else {
+                (
+                    prepared.ends_at() + Duration::minutes(5),
+                    prepared.ends_at() + Duration::minutes(10),
+                )
+            };
+            let occupied_range = TimeRange::new(
+                super::to_chrono_utc(busy_start).expect("busy start"),
+                super::to_chrono_utc(busy_end).expect("busy end"),
+            )
+            .expect("busy range");
+            let occupied = GoogleProposalDraft::from_owner(
+                format!("unrelated-buffer-{name}"),
+                super::PENDING_PROPOSAL_TITLE,
+                occupied_range,
+                prepared.timezone(),
+                CalendarAttendee::needs_action(owner),
+            )
+            .expect("occupied draft");
+            google
+                .create_proposal(&google_session, &occupied)
+                .await
+                .expect("occupy buffer only");
+
+            let submitted = service
+                .submit_request(
+                    ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                        .expect("confirmation"),
+                    now,
+                )
+                .await;
+            if expected_blocked {
+                assert!(matches!(submitted, Err(ServiceError::NoAvailability)));
+                assert_eq!(store.list_pending_notifications().expect("outbox").len(), 0);
+                assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 0);
+                assert_eq!(
+                    google_control
+                        .invocation_count(FakeOperation::CalendarProposalCreate)
+                        .expect("create count"),
+                    1
+                );
+            } else {
+                assert!(submitted.expect("zero-buffer submission").is_pending());
+                assert_eq!(
+                    google_control
+                        .invocation_count(FakeOperation::CalendarProposalCreate)
+                        .expect("create count"),
+                    2
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_buffer_expansion_overflow_fails_before_provider_calls() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let policy = AvailabilityPolicy::new(
+            "UTC",
+            default_working_windows(),
+            Duration::ZERO,
+            Duration::hours(2),
+            Duration::MAX,
+        )
+        .expect("policy");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &policy,
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let starts_at = now + Duration::hours(1);
+        let ends_at = starts_at
+            .checked_add(AppointmentKind::Callback.duration())
+            .expect("callback end");
+        let quote = Quote::new(now);
+        store
+            .save_appointment_quote(
+                &quote,
+                AppointmentKind::Callback,
+                "UTC",
+                &[AppointmentSlot::new(starts_at, ends_at).expect("slot")],
+            )
+            .expect("quote");
+        let prepared = service
+            .prepare_request(
+                quote.id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:buffer-overflow",
+                IdempotencyKey::new("appointment:buffer-overflow").expect("key"),
+                now,
+            )
+            .expect("prepare");
+
+        let error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("buffer expansion overflow must fail");
+        assert!(matches!(
+            error,
+            ServiceError::Availability(AvailabilityError::DateTimeOverflow)
+        ));
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            0
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            0
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn unmapped_proposal_not_found_rechecks_buffer_before_retry_create() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let owner = MailAddress::new("owner@example.test").expect("owner");
+        let policy = AvailabilityPolicy::new(
+            "UTC",
+            default_working_windows(),
+            Duration::ZERO,
+            Duration::hours(2),
+            Duration::minutes(15),
+        )
+        .expect("policy");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &policy,
+            owner.clone(),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:unmapped-buffer",
+                IdempotencyKey::new("appointment:unmapped-buffer").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        google_control
+            .set_failure(
+                FakeOperation::CalendarProposalCreate,
+                ProviderError::Unavailable,
+            )
+            .expect("create failure");
+        assert!(matches!(
+            service
+                .submit_request(
+                    ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                        .expect("confirmation"),
+                    now
+                )
+                .await,
+            Err(ServiceError::GoogleCalendar(ProviderError::Unavailable))
+        ));
+        google_control
+            .clear_failure(FakeOperation::CalendarProposalCreate)
+            .expect("clear create failure");
+        let busy_range = TimeRange::new(
+            super::to_chrono_utc(prepared.starts_at() - Duration::minutes(10)).expect("start"),
+            super::to_chrono_utc(prepared.starts_at() - Duration::minutes(5)).expect("end"),
+        )
+        .expect("range");
+        let occupied = GoogleProposalDraft::from_owner(
+            "unrelated-unmapped-buffer",
+            super::PENDING_PROPOSAL_TITLE,
+            busy_range,
+            prepared.timezone(),
+            CalendarAttendee::needs_action(owner),
+        )
+        .expect("occupied");
+        google
+            .create_proposal(&google_session, &occupied)
+            .await
+            .expect("occupy buffer");
+        let creates_before_retry = google_control
+            .invocation_count(FakeOperation::CalendarProposalCreate)
+            .expect("create count");
+        let error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now + Duration::minutes(1),
+            )
+            .await
+            .expect_err("buffer busy retry must fail");
+        assert!(matches!(error, ServiceError::NoAvailability));
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            creates_before_retry
+        );
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 0);
+        assert!(
+            store
+                .list_audit_events(None, 10)
+                .expect("audits")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_prepared_request_fails_before_provider_reads() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:expired-submit",
+                IdempotencyKey::new("appointment:expired-submit").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        let expires_at = search.quote().expires_at();
+
+        let error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                expires_at,
+            )
+            .await
+            .expect_err("expired quote must fail");
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AppointmentQuoteExpired)
+        ));
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            0
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM proposals", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("proposal count"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn non_utc_durable_interval_fails_before_submission_side_effects_and_exact_retry_converges()
+     {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:non-utc-submit",
+                IdempotencyKey::new("appointment:non-utc-submit").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        let non_utc_offset = UtcOffset::from_hms(10, 0, 0).expect("offset");
+        let non_utc_start = prepared
+            .starts_at()
+            .to_offset(non_utc_offset)
+            .format(&Rfc3339)
+            .expect("start text");
+        let non_utc_end = prepared
+            .ends_at()
+            .to_offset(non_utc_offset)
+            .format(&Rfc3339)
+            .expect("end text");
+        store
+            .connection()
+            .execute(
+                "UPDATE appointment_drafts SET starts_at = ?1, ends_at = ?2 WHERE id = ?3",
+                (&non_utc_start, &non_utc_end, prepared.draft_id()),
+            )
+            .expect("corrupt durable offset");
+
+        let error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("non-UTC durable interval must fail closed");
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::Conflict { .. })
+        ));
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            0
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            0
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count"),
+            1
+        );
+        for table in [
+            "proposals",
+            "event_mappings",
+            "notification_outbox",
+            "audit_events",
+        ] {
+            let count = store
+                .connection()
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("side-effect count");
+            assert_eq!(count, 0, "{table} must remain unchanged");
+        }
+
+        let starts_at = prepared
+            .starts_at()
+            .to_offset(UtcOffset::UTC)
+            .format(&Rfc3339)
+            .expect("canonical start text");
+        let ends_at = prepared
+            .ends_at()
+            .to_offset(UtcOffset::UTC)
+            .format(&Rfc3339)
+            .expect("canonical end text");
+        store
+            .connection()
+            .execute(
+                "UPDATE appointment_drafts SET starts_at = ?1, ends_at = ?2 WHERE id = ?3",
+                (&starts_at, &ends_at, prepared.draft_id()),
+            )
+            .expect("restore durable interval");
+
+        let first = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect("valid submission");
+        let retry = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect("exact valid retry");
+        assert_eq!(retry, first);
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn exact_retry_repairs_a_missing_audit_without_provider_calls() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:retry-submit",
+                IdempotencyKey::new("appointment:retry-submit").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_submission_audit
+                 BEFORE INSERT ON audit_events
+                 BEGIN SELECT RAISE(ABORT, 'forced audit failure'); END;",
+            )
+            .expect("install audit failure");
+        let first_error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("audit tail failure must be returned");
+        assert!(matches!(first_error, ServiceError::Store(_)));
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_submission_audit")
+            .expect("remove audit failure");
+        google_control
+            .set_failure(
+                FakeOperation::CalendarProposalFind,
+                ProviderError::Unavailable,
+            )
+            .expect("google find failure");
+        google_control
+            .set_failure(
+                FakeOperation::CalendarProposalCreate,
+                ProviderError::Unavailable,
+            )
+            .expect("google create failure");
+
+        let retry = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now + Duration::minutes(1),
+            )
+            .await
+            .expect("retry");
+        assert!(retry.is_pending());
+        assert_eq!(retry.requester_notification_id(), None);
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_retry_repairs_a_missing_mapping_without_duplicate_provider_create() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:mapping-retry",
+                IdempotencyKey::new("appointment:mapping-retry").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_submission_mapping
+                 BEFORE INSERT ON event_mappings
+                 BEGIN SELECT RAISE(ABORT, 'forced mapping failure'); END;",
+            )
+            .expect("install mapping failure");
+
+        let first_error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("mapping tail failure must be returned");
+        assert!(matches!(first_error, ServiceError::Store(_)));
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM event_mappings", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("mapping count"),
+            0
+        );
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_submission_mapping")
+            .expect("remove mapping failure");
+        google_control
+            .set_failure(
+                FakeOperation::CalendarProposalCreate,
+                ProviderError::Unavailable,
+            )
+            .expect("google create failure");
+
+        let retry = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now + Duration::minutes(1),
+            )
+            .await
+            .expect("retry repairs mapping");
+        assert!(retry.is_pending());
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn exact_retry_repairs_a_missing_notification_without_provider_calls() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:notification-retry",
+                IdempotencyKey::new("appointment:notification-retry").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_submission_notification
+                 BEFORE INSERT ON notification_outbox
+                 BEGIN SELECT RAISE(ABORT, 'forced notification failure'); END;",
+            )
+            .expect("install notification failure");
+
+        let first_error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("notification tail failure must be returned");
+        assert!(matches!(first_error, ServiceError::Store(_)));
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 0);
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_submission_notification")
+            .expect("remove notification failure");
+        for operation in [
+            FakeOperation::CalendarBusy,
+            FakeOperation::CalendarProposalFind,
+            FakeOperation::CalendarProposalCreate,
+        ] {
+            google_control
+                .set_failure(operation, ProviderError::Unavailable)
+                .expect("google failure");
+        }
+        outlook_control
+            .set_failure(FakeOperation::CalendarBusy, ProviderError::Unavailable)
+            .expect("outlook failure");
+
+        let retry = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now + Duration::minutes(1),
+            )
+            .await
+            .expect("retry repairs notification");
+        assert!(retry.is_pending());
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_change_after_mapping_fails_closed_without_provider_calls_or_misrouting() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let original_owner = MailAddress::new("owner@example.test").expect("original owner");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            original_owner,
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:owner-change-retry",
+                IdempotencyKey::new("appointment:owner-change-retry").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_owner_notification
+                 BEFORE INSERT ON notification_outbox
+                 BEGIN SELECT RAISE(ABORT, 'forced notification failure'); END;",
+            )
+            .expect("install notification failure");
+        let first_error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("notification tail failure must be returned");
+        assert!(matches!(first_error, ServiceError::Store(_)));
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_owner_notification")
+            .expect("remove notification failure");
+        let changed_owner_service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("replacement@example.test").expect("replacement owner"),
+        );
+        let proposal_creates = google_control
+            .invocation_count(FakeOperation::CalendarProposalCreate)
+            .expect("create count");
+        let proposal_finds = google_control
+            .invocation_count(FakeOperation::CalendarProposalFind)
+            .expect("find count");
+        let outlook_busy = outlook_control
+            .invocation_count(FakeOperation::CalendarBusy)
+            .expect("outlook busy count");
+        let google_busy = google_control
+            .invocation_count(FakeOperation::CalendarBusy)
+            .expect("google busy count");
+        for operation in [
+            FakeOperation::CalendarBusy,
+            FakeOperation::CalendarProposalFind,
+            FakeOperation::CalendarProposalCreate,
+        ] {
+            google_control
+                .set_failure(operation, ProviderError::Unavailable)
+                .expect("google failure");
+        }
+        outlook_control
+            .set_failure(FakeOperation::CalendarBusy, ProviderError::Unavailable)
+            .expect("outlook failure");
+
+        let error = changed_owner_service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now + Duration::minutes(1),
+            )
+            .await
+            .expect_err("owner change must fail before tail repair");
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::Conflict { .. })
+        ));
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 0);
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            proposal_creates
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            proposal_finds
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            outlook_busy
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count"),
+            google_busy
+        );
+    }
+
+    #[tokio::test]
+    async fn nonzero_nanosecond_submission_retries_without_partial_state() {
+        let now = now();
+        let submission_now = now
+            .replace_nanosecond(123_456_789)
+            .expect("valid nanosecond");
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:nanosecond-submit",
+                IdempotencyKey::new("appointment:nanosecond-submit").expect("key"),
+                now,
+            )
+            .expect("prepare");
+
+        let first = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                submission_now,
+            )
+            .await
+            .expect("nonzero nanoseconds must be canonicalized");
+        assert!(first.is_pending());
+        assert_eq!(first.requester_notification_id(), None);
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
+        assert_eq!(
+            store
+                .load_appointment_quote_by_id(search.quote().id())
+                .expect("quote")
+                .consumed_at()
+                .expect("consumed timestamp")
+                .nanosecond(),
+            0
+        );
+
+        for operation in [
+            FakeOperation::CalendarBusy,
+            FakeOperation::CalendarProposalFind,
+            FakeOperation::CalendarProposalCreate,
+        ] {
+            let failure = if operation == FakeOperation::CalendarBusy {
+                ProviderError::Unavailable
+            } else {
+                ProviderError::Conflict
+            };
+            google_control
+                .set_failure(operation, failure)
+                .expect("provider failure");
+            if operation == FakeOperation::CalendarBusy {
+                outlook_control
+                    .set_failure(operation, ProviderError::Unavailable)
+                    .expect("outlook failure");
+            }
+        }
+
+        let retry = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                submission_now,
+            )
+            .await
+            .expect("exact retry");
+        assert_eq!(retry, first);
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn fractional_issued_at_is_valid_at_exact_issue() {
+        let now = now()
+            .replace_nanosecond(123_456_789)
+            .expect("valid fractional time");
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        assert_eq!(search.quote().issued_at().nanosecond(), 123_456_789);
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:fractional-issued",
+                IdempotencyKey::new("appointment:fractional-issued").expect("key"),
+                now,
+            )
+            .expect("prepare");
+
+        let submitted = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect("exact fractional issue must be valid");
+        assert!(submitted.is_pending());
+        assert_eq!(
+            store
+                .load_appointment_quote_by_id(search.quote().id())
+                .expect("quote")
+                .consumed_at()
+                .expect("consumed timestamp")
+                .nanosecond(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn fractional_expires_at_remains_exclusive() {
+        let now = now()
+            .replace_nanosecond(123_456_789)
+            .expect("valid fractional time");
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        assert_eq!(search.quote().expires_at().nanosecond(), 123_456_789);
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:fractional-expiry",
+                IdempotencyKey::new("appointment:fractional-expiry").expect("key"),
+                now,
+            )
+            .expect("prepare");
+
+        let error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                search.quote().expires_at(),
+            )
+            .await
+            .expect_err("fractional expiry must be exclusive");
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AppointmentQuoteExpired)
+        ));
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            0
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM proposals", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("proposal count"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_provider_event_is_rejected_before_mapping() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let owner = MailAddress::new("owner@example.test").expect("owner");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            owner,
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:mismatch-submit",
+                IdempotencyKey::new("appointment:mismatch-submit").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        let range = TimeRange::new(
+            super::to_chrono_utc(prepared.starts_at()).expect("start"),
+            super::to_chrono_utc(prepared.ends_at()).expect("end"),
+        )
+        .expect("range");
+        google
+            .queue_create_response_override(
+                CalendarEvent::new(
+                    "mismatched-event",
+                    super::proposal_operation_key(prepared.draft_id()),
+                    "Wrong title",
+                    range,
+                    prepared.timezone(),
+                    [CalendarAttendee::needs_action(
+                        MailAddress::new("other@example.test").expect("other owner"),
+                    )],
+                    google_control.now(),
+                )
+                .expect("response"),
+            )
+            .expect("queue response");
+
+        let error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("mismatched event must fail");
+        assert!(matches!(
+            error,
+            ServiceError::GoogleCalendar(ProviderError::Conflict)
+        ));
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM event_mappings", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("mapping count"),
+            0
+        );
+        assert!(
+            store
+                .list_pending_notifications()
+                .expect("outbox")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_audit_events(None, 10)
+                .expect("audits")
+                .is_empty()
         );
     }
 
