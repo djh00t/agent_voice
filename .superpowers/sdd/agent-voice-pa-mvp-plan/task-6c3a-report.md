@@ -7,7 +7,7 @@
 - **Worktree:** `/private/tmp/agent-voice-pa-06c3-submit-orchestration`
 - **Branch:** `codex/agent-voice-pa-06c3-submit-orchestration`
 - **Base:** `4ba837e6ed7f2cd4ba431660865d902a2787f9eb` (`origin/main`)
-- **Implementation commits:** `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`, `68e8e2e`, `499adc5`
+- **Implementation commits:** `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`, `68e8e2e`, `499adc5`, `95f216b`
 
 ## Scope
 
@@ -92,12 +92,12 @@ Commands and results:
 
 | Check | Result |
 | --- | --- |
-| `rtk cargo test pa::service::tests::fractional --lib` | PASS — 2 passed, 492 filtered out |
-| `rtk cargo test pa::service::tests:: --lib` | PASS — 40 passed, 454 filtered out |
+| `rtk cargo test pa::service::tests::fractional --lib` | PASS — 2 passed, 494 filtered out |
+| `rtk cargo test pa::service::tests:: --lib` | PASS — 42 passed, 454 filtered out |
 | `rtk cargo clippy --all-targets --all-features -- -D warnings` | PASS — no issues found |
 | `rtk rustfmt --edition 2024 --check src/pa/service.rs` | PASS |
 | `rtk git diff --check` | PASS |
-| `rtk make check` | PASS — Rust tests, clippy, docs, and Docusaurus build completed; full suite ran 494 tests |
+| `rtk make check` | PASS — Rust tests, clippy, docs, and Docusaurus build completed; full suite ran 496 tests |
 
 The first `rtk make check` attempt stopped at `docs-build` because the clean
 worktree had no installed Docusaurus binary (`docusaurus: command not found`).
@@ -145,7 +145,7 @@ Focused command:
 rtk cargo test pa::service::tests::non_utc_durable_interval_fails_before_submission_side_effects_and_exact_retry_converges --lib
 ```
 
-Result: PASS — 1 passed, 493 filtered out.
+Result: PASS — 1 passed, 495 filtered out.
 
 Current repository gate:
 
@@ -153,7 +153,7 @@ Current repository gate:
 rtk make check
 ```
 
-Result: PASS — 494 unit tests, 3 doctests, strict clippy, Rust API docs, and
+Result: PASS — 496 unit tests, 3 doctests, strict clippy, Rust API docs, and
 the Docusaurus production build. The fresh worktree first lacked the local
 Docusaurus binary; `rtk make docs-install` installed the lockfile-resolved
 website dependencies without changing tracked manifests or lockfiles.
@@ -175,7 +175,7 @@ Focused command:
 rtk cargo test pa::service::tests::exact_retry_repairs_a_missing_ --lib
 ```
 
-Result: PASS — 3 passed, 491 filtered out.
+Result: PASS — 3 passed, 493 filtered out.
 
 ## Reviewer owner-binding remediation
 
@@ -198,7 +198,31 @@ Focused command:
 rtk cargo test pa::service::tests::owner_change_after_mapping_fails_closed_without_provider_calls_or_misrouting --lib
 ```
 
-Result: PASS — 1 passed, 493 filtered out.
+Result: PASS — 1 passed, 495 filtered out.
+
+## Reviewer meeting-buffer remediation
+
+Fresh submissions now expand the selected durable interval by the configured
+meeting buffer with checked subtraction/addition, query both calendars over
+that expanded half-open range, and reject any overlap before proposal lookup,
+creation, mapping, or notification writes. Expansion overflow fails closed
+before provider calls. A retry with an already persisted proposal but no
+mapping keeps its existing operation-key recovery path: rechecking it would
+see the proposal's own busy event and prevent mapping-tail repair.
+
+`submission_recheck_enforces_pre_and_post_buffer_but_zero_buffer_is_unchanged`
+verifies events only inside the pre- and post-buffers block a fresh submission,
+while the same pre-slot event is ignored under a zero buffer.
+`submission_buffer_expansion_overflow_fails_before_provider_calls` verifies a
+representable maximal policy buffer fails before proposal lookup or busy reads.
+
+Focused command:
+
+```text
+rtk cargo test pa::service::tests::submission_ --lib
+```
+
+Result: PASS — 2 passed, 494 filtered out.
 
 ## Non-claims and residual gates
 
@@ -207,7 +231,7 @@ Result: PASS — 1 passed, 493 filtered out.
 - #211 owns ambiguous provider-create recovery and its audit/evidence path;
   it remains unimplemented here.
 - Rollback is a code revert of `5d2d43e`, `cf72a79`, `5d4efc9`, `82e6723`,
-  `68e8e2e`, and `499adc5`; no remote deletion is inferred or attempted.
+  `68e8e2e`, `499adc5`, and `95f216b`; no remote deletion is inferred or attempted.
 
 ## Completion evidence
 
@@ -217,7 +241,8 @@ Result: PASS — 1 passed, 493 filtered out.
   (`fix(service): preserve fractional quote boundaries`), `82e6723`
   (`fix(service): reject non-UTC durable submission intervals`), `68e8e2e`
   (`test(service): cover local submission tail repair`), `499adc5`
-  (`fix(service): bind mapping retries to proposal owner`)
+  (`fix(service): bind mapping retries to proposal owner`), `95f216b`
+  (`fix(service): recheck submission meeting buffers`)
 - **Report commit:** added separately after reviewer remediation
 - **PR/push:** not created or pushed, per task instruction
 - **Reviewer:** not performed in this lane
