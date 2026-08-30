@@ -7,6 +7,7 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
+use ring::digest;
 use time::{OffsetDateTime, UtcOffset};
 
 use super::availability::{AvailabilityError, AvailabilityPolicy};
@@ -790,7 +791,7 @@ impl<'a> PaService<'a> {
         let draft_id = stored_draft.id();
         let proposal_key = format!("pa-proposal-draft-{draft_id}");
         let proposal_source = format!("pa-proposal-source-draft-{draft_id}");
-        let mapping_source = |proposal_id| format!("pa-event-source-{proposal_id}");
+        let mapping_source = |proposal_id| event_mapping_source(proposal_id, owner);
 
         let existing_proposal = match quote.proposal_id() {
             Some(proposal_id) => {
@@ -1029,6 +1030,24 @@ impl<'a> PaService<'a> {
 
 fn proposal_operation_key(draft_id: i64) -> String {
     format!("pa-google-proposal-draft-{draft_id}")
+}
+
+fn event_mapping_source(proposal_id: i64, owner: &MailAddress) -> String {
+    format!(
+        "pa-event-source-{proposal_id}-{}",
+        owner_fingerprint(owner.as_str())
+    )
+}
+
+fn owner_fingerprint(owner: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = digest::digest(&digest::SHA256, owner.as_bytes());
+    let mut fingerprint = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        fingerprint.push(char::from(HEX[usize::from(byte >> 4)]));
+        fingerprint.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    fingerprint
 }
 
 fn validate_prepared_request(
@@ -3063,6 +3082,137 @@ mod tests {
                 .invocation_count(FakeOperation::CalendarProposalCreate)
                 .expect("create count"),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_change_after_mapping_fails_closed_without_provider_calls_or_misrouting() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let original_owner = MailAddress::new("owner@example.test").expect("original owner");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            original_owner,
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:owner-change-retry",
+                IdempotencyKey::new("appointment:owner-change-retry").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_owner_notification
+                 BEFORE INSERT ON notification_outbox
+                 BEGIN SELECT RAISE(ABORT, 'forced notification failure'); END;",
+            )
+            .expect("install notification failure");
+        let first_error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("notification tail failure must be returned");
+        assert!(matches!(first_error, ServiceError::Store(_)));
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_owner_notification")
+            .expect("remove notification failure");
+        let changed_owner_service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("replacement@example.test").expect("replacement owner"),
+        );
+        let proposal_creates = google_control
+            .invocation_count(FakeOperation::CalendarProposalCreate)
+            .expect("create count");
+        let proposal_finds = google_control
+            .invocation_count(FakeOperation::CalendarProposalFind)
+            .expect("find count");
+        let outlook_busy = outlook_control
+            .invocation_count(FakeOperation::CalendarBusy)
+            .expect("outlook busy count");
+        let google_busy = google_control
+            .invocation_count(FakeOperation::CalendarBusy)
+            .expect("google busy count");
+        for operation in [
+            FakeOperation::CalendarBusy,
+            FakeOperation::CalendarProposalFind,
+            FakeOperation::CalendarProposalCreate,
+        ] {
+            google_control
+                .set_failure(operation, ProviderError::Unavailable)
+                .expect("google failure");
+        }
+        outlook_control
+            .set_failure(FakeOperation::CalendarBusy, ProviderError::Unavailable)
+            .expect("outlook failure");
+
+        let error = changed_owner_service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now + Duration::minutes(1),
+            )
+            .await
+            .expect_err("owner change must fail before tail repair");
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::Conflict { .. })
+        ));
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 0);
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            proposal_creates
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            proposal_finds
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            outlook_busy
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count"),
+            google_busy
         );
     }
 
