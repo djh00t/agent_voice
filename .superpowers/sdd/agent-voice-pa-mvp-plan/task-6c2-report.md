@@ -6,14 +6,14 @@
 - **Evidence date:** 2026-08-30 (Australia/Sydney)
 - **Worktree:** `/private/tmp/agent-voice-pa-task6-build`
 - **Branch:** `codex/agent-voice-pa-06-service-layer`
-- **Implementation commit:** `e8ab117`
+- **Implementation commit:** `3ed5bff`
 
 ## Prerequisite evidence
 
 - Issue #176's atomic quote-to-draft prepare boundary is implemented by
   `40439ac` in green, mergeable PR #204, which now contains `Closes #176`.
-- Issue #178's service facade is implemented by `bb10f2d` and exported by
-  `1512f9e`; its fresh-review findings were remediated by `3a9180c` and the
+- Issue #178's service facade is implemented by `05dc49c` and exported by
+  `781f7e6`; its fresh-review findings were remediated by `d0b6fc3` and the
   synchronized Task 6c1 evidence update.
 
 This stack remains ordered after PR #204 and the Task 6c1 commits.
@@ -173,7 +173,7 @@ each). No provider session or credential can influence this operation.
 ## RED evidence
 
 No historical failing-first command was captured in this handoff. The expected
-RED condition is reconstructed context: before `e8ab117`, the service lacked
+RED condition is reconstructed context: before `3ed5bff`, the service lacked
 the `PreparedRequest` and `PaService::prepare_request` boundary and its
 provider-free preparation tests. The original RED run is unavailable; this
 report does not invent output or a failure count.
@@ -198,7 +198,7 @@ handling, and redacted output. No `make check` result is claimed here.
 
 ## Handoff and dependencies
 
-The implementation commit is `e8ab117` (`feat(service): prepare requests from
+The implementation commit is `3ed5bff` (`feat(service): prepare requests from
 frozen quotes`). The next dependency is [#180](https://github.com/djh00t/agent_voice/issues/180),
 the submit-request boundary. It must consume this immutable prepared draft,
 recheck both calendars during submission, and preserve the two-turn explicit
@@ -210,7 +210,7 @@ The implementation PR must contain the exact closing footer:
 Closes #179
 ```
 
-It must also reference feature #138 and commit `e8ab117`. Issue #179 should
+It must also reference feature #138 and commit `3ed5bff`. Issue #179 should
 remain open until the linked PR is reviewed, findings are resolved, CI is
 green, and the PR is merged.
 
@@ -225,7 +225,7 @@ green, and the PR is merged.
   or external side effect is created by this package.
 - **Backup, retention, polling, metrics, and admin UI:** owned by later
   packages and not claimed here.
-- **Rollback:** revert `e8ab117` if the preparation boundary must be
+- **Rollback:** revert `3ed5bff` if the preparation boundary must be
   withdrawn; this commit makes no provider-side changes.
 
 **Package status:** `status:review` / locally verified; CI and LIVE remain
