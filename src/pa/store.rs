@@ -4433,7 +4433,7 @@ impl PaStore {
             .ok_or(StoreError::InvalidInput {
                 field: "lease_duration",
             })?;
-        let now_text = format_offset_datetime(now)?;
+        let now_key = format_notification_comparison_datetime(now)?;
         let lease_until_text = format_offset_datetime(lease_until)?;
         let updated_at = format_offset_datetime(OffsetDateTime::now_utc())?;
         let limit =
@@ -4441,22 +4441,26 @@ impl PaStore {
 
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let available_at_key = notification_timestamp_comparison_sql("available_at");
+        let lease_until_key = notification_timestamp_comparison_sql("lease_until");
         let candidate_ids = {
-            let mut statement = transaction.prepare(
+            let query = format!(
                 "SELECT id
                  FROM notification_outbox
-                 WHERE (status = 'pending' AND available_at <= ?1)
-                    OR (status = 'delivering' AND lease_until IS NOT NULL AND lease_until <= ?1)
-                 ORDER BY available_at ASC, id ASC
-                 LIMIT ?2",
-            )?;
+                 WHERE (status = 'pending' AND {available_at_key} <= ?1)
+                    OR (status = 'delivering' AND lease_until IS NOT NULL
+                        AND {lease_until_key} <= ?1)
+                 ORDER BY {available_at_key} ASC, id ASC
+                 LIMIT ?2"
+            );
+            let mut statement = transaction.prepare(&query)?;
             statement
-                .query_map(params![now_text, limit], |row| row.get::<_, i64>(0))?
+                .query_map(params![now_key, limit], |row| row.get::<_, i64>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut claimed = Vec::with_capacity(candidate_ids.len());
         for id in candidate_ids {
-            let updated = transaction.execute(
+            let query = format!(
                 "UPDATE notification_outbox
                  SET status = 'delivering',
                      attempts = attempts + 1,
@@ -4466,11 +4470,13 @@ impl PaStore {
                      updated_at = ?4
                  WHERE id = ?2
                    AND (
-                       (status = 'pending' AND available_at <= ?3)
-                       OR (status = 'delivering' AND lease_until IS NOT NULL AND lease_until <= ?3)
-                   )",
-                params![lease_until_text, id, now_text, updated_at],
-            )?;
+                       (status = 'pending' AND {available_at_key} <= ?3)
+                       OR (status = 'delivering' AND lease_until IS NOT NULL
+                           AND {lease_until_key} <= ?3)
+                   )"
+            );
+            let updated =
+                transaction.execute(&query, params![lease_until_text, id, now_key, updated_at])?;
             if updated != 1 {
                 return Err(StoreError::CursorConflict {
                     resource: "notification",
@@ -5714,6 +5720,48 @@ fn normalize_legacy_notification_timestamp(value: &str) -> StoreResult<String> {
 
 fn normalize_notification_time(value: OffsetDateTime) -> StoreResult<OffsetDateTime> {
     Ok(value.to_offset(time::UtcOffset::UTC))
+}
+
+/// Formats a notification timestamp as a fixed-width UTC comparison key.
+///
+/// Persisted notification timestamps retain their RFC3339 representation,
+/// which omits trailing fractional zeroes. SQL comparisons therefore use a
+/// fixed nine-digit fractional representation instead of comparing the raw
+/// variable-width text.
+fn format_notification_comparison_datetime(value: OffsetDateTime) -> StoreResult<String> {
+    let text = format_offset_datetime(normalize_notification_time(value)?)?;
+    let without_offset = text
+        .strip_suffix('Z')
+        .ok_or_else(|| stored_record_invalid("notification"))?;
+    let (whole, fraction) = without_offset
+        .split_once('.')
+        .unwrap_or((without_offset, ""));
+    if fraction.len() > 9 {
+        return Err(stored_record_invalid("notification"));
+    }
+    let mut key = String::with_capacity(whole.len() + 11);
+    key.push_str(whole);
+    key.push('.');
+    key.push_str(fraction);
+    for _ in fraction.len()..9 {
+        key.push('0');
+    }
+    key.push('Z');
+    Ok(key)
+}
+
+/// Returns the SQL expression that normalizes a persisted notification time
+/// to the same fixed-width comparison key as
+/// [`format_notification_comparison_datetime`].
+fn notification_timestamp_comparison_sql(column: &str) -> String {
+    format!(
+        "CASE WHEN instr({column}, '.') = 0 \
+         THEN replace({column}, 'Z', '.000000000Z') \
+         ELSE substr({column}, 1, instr({column}, '.')) \
+              || replace(printf('%-9s', substr({column}, instr({column}, '.') + 1, \
+                 length({column}) - instr({column}, '.') - 1)), ' ', '0') \
+              || 'Z' END"
+    )
 }
 
 fn validate_notification_references(
@@ -17758,6 +17806,82 @@ END;
             recovered[0].lease_until(),
             Some(first_now + TimeDuration::minutes(10))
         );
+    }
+
+    #[test]
+    fn notification_claim_does_not_treat_fractional_future_time_as_due() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let base = notification_time(0);
+        let notification = store
+            .enqueue_notification(
+                "claim-fractional-available-at",
+                None,
+                None,
+                NotificationKind::CallSummary,
+                notification_recipient(),
+                notification_template(None, None),
+                base + TimeDuration::milliseconds(100),
+            )
+            .expect("notification");
+
+        assert!(
+            store
+                .claim_notifications(base, 1, TimeDuration::minutes(5))
+                .expect("future notification is not claimed early")
+                .is_empty()
+        );
+        let claimed = store
+            .claim_notifications(
+                base + TimeDuration::milliseconds(100),
+                1,
+                TimeDuration::minutes(5),
+            )
+            .expect("fractional notification becomes due");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id(), notification.id());
+    }
+
+    #[test]
+    fn notification_claim_does_not_reclaim_fractional_lease_before_expiry() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let base = notification_time(0);
+        let notification = store
+            .enqueue_notification(
+                "claim-fractional-lease-unexpired",
+                None,
+                None,
+                NotificationKind::CallSummary,
+                notification_recipient(),
+                notification_template(None, None),
+                base - TimeDuration::seconds(1),
+            )
+            .expect("notification");
+        let first_now = base + TimeDuration::milliseconds(100);
+        let first = store
+            .claim_notifications(first_now, 1, TimeDuration::minutes(5))
+            .expect("first claim");
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].lease_until(),
+            Some(first_now + TimeDuration::minutes(5))
+        );
+
+        assert!(
+            store
+                .claim_notifications(base + TimeDuration::minutes(5), 1, TimeDuration::minutes(5))
+                .expect("lease is still active")
+                .is_empty()
+        );
+        let recovered = store
+            .claim_notifications(
+                first_now + TimeDuration::minutes(5),
+                1,
+                TimeDuration::minutes(5),
+            )
+            .expect("lease becomes reclaimable at expiry");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id(), notification.id());
+        assert_eq!(recovered[0].attempts(), 2);
     }
 
     #[test]
