@@ -112,6 +112,24 @@ fn header_insertion_order_is_irrelevant() {
 }
 
 #[test]
+fn method_tokens_are_preserved_exactly() {
+    for method in ["get", "MiXeD", "X-Custom-Extension"] {
+        let canonical = canonical_request(method, "/test.txt", &fixture_headers(), PAYLOAD_HASH)
+            .expect("valid HTTP method token");
+        assert!(canonical.starts_with(&format!("{method}\n/test.txt\n\n")));
+
+        let request = Request {
+            method: method.into(),
+            uri: "/test.txt".into(),
+            headers: fixture_headers(),
+            payload_sha256: PAYLOAD_HASH.into(),
+            region: REGION.into(),
+        };
+        assert!(sign_request(&request, &fixture_credentials(), TIMESTAMP).is_ok());
+    }
+}
+
+#[test]
 fn uri_query_and_unicode_rules() {
     let headers = vec![
         ("Host".into(), "examplebucket.s3.amazonaws.com".into()),
@@ -264,6 +282,15 @@ fn session_token_header_must_be_present_unique_and_exact() {
 }
 
 #[test]
+fn session_token_header_without_session_credentials_is_rejected() {
+    let mut headers = fixture_headers();
+    headers.push(("x-amz-security-token".into(), "unexpected-token".into()));
+    let error =
+        sign_request(&fixture_request(headers), &fixture_credentials(), TIMESTAMP).unwrap_err();
+    assert_eq!(error.kind, SigV4ErrorKind::InvalidCredential);
+}
+
+#[test]
 fn preexisting_authorization_header_is_rejected() {
     let mut headers = fixture_headers();
     headers.push(("Authorization".into(), "preexisting-signature".into()));
@@ -319,6 +346,13 @@ fn mutation_of_any_signed_value_changes_signature() {
         .expect("date mutation")
         .authorization;
     assert_ne!(date_signature, baseline);
+
+    let mut method = fixture_request(fixture_headers());
+    method.method = "POST".into();
+    let method_signature = sign_request(&method, &credentials, TIMESTAMP)
+        .expect("method mutation")
+        .authorization;
+    assert_ne!(method_signature, baseline);
 }
 
 fn replace_header(headers: &mut [(String, String)], name: &str, value: &str) {
