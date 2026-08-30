@@ -7,8 +7,8 @@
 - **Evidence date:** 2026-08-30 (Australia/Sydney)
 - **Worktree:** `/private/tmp/agent-voice-pa-06c3b-ambiguous-recovery`
 - **Branch:** `codex/agent-voice-pa-06c3b-ambiguous-recovery`
-- **Base:** `57643df` (`origin/main`, current after PR #233)
-- **Implementation commit:** `15539dc`
+- **Base:** `76e8df4` (`origin/main`, current after PR #242)
+- **Test commits:** `fbda37c`, `ee534f5`
 
 ## Scope
 
@@ -47,24 +47,25 @@ After the test was added, the same command passed as recorded below.
 | Operation-key lookup recovery | The exact durable retry finds the materialized event, validates its title, interval, timezone, sole owner, and `NeedsAction` RSVP, and finishes without another create. Counts are `CalendarProposalCreate = 1` and `CalendarProposalFind = 2` after recovery (the first submission lookup plus the retry lookup). |
 | Local convergence | After recovery, local counts are proposals `1`, mappings `1`, notifications `2`, and audits `4`; both outbox rows point to the recovered proposal and mapping. |
 | Stable exact retry | A third exact submission returns the same `SubmittedRequest`; all local counts and provider operation counts remain unchanged. |
-| Immutable audit tail | The four audit rows remain in the expected request/proposal/owner-notification/requester-notification sequence. Repeating the submission does not add rows or alter their immutable keys/content. |
+| Immutable audit tail | The four audit rows remain in the expected request/proposal/owner-notification/requester-notification sequence. Every row is reloaded by idempotency key before and after the exact retry and compared as the original `StoredAuditEvent`; repeating the submission does not add rows or alter immutable content. |
 | Redaction | The first service error has category-only Display/Debug output. Fake Debug exposes only counts and omits event identity, operation identity, title, owner data, and session token. The store audit contract is details-free. |
 
 ## Commands and results
 
 | Check | Result |
 | --- | --- |
-| `rtk cargo test pa::fakes::calendar::tests::google_ambiguous_create_is_recovered_by_operation_lookup --lib` | PASS — 1 passed, 498 filtered out |
-| `rtk cargo test pa::service::tests::confirmed_submission_creates_one_owner_only_pending_proposal_and_outbox_rows --lib` | PASS — 1 passed, 498 filtered out |
-| `rtk cargo test pa::service::tests::exact_retry_repairs_a_missing_ --lib` | PASS — 3 passed, 496 filtered out |
-| `rtk cargo test pa::store::tests::audit_append_retries_stably_and_conflicting_keys_preserve_the_original --lib` | PASS — 1 passed, 498 filtered out |
-| `rtk cargo test pa::service::tests::mismatched_provider_event_is_rejected_before_mapping --lib` | PASS — 1 passed, 498 filtered out |
-| `rtk cargo test pa:: --lib` | PASS — 428 passed, 71 filtered out |
+| `rtk cargo test pa::fakes::calendar::tests::google_ambiguous_create_is_recovered_by_operation_lookup --lib` | PASS — 1 passed, 507 filtered out |
+| `rtk cargo test pa::service::tests::confirmed_submission_creates_one_owner_only_pending_proposal_and_outbox_rows --lib` | PASS — 1 passed, 507 filtered out |
+| `rtk cargo test pa::service::tests::exact_retry_repairs_a_missing_ --lib` | PASS — 3 passed, 505 filtered out |
+| `rtk cargo test pa::store::tests::audit_append_retries_stably_and_conflicting_keys_preserve_the_original --lib` | PASS — 1 passed, 507 filtered out |
+| `rtk cargo test pa::service::tests::mismatched_provider_event_is_rejected_before_mapping --lib` | PASS — 1 passed, 507 filtered out |
+| `rtk cargo test pa:: --lib` | PASS — 437 passed, 71 filtered out |
 | `rtk cargo clippy --all-targets --all-features -- -D warnings` | PASS — no issues found |
 | `rtk rustfmt --edition 2024 --check src/pa/fakes/calendar.rs` | PASS |
 | `rtk git diff --check` | PASS |
+| `rtk git diff --check origin/main...HEAD` | PASS — no whitespace errors in the reviewed range |
 | `rtk cargo doc --no-deps` | PASS |
-| `rtk make check` | PASS — 499 tests, clippy, Rust docs, and Docusaurus build |
+| `rtk make check` | PASS — 508 tests, clippy, Rust docs, and Docusaurus build |
 
 The first `rtk make check` attempt stopped because the clean worktree lacked
 the existing website binary (`docusaurus: command not found`, exit 127).
@@ -93,4 +94,3 @@ No CI, live-provider, OAuth, deployment, publication, or UAT claim is made.
 Rollback is the local commit revert; no remote event deletion or manual
 compensation is inferred. Push, PR publication, merge, and approval remain
 outside this package.
-
