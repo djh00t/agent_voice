@@ -285,8 +285,10 @@ fn hex_digit(value: u8) -> Option<u8> {
 mod tests {
     use ring::rand::{SecureRandom, SystemRandom};
 
+    use crate::pa::store::PaStore;
+
     use super::{
-        AuthError, InMemoryReplayGuard, X_AV_NONCE, X_AV_SIGNATURE, X_AV_TIMESTAMP,
+        AuthError, InMemoryReplayGuard, ReplayGuard, X_AV_NONCE, X_AV_SIGNATURE, X_AV_TIMESTAMP,
         canonical_request, lower_hex, sign_request, verify_request,
     };
 
@@ -310,6 +312,7 @@ mod tests {
         bytes
     }
 
+    const DATABASE_KEY: &[u8] = b"task-4a-test-key";
     fn signed_headers() -> (String, String, String) {
         let nonce = test_nonce();
         let signature = sign_request(SECRET, METHOD, PATH_AND_QUERY, NOW, &nonce, BODY).unwrap();
@@ -701,5 +704,89 @@ mod tests {
         assert_eq!(X_AV_TIMESTAMP, "X-AV-Timestamp");
         assert_eq!(X_AV_NONCE, "X-AV-Nonce");
         assert_eq!(X_AV_SIGNATURE, "X-AV-Signature");
+    }
+
+    #[test]
+    fn persistent_replay_guard_verifies_once_and_invalid_hmac_does_not_consume() {
+        let (timestamp, nonce, signature) = signed_headers();
+        let mut replay_guard = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+
+        assert!(
+            verify_request(
+                SECRET,
+                METHOD,
+                PATH_AND_QUERY,
+                timestamp.as_bytes(),
+                nonce.as_bytes(),
+                signature.as_bytes(),
+                BODY,
+                NOW,
+                &mut replay_guard,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            verify_request(
+                SECRET,
+                METHOD,
+                PATH_AND_QUERY,
+                timestamp.as_bytes(),
+                nonce.as_bytes(),
+                signature.as_bytes(),
+                BODY,
+                NOW,
+                &mut replay_guard,
+            ),
+            Err(AuthError::NonceReplay)
+        );
+
+        let mut invalid_guard = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let mut altered_signature = signature.clone().into_bytes();
+        altered_signature[0] = if altered_signature[0] == b'0' {
+            b'1'
+        } else {
+            b'0'
+        };
+        assert_eq!(altered_signature.len(), 64);
+        assert!(
+            altered_signature
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        );
+        assert_ne!(altered_signature, signature.as_bytes());
+        assert_eq!(
+            verify_request(
+                SECRET,
+                METHOD,
+                PATH_AND_QUERY,
+                timestamp.as_bytes(),
+                nonce.as_bytes(),
+                &altered_signature,
+                BODY,
+                NOW,
+                &mut invalid_guard,
+            ),
+            Err(AuthError::InvalidSignature)
+        );
+        let count: i64 = invalid_guard
+            .connection()
+            .query_row("SELECT count(*) FROM replay_nonces", [], |row| row.get(0))
+            .expect("count replay rows");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn persistent_replay_guard_fails_closed_when_storage_fails() {
+        let mut replay_guard = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        replay_guard
+            .connection()
+            .execute("DROP TABLE replay_nonces", [])
+            .expect("drop replay table");
+
+        assert!(!ReplayGuard::check_and_record(
+            &mut replay_guard,
+            NONCE,
+            NOW
+        ));
     }
 }
