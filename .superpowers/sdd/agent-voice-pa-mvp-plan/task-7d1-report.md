@@ -84,6 +84,17 @@ selectors passed after the fix. A fresh controller `rtk make check` exited `0`
 with 515 tests, three compile-fail doctests, Clippy, rustdoc, and the locked
 website build.
 
+## Round-5 canonical timestamp remediation
+
+Current-head review found that SQLite `CURRENT_TIMESTAMP` emits a legacy
+space-separated value that the store's strict RFC3339 UTC decoder rejects.
+RED coverage failed on the old default metadata and proved a legacy stored
+timestamp was accepted. Source-only commit
+`7ad0976e9868a5b2e8da5ed790d2d37e07d4b690` now uses the established
+`strftime('%Y-%m-%dT%H:%M:%SZ', 'now')` defaults and exact canonical checks for
+both timestamp columns. All six v14 selectors passed after the fix; the
+implementer gate observed 516 tests plus lint, rustdoc, and docs stages.
+
 ## Evidence records
 
 | evidence_id | order | command | expected_exit | observed_exit | selector_or_diagnostic | evidence_tier | status | artifact_ref | non_claim | reviewer |
@@ -101,6 +112,7 @@ website build.
 | EV-13F-10 | 10 | `rtk make check` | 0 | 0 | post-review 514-test suite, compile-fail doctests, Clippy, rustdoc, docs | LOCAL | CONFIRMED | `7a874473ae32d179d9f5068dfafe81afe7bb91c9` | does not prove current-head CI or live behavior | controller |
 | EV-13F-11 | 11 | v14 invalid-row and wrong-storage-class exact selectors | nonzero then 0 | 101 then 0 | non-space whitespace and wrong SQLite storage classes rejected | LOCAL | CONFIRMED | `6d5657468cd5168bd35e85b02c7c7712b4b68faa` | does not prove runtime decoding | Codex PR review |
 | EV-13F-12 | 12 | `rtk make check` | 0 | 0 | post-hardening 515-test suite, compile-fail doctests, Clippy, rustdoc, docs | LOCAL | CONFIRMED | `6d5657468cd5168bd35e85b02c7c7712b4b68faa` | does not prove current-head CI or live behavior | controller |
+| EV-13F-13 | 13 | v14 migration metadata and timestamp exact selectors | nonzero then 0 | 101 then 0 | canonical RFC3339 UTC defaults and malformed timestamp rejection | LOCAL | CONFIRMED | `7ad0976e9868a5b2e8da5ed790d2d37e07d4b690` | does not prove runtime reservation behavior | Codex PR review |
 
 ## Round-1 findings and resolutions
 
@@ -160,6 +172,7 @@ Controller review must verify the exact base/stack, one-file source commit, migr
 - Round-2 source follow-up: `25074b38e5a0e0bfe9c2505bb669badddbc740e7`.
 - Round-3 source remediation: `7a874473ae32d179d9f5068dfafe81afe7bb91c9`.
 - Round-4 source remediation: `6d5657468cd5168bd35e85b02c7c7712b4b68faa`.
+- Round-5 source remediation: `7ad0976e9868a5b2e8da5ed790d2d37e07d4b690`.
 - Prior report commits: `0f711bf03eecf009980de96e8b4990fb5de9389a`, `ddc35eab9aff4955d11b8ac1d54d5557c4bbaa8f`.
 - Report commit state: containing commit; resolve with `rtk git log -1 --format=%H -- .superpowers/sdd/agent-voice-pa-mvp-plan/task-7d1-report.md` after this report is committed.
 - Reviewer: pending controller review.
