@@ -70,7 +70,7 @@ Command:
 rtk cargo test --lib pa::fakes::backup::tests --no-fail-fast
 ```
 
-Result: **PASS** — 14 focused backup-fake tests passed and 420 unrelated
+Result: **PASS** — 14 focused backup-fake tests passed and 422 unrelated
 library tests were filtered out.
 
 The focused selector exercises exact retry receipts, receipt observability,
@@ -95,7 +95,7 @@ Command:
 rtk cargo test --all-targets --no-fail-fast
 ```
 
-Result: **PASS** — 434 all-target unit tests passed across 2 suites.
+Result: **PASS** — 436 all-target unit tests passed across 2 suites.
 
 ### Doctests
 
@@ -136,7 +136,7 @@ Command:
 rtk make check
 ```
 
-Result: **PASS** — the repository gate completed successfully, including 434
+Result: **PASS** — the repository gate completed successfully, including 436
 library tests, doctests, strict linting, Rust documentation, and the docs
 build.
 
@@ -182,8 +182,8 @@ status because the file is not yet tracked).
 | --- | --- | --- |
 | Focused backup tests | LOCAL | PASS (14) |
 | Fake-family tests | LOCAL | PASS (109) |
-| Full library tests | LOCAL | PASS (434) |
-| All-target tests | LOCAL | PASS (434 across 2 suites) |
+| Full library tests | LOCAL | PASS (436) |
+| All-target tests | LOCAL | PASS (436 across 2 suites) |
 | Doctests | LOCAL | PASS (3) |
 | Warning-denied rustdoc | LOCAL | PASS |
 | Strict Clippy | LOCAL | PASS |
