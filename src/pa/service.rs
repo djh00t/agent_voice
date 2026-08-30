@@ -753,7 +753,7 @@ impl<'a> PaService<'a> {
             .as_ref()
             .ok_or(ServiceError::OwnerNotConfigured)?;
         let prepared = confirmed.0;
-        let now = canonicalize_utc_second(now, "now")?;
+        let validation_now = now.to_offset(UtcOffset::UTC);
         let quote = self
             .store
             .load_appointment_quote_by_draft_id(prepared.draft_id)
@@ -765,10 +765,12 @@ impl<'a> PaService<'a> {
         ))?;
         validate_prepared_request(&prepared, &quote, stored_draft)?;
         match quote.state() {
-            StoredAppointmentQuoteState::Prepared if now < quote.quote().issued_at() => {
+            StoredAppointmentQuoteState::Prepared if validation_now < quote.quote().issued_at() => {
                 return Err(ServiceError::Store(StoreError::AppointmentQuoteNotYetValid));
             }
-            StoredAppointmentQuoteState::Prepared if now >= quote.quote().expires_at() => {
+            StoredAppointmentQuoteState::Prepared
+                if validation_now >= quote.quote().expires_at() =>
+            {
                 return Err(ServiceError::Store(StoreError::AppointmentQuoteExpired));
             }
             StoredAppointmentQuoteState::Prepared | StoredAppointmentQuoteState::Consumed => {}
@@ -778,6 +780,11 @@ impl<'a> PaService<'a> {
                 }));
             }
         }
+        let durable_now = canonicalize_submission_timestamp(
+            validation_now,
+            quote.quote().issued_at(),
+            quote.quote().expires_at(),
+        )?;
 
         let draft = stored_draft.draft();
         let draft_id = stored_draft.id();
@@ -859,7 +866,7 @@ impl<'a> PaService<'a> {
                             draft_id,
                             &proposal_key,
                             &proposal_source,
-                            now,
+                            durable_now,
                         )
                         .map_err(ServiceError::Store)?,
                 };
@@ -897,7 +904,7 @@ impl<'a> PaService<'a> {
                             draft_id,
                             &proposal_key,
                             &proposal_source,
-                            now,
+                            durable_now,
                         )
                         .map_err(ServiceError::Store)?,
                 };
@@ -1181,6 +1188,34 @@ fn canonicalize_utc_second(
         .to_offset(UtcOffset::UTC)
         .replace_nanosecond(0)
         .map_err(|_| ServiceError::Store(StoreError::InvalidInput { field }))
+}
+
+fn canonicalize_submission_timestamp(
+    validation_now: OffsetDateTime,
+    issued_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+) -> ServiceResult<OffsetDateTime> {
+    let durable_now = canonicalize_utc_second(validation_now, "now")?;
+    if durable_now >= issued_at {
+        return Ok(durable_now);
+    }
+
+    // A fractional issue instant can be later than the truncated second even
+    // though validation_now is already within the quote's validity window.
+    // Carry the durable timestamp to the next whole second while retaining
+    // the full-precision boundary decision above.
+    let next_second =
+        durable_now
+            .checked_add(time::Duration::seconds(1))
+            .ok_or(ServiceError::Availability(
+                AvailabilityError::DateTimeOverflow,
+            ))?;
+    if next_second >= expires_at {
+        return Err(ServiceError::Store(StoreError::Conflict {
+            resource: "appointment quote",
+        }));
+    }
+    Ok(next_second)
 }
 
 #[cfg(test)]
@@ -2778,6 +2813,134 @@ mod tests {
                 .invocation_count(FakeOperation::CalendarProposalCreate)
                 .expect("create count"),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn fractional_issued_at_is_valid_at_exact_issue() {
+        let now = now()
+            .replace_nanosecond(123_456_789)
+            .expect("valid fractional time");
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        assert_eq!(search.quote().issued_at().nanosecond(), 123_456_789);
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:fractional-issued",
+                IdempotencyKey::new("appointment:fractional-issued").expect("key"),
+                now,
+            )
+            .expect("prepare");
+
+        let submitted = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect("exact fractional issue must be valid");
+        assert!(submitted.is_pending());
+        assert_eq!(
+            store
+                .load_appointment_quote_by_id(search.quote().id())
+                .expect("quote")
+                .consumed_at()
+                .expect("consumed timestamp")
+                .nanosecond(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn fractional_expires_at_remains_exclusive() {
+        let now = now()
+            .replace_nanosecond(123_456_789)
+            .expect("valid fractional time");
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        assert_eq!(search.quote().expires_at().nanosecond(), 123_456_789);
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:fractional-expiry",
+                IdempotencyKey::new("appointment:fractional-expiry").expect("key"),
+                now,
+            )
+            .expect("prepare");
+
+        let error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                search.quote().expires_at(),
+            )
+            .await
+            .expect_err("fractional expiry must be exclusive");
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AppointmentQuoteExpired)
+        ));
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            0
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM proposals", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("proposal count"),
+            0
         );
     }
 
