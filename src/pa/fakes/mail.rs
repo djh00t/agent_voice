@@ -872,7 +872,7 @@ mod tests {
             "private-label",
             "fake-gmail:",
         ] {
-            assert!(!debug.contains(secret), "debug leaked {secret}");
+            assert!(!debug.contains(secret), "debug output exposed a seeded value");
         }
     }
 
@@ -916,7 +916,7 @@ mod tests {
             "sentinel sent body",
             "fake-gmail-sent-1",
         ] {
-            assert!(!debug.contains(secret), "debug leaked {secret}");
+            assert!(!debug.contains(secret), "debug output exposed a seeded value");
         }
     }
 
