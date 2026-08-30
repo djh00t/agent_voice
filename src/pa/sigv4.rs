@@ -373,7 +373,7 @@ fn canonical_uri_and_query(uri: &str) -> Result<(String, String), SigV4Error> {
     if !raw_path.starts_with('/') {
         return Err(SigV4Error::new(SigV4ErrorKind::InvalidUri));
     }
-    let canonical_path = percent_encode_path(raw_path.as_bytes());
+    let canonical_path = percent_encode(raw_path.as_bytes(), true, true);
     let canonical_query = canonical_query(raw_query);
     Ok((canonical_path, canonical_query))
 }
@@ -387,8 +387,8 @@ fn canonical_query(raw_query: &str) -> String {
         .map(|pair| {
             let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
             (
-                percent_encode(name.as_bytes(), false),
-                percent_encode(value.as_bytes(), false),
+                percent_encode(name.as_bytes(), false, true),
+                percent_encode(value.as_bytes(), false, true),
             )
         })
         .collect::<Vec<_>>();
@@ -400,19 +400,7 @@ fn canonical_query(raw_query: &str) -> String {
         .join("&")
 }
 
-fn percent_encode(value: &[u8], preserve_slash: bool) -> String {
-    percent_encode_with_options(value, preserve_slash, false)
-}
-
-fn percent_encode_path(value: &[u8]) -> String {
-    percent_encode_with_options(value, true, true)
-}
-
-fn percent_encode_with_options(
-    value: &[u8],
-    preserve_slash: bool,
-    preserve_valid_escapes: bool,
-) -> String {
+fn percent_encode(value: &[u8], preserve_slash: bool, preserve_valid_escapes: bool) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::with_capacity(value.len());
     let mut index = 0;
@@ -672,10 +660,24 @@ mod tests {
 
     #[test]
     fn canonical_uri_preserves_valid_percent_escapes() {
-        let canonical = canonical_request("GET", "/folder/a%20b", &headers(), PAYLOAD_HASH)
-            .expect("origin-form URI is valid");
+        let canonical =
+            canonical_request("GET", "/folder/a%20b%2F%2f%41", &headers(), PAYLOAD_HASH)
+                .expect("origin-form URI is valid");
 
-        assert!(canonical.starts_with("GET\n/folder/a%20b\n\n"));
+        assert!(canonical.starts_with("GET\n/folder/a%20b%2F%2f%41\n\n"));
+    }
+
+    #[test]
+    fn canonical_query_preserves_valid_percent_escapes() {
+        let canonical = canonical_request(
+            "GET",
+            "/test.txt?prefix=a%2Fb&marker=%2f%20",
+            &headers(),
+            PAYLOAD_HASH,
+        )
+        .expect("origin-form URI is valid");
+
+        assert!(canonical.starts_with("GET\n/test.txt\nmarker=%2f%20&prefix=a%2Fb\n"));
     }
 
     #[test]
