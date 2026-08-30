@@ -66,7 +66,7 @@ fn snapshot() -> EncryptedSnapshot {
     EncryptedSnapshot::new(
         "backup-sentinel-object-key",
         b"backup-sentinel-ciphertext".to_vec(),
-        "a3b7c87d9b77dc909f571008227641e45b11b4e2369ebcd57e87c714fd8b5fe5",
+        "2e46e41589939dd28a664c8d40d852b3800c01cdb32e87f3d7a6422f745c42e9",
         26,
         "backup-sentinel-encryption-format",
         "backup-sentinel-key-metadata",
@@ -941,7 +941,7 @@ async fn every_sentinelized_return_value_formats_without_private_payloads() {
     assert_eq!(receipt.object_key(), "backup-sentinel-object-key");
     assert_eq!(
         receipt.checksum(),
-        "a3b7c87d9b77dc909f571008227641e45b11b4e2369ebcd57e87c714fd8b5fe5"
+        "2e46e41589939dd28a664c8d40d852b3800c01cdb32e87f3d7a6422f745c42e9"
     );
     assert_eq!(receipt.provider_version(), "fake-s3-version-1");
     assert_contract_debug_redacted(receipt);
