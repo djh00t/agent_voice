@@ -642,7 +642,7 @@ impl fmt::Debug for StoredTask {
     }
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 11;
+const CURRENT_SCHEMA_VERSION: i64 = 12;
 const BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 struct Migration {
@@ -692,8 +692,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: apply_schema_v10,
     },
     Migration {
-        version: CURRENT_SCHEMA_VERSION,
+        version: 11,
         apply: apply_schema_v11,
+    },
+    Migration {
+        version: CURRENT_SCHEMA_VERSION,
+        apply: apply_schema_v12,
     },
 ];
 
@@ -7710,6 +7714,25 @@ fn apply_schema_v11(transaction: &Transaction<'_>) -> StoreResult<()> {
     Ok(())
 }
 
+fn apply_schema_v12(transaction: &Transaction<'_>) -> StoreResult<()> {
+    transaction.execute_batch(
+        r#"
+CREATE TRIGGER IF NOT EXISTS audit_events_append_only_update
+BEFORE UPDATE ON audit_events
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_events_append_only_delete
+BEFORE DELETE ON audit_events
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events are append-only');
+END;
+        "#,
+    )?;
+    Ok(())
+}
+
 fn normalize_legacy_audit_timestamp(value: &str) -> StoreResult<String> {
     let parsed = OffsetDateTime::parse(value, &Rfc3339)
         .map(|value| value.to_offset(time::UtcOffset::UTC))
@@ -7817,6 +7840,35 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
         let _ = fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+    }
+
+    fn disable_audit_append_only_triggers_for_fixture(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP TRIGGER audit_events_append_only_update;
+                 DROP TRIGGER audit_events_append_only_delete;",
+            )
+            .expect("disable audit append-only triggers for corruption fixture");
+    }
+
+    fn enable_audit_append_only_triggers_after_fixture(connection: &Connection) {
+        connection
+            .execute_batch(
+                r#"
+CREATE TRIGGER audit_events_append_only_update
+BEFORE UPDATE ON audit_events
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events are append-only');
+END;
+
+CREATE TRIGGER audit_events_append_only_delete
+BEFORE DELETE ON audit_events
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events are append-only');
+END;
+                "#,
+            )
+            .expect("restore audit append-only triggers after corruption fixture");
     }
 
     fn table_names(store: &PaStore) -> Vec<String> {
@@ -10597,6 +10649,51 @@ mod tests {
     }
 
     #[test]
+    fn audit_events_are_database_enforced_append_only() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let event = store
+            .append_audit_event(
+                "audit-append-only",
+                AuditEventType::MessageRecorded,
+                AuditEntityType::Message,
+                "message-append-only",
+                OffsetDateTime::parse("2025-01-02T03:04:05Z", &Rfc3339).expect("occurrence time"),
+            )
+            .expect("append valid event");
+
+        assert!(
+            store
+                .connection()
+                .execute(
+                    "UPDATE audit_events SET entity_id = ?1 WHERE id = ?2",
+                    rusqlite::params!["message-mutated", event.id()],
+                )
+                .is_err(),
+            "raw audit updates must be rejected"
+        );
+        assert_eq!(
+            store
+                .load_audit_event_by_idempotency_key("audit-append-only")
+                .expect("original event after rejected update"),
+            event
+        );
+
+        assert!(
+            store
+                .connection()
+                .execute("DELETE FROM audit_events WHERE id = ?1", [event.id()],)
+                .is_err(),
+            "raw audit deletes must be rejected"
+        );
+        assert_eq!(
+            store
+                .load_audit_event_by_idempotency_key("audit-append-only")
+                .expect("original event after rejected delete"),
+            event
+        );
+    }
+
+    #[test]
     fn audit_listing_is_ordered_and_cursor_paginated_with_strict_inputs() {
         let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
         let occurred_at =
@@ -10728,6 +10825,7 @@ mod tests {
                 .connection()
                 .pragma_update(None, "ignore_check_constraints", true)
                 .expect("disable checks for corruption fixture");
+            disable_audit_append_only_triggers_for_fixture(store.connection());
             store
                 .connection()
                 .execute(
@@ -10735,6 +10833,7 @@ mod tests {
                     rusqlite::params![value, &key],
                 )
                 .expect("corrupt fixture row");
+            enable_audit_append_only_triggers_after_fixture(store.connection());
             store
                 .connection()
                 .pragma_update(None, "ignore_check_constraints", false)
@@ -10772,6 +10871,7 @@ mod tests {
             .connection()
             .pragma_update(None, "ignore_check_constraints", true)
             .expect("disable checks for corruption fixture");
+        disable_audit_append_only_triggers_for_fixture(store.connection());
         store
             .connection()
             .execute(
@@ -10779,6 +10879,7 @@ mod tests {
                 [],
             )
             .expect("corrupt ID fixture");
+        enable_audit_append_only_triggers_after_fixture(store.connection());
         let error = store
             .load_audit_event_by_idempotency_key("audit-corrupt-id")
             .expect_err("corrupted ID must fail closed");
