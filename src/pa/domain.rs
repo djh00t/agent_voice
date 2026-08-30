@@ -454,7 +454,10 @@ impl<'de> Deserialize<'de> for Quote {
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        let expected = wire.issued_at + Self::VALID_FOR;
+        let expected = wire
+            .issued_at
+            .checked_add(Self::VALID_FOR)
+            .ok_or_else(|| D::Error::custom(DomainError::InvalidQuoteExpiry))?;
         if wire.expires_at != expected {
             return Err(D::Error::custom(DomainError::InvalidQuoteExpiry));
         }
@@ -1108,6 +1111,19 @@ mod tests {
     fn quote_rejects_consumption_before_issuance() {
         let quote = Quote::with_id(QuoteId::new(), now());
         assert!(quote.consume(now() - Duration::seconds(1)).is_err());
+    }
+
+    #[test]
+    fn quote_deserialization_rejects_expiry_overflow() {
+        let maximum = OffsetDateTime::new_utc(time::Date::MAX, time::Time::MAX);
+        let overflow = Quote {
+            id: QuoteId::new(),
+            issued_at: maximum,
+            expires_at: maximum,
+        };
+        let encoded = serde_json::to_string(&overflow).expect("serialize overflow fixture");
+
+        assert!(serde_json::from_str::<Quote>(&encoded).is_err());
     }
 
     #[test]
