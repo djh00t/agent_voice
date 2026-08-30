@@ -1365,9 +1365,9 @@ fn normalize_and_validate_provider(
             oauth_field_path(provider, "client_id")
         );
     }
-    validate_oauth_url(provider, "authorize_url", &config.authorize_url)?;
-    validate_oauth_url(provider, "token_url", &config.token_url)?;
-    validate_oauth_url(provider, "redirect_uri", &config.redirect_uri)?;
+    validate_oauth_endpoint_url(provider, "authorize_url", &config.authorize_url)?;
+    validate_oauth_endpoint_url(provider, "token_url", &config.token_url)?;
+    validate_oauth_redirect_url(provider, &config.redirect_uri)?;
     normalize_scopes(provider, &mut config.scopes)
 }
 
@@ -1419,14 +1419,13 @@ fn normalize_client_secret(
 }
 
 #[allow(dead_code)]
-fn validate_oauth_url(provider: OAuthProvider, field: &str, url: &reqwest::Url) -> Result<()> {
+fn validate_oauth_endpoint_url(
+    provider: OAuthProvider,
+    field: &str,
+    url: &reqwest::Url,
+) -> Result<()> {
     let path = oauth_field_path(provider, field);
-    if url.host().is_none() {
-        bail!("{} must be an absolute URL with a host", path);
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!("{} must not include username or password", path);
-    }
+    validate_oauth_url_shape(&path, url)?;
     if url.scheme() == "https" {
         return Ok(());
     }
@@ -1437,11 +1436,46 @@ fn validate_oauth_url(provider: OAuthProvider, field: &str, url: &reqwest::Url) 
 }
 
 #[allow(dead_code)]
+fn validate_oauth_redirect_url(provider: OAuthProvider, url: &reqwest::Url) -> Result<()> {
+    let path = oauth_field_path(provider, "redirect_uri");
+    validate_oauth_url_shape(&path, url)?;
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    if url.scheme() == "http" && url.host_str().is_some_and(is_exact_redirect_host) {
+        return Ok(());
+    }
+    bail!("{} must use HTTPS or exact loopback HTTP", path)
+}
+
+fn validate_oauth_url_shape(path: &str, url: &reqwest::Url) -> Result<()> {
+    if url.host().is_none() {
+        bail!("{} must be an absolute URL with a host", path);
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("{} must not include username or password", path);
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 fn is_loopback_host(host: &str) -> bool {
+    let host = unbracket_ipv6_host(host);
     host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+fn is_exact_redirect_host(host: &str) -> bool {
+    let host = unbracket_ipv6_host(host);
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn unbracket_ipv6_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 #[allow(dead_code)]
@@ -2577,6 +2611,44 @@ google:
             assert!(error.contains(&format!("agent_api.oauth.microsoft.{field}")));
             assert!(!error.contains("client_secret=hidden"));
             assert!(!error.contains("user:password@"));
+        }
+
+        let redirect_http_hosts = [
+            ("http://localhost/oauth/callback", true),
+            ("http://127.0.0.1/oauth/callback", true),
+            ("http://[::1]/oauth/callback", true),
+            ("http://127.0.0.2/oauth/callback", false),
+            ("http://127.1.2.3/oauth/callback", false),
+            ("http://127.255.255.254/oauth/callback", false),
+            ("https://oauth.example.test/callback", true),
+        ];
+        for (value, valid) in redirect_http_hosts {
+            let mut redirect = PaOAuthConfig::default();
+            redirect.microsoft.redirect_uri = reqwest::Url::parse(value).unwrap();
+            let result = redirect.normalize_and_validate();
+            assert_eq!(
+                result.is_ok(),
+                valid,
+                "unexpected redirect result for {value}"
+            );
+            if let Err(error) = result {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("agent_api.oauth.microsoft.redirect_uri")
+                );
+            }
+        }
+
+        for field in ["authorize_url", "token_url"] {
+            let mut endpoint = PaOAuthConfig::default();
+            let url = reqwest::Url::parse("http://127.0.0.2/oauth-endpoint").unwrap();
+            match field {
+                "authorize_url" => endpoint.microsoft.authorize_url = url,
+                "token_url" => endpoint.microsoft.token_url = url,
+                _ => unreachable!(),
+            }
+            endpoint.normalize_and_validate().unwrap();
         }
 
         let credential_cases = [
