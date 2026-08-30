@@ -412,16 +412,18 @@ fn percent_encode(value: &[u8], preserve_slash: bool, preserve_valid_escapes: bo
             && is_hex_byte(value[index + 1])
             && is_hex_byte(value[index + 2])
         {
-            encoded.push('%');
-            encoded.push(value[index + 1] as char);
-            encoded.push(value[index + 2] as char);
+            let decoded = (hex_value(value[index + 1]) << 4) | hex_value(value[index + 2]);
+            if is_uri_unreserved(decoded) {
+                encoded.push(decoded as char);
+            } else {
+                encoded.push('%');
+                encoded.push(HEX[(decoded >> 4) as usize] as char);
+                encoded.push(HEX[(decoded & 0x0f) as usize] as char);
+            }
             index += 3;
             continue;
         }
-        if byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'.' | b'_' | b'~')
-            || (preserve_slash && byte == b'/')
-        {
+        if is_uri_unreserved(byte) || (preserve_slash && byte == b'/') {
             encoded.push(byte as char);
         } else {
             encoded.push('%');
@@ -435,6 +437,19 @@ fn percent_encode(value: &[u8], preserve_slash: bool, preserve_valid_escapes: bo
 
 fn is_hex_byte(byte: u8) -> bool {
     byte.is_ascii_digit() || matches!(byte, b'a'..=b'f' | b'A'..=b'F')
+}
+
+fn hex_value(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => unreachable!("hex_value is called only for hexadecimal bytes"),
+    }
+}
+
+fn is_uri_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
 fn normalize_header_name(name: &str) -> Result<String, SigV4Error> {
@@ -659,25 +674,25 @@ mod tests {
     }
 
     #[test]
-    fn canonical_uri_preserves_valid_percent_escapes() {
+    fn canonical_uri_canonicalizes_valid_percent_escapes() {
         let canonical =
-            canonical_request("GET", "/folder/a%20b%2F%2f%41", &headers(), PAYLOAD_HASH)
+            canonical_request("GET", "/folder/a%20b%2F%2f%41%7E", &headers(), PAYLOAD_HASH)
                 .expect("origin-form URI is valid");
 
-        assert!(canonical.starts_with("GET\n/folder/a%20b%2F%2f%41\n\n"));
+        assert!(canonical.starts_with("GET\n/folder/a%20b%2F%2FA~\n\n"));
     }
 
     #[test]
-    fn canonical_query_preserves_valid_percent_escapes() {
+    fn canonical_query_canonicalizes_valid_percent_escapes() {
         let canonical = canonical_request(
             "GET",
-            "/test.txt?prefix=a%2Fb&marker=%2f%20",
+            "/test.txt?prefix=a%2Fb&marker=%2f%20&tilde=%7E",
             &headers(),
             PAYLOAD_HASH,
         )
         .expect("origin-form URI is valid");
 
-        assert!(canonical.starts_with("GET\n/test.txt\nmarker=%2f%20&prefix=a%2Fb\n"));
+        assert!(canonical.starts_with("GET\n/test.txt\nmarker=%2F%20&prefix=a%2Fb&tilde=~\n"));
     }
 
     #[test]
