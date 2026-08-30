@@ -165,6 +165,11 @@ impl AppConfig {
             &mut self.llm.openai.instructions,
         );
         apply_voice_provider(env, "VOICE_PROVIDER", &mut self.voice.provider);
+        apply_voice_transport(
+            env,
+            "OPENAI_VOICE_TRANSPORT",
+            &mut self.voice.openai.transport,
+        );
         apply_string(env, "OPENAI_VOICE_API_URL", &mut self.voice.openai.api_url);
         apply_string(env, "OPENAI_VOICE_MODEL", &mut self.voice.openai.model);
         apply_string(env, "OPENAI_VOICE_NAME", &mut self.voice.openai.voice);
@@ -690,6 +695,36 @@ impl VoiceProvider {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Selects the OpenAI API transport used for unified voice turns.
+pub enum VoiceTransport {
+    #[default]
+    #[serde(alias = "chat-completions")]
+    ChatCompletions,
+    Realtime,
+}
+
+impl VoiceTransport {
+    /// Parses a transport from a config or environment string.
+    pub fn parse(value: &str) -> Option<Self> {
+        match normalize_env_value(value).to_ascii_lowercase().as_str() {
+            "chat_completions" | "chat-completions" | "chat" => Some(Self::ChatCompletions),
+            "realtime" => Some(Self::Realtime),
+            _ => None,
+        }
+    }
+
+    /// Returns whether the model is supported by this API transport.
+    pub fn supports_model(self, model: &str) -> bool {
+        let model = normalize_env_value(model);
+        match self {
+            Self::ChatCompletions => model == "gpt-audio-1.5",
+            Self::Realtime => matches!(model, "gpt-realtime-2.1" | "gpt-realtime-2.1-mini"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 /// Runtime LLM backend selection and provider-specific settings.
 pub struct LlmConfig {
@@ -750,8 +785,8 @@ pub struct VoiceConfig {
 
 impl VoiceConfig {
     fn validate(&self) -> Result<()> {
-        if self.uses_openai() && self.openai.model.trim().is_empty() {
-            bail!("voice.openai.model must not be empty");
+        if self.uses_openai() {
+            self.openai.validate()?;
         }
         Ok(())
     }
@@ -768,8 +803,10 @@ impl VoiceConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-/// OpenAI Realtime voice-model settings for full audio-in/audio-out calls.
+/// OpenAI voice-model settings for full audio-in/audio-out calls.
 pub struct OpenAiVoiceConfig {
+    #[serde(default)]
+    pub transport: VoiceTransport,
     #[serde(default = "default_openai_voice_api_url")]
     pub api_url: String,
     #[serde(default = "default_openai_voice_model")]
@@ -782,9 +819,26 @@ pub struct OpenAiVoiceConfig {
     pub input_transcription_model: Option<String>,
 }
 
+impl OpenAiVoiceConfig {
+    fn validate(&self) -> Result<()> {
+        if self.model.trim().is_empty() {
+            bail!("voice.openai.model must not be empty");
+        }
+        if !self.transport.supports_model(&self.model) {
+            bail!(
+                "voice.openai.model {} is not supported by {:?} transport",
+                self.model,
+                self.transport
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for OpenAiVoiceConfig {
     fn default() -> Self {
         Self {
+            transport: VoiceTransport::default(),
             api_url: default_openai_voice_api_url(),
             model: default_openai_voice_model(),
             voice: default_openai_voice_name(),
@@ -1523,6 +1577,16 @@ fn apply_voice_provider(
     }
 }
 
+fn apply_voice_transport(
+    env: &std::collections::HashMap<String, String>,
+    key: &str,
+    target: &mut VoiceTransport,
+) {
+    if let Some(value) = env.get(key).and_then(|value| VoiceTransport::parse(value)) {
+        *target = value;
+    }
+}
+
 fn apply_string_list(
     env: &std::collections::HashMap<String, String>,
     key: &str,
@@ -1839,5 +1903,45 @@ mod tests {
         assert_eq!(config.voice.provider, VoiceProvider::OpenAi);
         assert_eq!(config.voice.openai.model, "gpt-audio-1.5");
         assert_eq!(config.voice.openai.voice, "alloy");
+    }
+
+    #[test]
+    fn voice_transport_yaml_and_env_select_supported_model() {
+        let defaults = OpenAiVoiceConfig::default();
+        let serialized_defaults = serde_yaml::to_value(&defaults).unwrap();
+        assert_eq!(serialized_defaults["transport"], "chat_completions");
+        assert_eq!(defaults.model, "gpt-audio-1.5");
+
+        let yaml = r#"
+transport: realtime
+model: gpt-realtime-2.1
+"#;
+        let yaml_config: OpenAiVoiceConfig = serde_yaml::from_str(yaml).unwrap();
+        let serialized = serde_yaml::to_value(&yaml_config).unwrap();
+        assert_eq!(serialized["transport"], "realtime");
+        assert_eq!(yaml_config.model, "gpt-realtime-2.1");
+
+        let mut config = AppConfig::default();
+        let env = HashMap::from([
+            ("VOICE_PROVIDER".to_string(), "openai".to_string()),
+            ("OPENAI_VOICE_TRANSPORT".to_string(), "realtime".to_string()),
+            (
+                "OPENAI_VOICE_MODEL".to_string(),
+                "gpt-realtime-2.1".to_string(),
+            ),
+        ]);
+        config.apply_env_overrides_from_map(&env);
+        let serialized = serde_yaml::to_value(&config.voice.openai).unwrap();
+        assert_eq!(serialized["transport"], "realtime");
+        assert_eq!(config.voice.openai.model, "gpt-realtime-2.1");
+        assert!(config.voice.validate().is_ok());
+
+        let incompatible: OpenAiVoiceConfig =
+            serde_yaml::from_str("transport: chat_completions\nmodel: gpt-realtime-2.1\n").unwrap();
+        let voice = VoiceConfig {
+            provider: VoiceProvider::OpenAi,
+            openai: incompatible,
+        };
+        assert!(voice.validate().is_err());
     }
 }
