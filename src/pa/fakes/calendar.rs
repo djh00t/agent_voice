@@ -150,6 +150,17 @@ impl FakeCalendarRead {
             }
             return Err(ProviderError::Conflict);
         }
+        if let Some(existing) = state
+            .changes
+            .iter()
+            .filter_map(CalendarChange::event)
+            .find(|event| event.operation_key() == draft.operation_key())
+        {
+            if owner_draft_matches_event(draft, existing) {
+                return Ok(existing.clone());
+            }
+            return Err(ProviderError::Conflict);
+        }
 
         let mut sequence = state.next_outlook_event_sequence;
         let provider_event_id = loop {
@@ -923,6 +934,13 @@ impl OutlookCalendarProvider for FakeOutlookCalendar {
                 .owner_events
                 .iter()
                 .find(|event| event.operation_key() == draft.operation_key())
+                .or_else(|| {
+                    state
+                        .changes
+                        .iter()
+                        .filter_map(CalendarChange::event)
+                        .find(|event| event.operation_key() == draft.operation_key())
+                })
                 .cloned()
                 .ok_or(ProviderError::NotFound)
         })
@@ -1900,6 +1918,22 @@ mod tests {
             "Australia/Sydney",
         )
         .expect("owner draft")
+    }
+
+    fn owner_event_change(id: &str, draft: &OwnerEventDraft) -> CalendarChange {
+        CalendarChange::upsert(
+            CalendarEvent::new(
+                id,
+                draft.operation_key(),
+                draft.title(),
+                draft.time_range().clone(),
+                draft.timezone(),
+                std::iter::empty::<CalendarAttendee>(),
+                now(),
+            )
+            .expect("seeded owner event"),
+        )
+        .expect("seeded owner change")
     }
 
     fn google_proposal_draft(key: &str, title: &str) -> GoogleProposalDraft {
@@ -3536,6 +3570,64 @@ mod tests {
             created.provider_event_id()
         );
         assert_eq!(page.items()[1].event(), Some(&created));
+    }
+
+    #[tokio::test]
+    async fn outlook_seeded_operation_key_reconciles_without_duplicate() {
+        let control = FakeControl::new(now());
+        let draft = owner_draft("outlook-seeded-operation", "Focus time");
+        let seeded = owner_event_change("seeded-owner-event", &draft)
+            .event()
+            .expect("seeded event")
+            .clone();
+        let fake = FakeOutlookCalendar::new(
+            control.clone(),
+            Vec::<BusyInterval>::new(),
+            [owner_event_change("seeded-owner-event", &draft)],
+        );
+        let provider: &dyn OutlookCalendarProvider = &fake;
+
+        let found = provider
+            .find_owner_event(&session(), &draft)
+            .await
+            .expect("seeded owner event");
+        assert_eq!(found, seeded);
+        let created = provider
+            .create_owner_event(&session(), &draft)
+            .await
+            .expect("seeded create retry");
+        assert_eq!(created, seeded);
+        assert_eq!(
+            provider
+                .create_owner_event(
+                    &session(),
+                    &owner_draft("outlook-seeded-operation", "Changed"),
+                )
+                .await,
+            Err(ProviderError::Conflict)
+        );
+
+        {
+            let state = fake.read.state.lock().expect("state");
+            assert!(state.owner_events.is_empty());
+            assert_eq!(state.changes.len(), 1);
+            assert_eq!(state.changes[0].event(), Some(&seeded));
+        }
+        assert!(
+            fake.list_busy(
+                &session(),
+                &range("2026-08-29T09:00:00Z", "2026-08-29T12:00:00Z"),
+            )
+            .await
+            .expect("seeded busy")
+            .is_empty()
+        );
+        assert_eq!(
+            control
+                .invocation_count(FakeOperation::CalendarOwnerCreate)
+                .expect("owner-create count"),
+            2
+        );
     }
 
     #[tokio::test]
