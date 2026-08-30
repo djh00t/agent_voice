@@ -95,6 +95,16 @@ timestamp was accepted. Source-only commit
 both timestamp columns. All six v14 selectors passed after the fix; the
 implementer gate observed 516 tests plus lint, rustdoc, and docs stages.
 
+## Round-6 embedded-NUL remediation
+
+Current-head review proved SQLite `GLOB` could stop at an embedded NUL while
+the byte-length constraint still counted an invalid suffix. RED failed with
+`embedded NUL in scope was accepted`. Source-only commit
+`c64dd7f2c3f77c18155b428fd66670965776eb06` adds explicit BLOB NUL rejection
+for scope, idempotency key, and fingerprint, including an exact-64-byte
+fingerprint bypass fixture. All exact v14 selectors and the implementer full
+gate passed with 516 tests.
+
 ## Evidence records
 
 | evidence_id | order | command | expected_exit | observed_exit | selector_or_diagnostic | evidence_tier | status | artifact_ref | non_claim | reviewer |
@@ -113,6 +123,7 @@ implementer gate observed 516 tests plus lint, rustdoc, and docs stages.
 | EV-13F-11 | 11 | v14 invalid-row and wrong-storage-class exact selectors | nonzero then 0 | 101 then 0 | non-space whitespace and wrong SQLite storage classes rejected | LOCAL | CONFIRMED | `6d5657468cd5168bd35e85b02c7c7712b4b68faa` | does not prove runtime decoding | Codex PR review |
 | EV-13F-12 | 12 | `rtk make check` | 0 | 0 | post-hardening 515-test suite, compile-fail doctests, Clippy, rustdoc, docs | LOCAL | CONFIRMED | `6d5657468cd5168bd35e85b02c7c7712b4b68faa` | does not prove current-head CI or live behavior | controller |
 | EV-13F-13 | 13 | v14 migration metadata and timestamp exact selectors | nonzero then 0 | 101 then 0 | canonical RFC3339 UTC defaults and malformed timestamp rejection | LOCAL | CONFIRMED | `7ad0976e9868a5b2e8da5ed790d2d37e07d4b690` | does not prove runtime reservation behavior | Codex PR review |
+| EV-13F-14 | 14 | v14 invalid-row exact selector | nonzero then 0 | 101 then 0 | embedded-NUL suffix bypasses rejected for all durable identities | LOCAL | CONFIRMED | `c64dd7f2c3f77c18155b428fd66670965776eb06` | does not prove runtime decoding | Codex PR review |
 
 ## Round-1 findings and resolutions
 
@@ -173,6 +184,7 @@ Controller review must verify the exact base/stack, one-file source commit, migr
 - Round-3 source remediation: `7a874473ae32d179d9f5068dfafe81afe7bb91c9`.
 - Round-4 source remediation: `6d5657468cd5168bd35e85b02c7c7712b4b68faa`.
 - Round-5 source remediation: `7ad0976e9868a5b2e8da5ed790d2d37e07d4b690`.
+- Round-6 source remediation: `c64dd7f2c3f77c18155b428fd66670965776eb06`.
 - Prior report commits: `0f711bf03eecf009980de96e8b4990fb5de9389a`, `ddc35eab9aff4955d11b8ac1d54d5557c4bbaa8f`.
 - Report commit state: containing commit; resolve with `rtk git log -1 --format=%H -- .superpowers/sdd/agent-voice-pa-mvp-plan/task-7d1-report.md` after this report is committed.
 - Reviewer: pending controller review.
