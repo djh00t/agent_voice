@@ -31,6 +31,7 @@ dependencies = [
  "http",
  "parking_lot",
  "reqwest",
+ "ring",
  "rustls",
  "scraper",
  "serde",
