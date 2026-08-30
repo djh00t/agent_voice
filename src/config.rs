@@ -1180,9 +1180,42 @@ pub struct OAuthProviderConfig {
 }
 
 /// OAuth settings for Microsoft identity and calendar/mail access.
-pub type MicrosoftOAuthConfig = OAuthProviderConfig;
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct MicrosoftOAuthConfig(OAuthProviderConfig);
+
 /// OAuth settings for Google identity and calendar/mail access.
-pub type GoogleOAuthConfig = OAuthProviderConfig;
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct GoogleOAuthConfig(OAuthProviderConfig);
+
+impl std::ops::Deref for MicrosoftOAuthConfig {
+    type Target = OAuthProviderConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for MicrosoftOAuthConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl std::ops::Deref for GoogleOAuthConfig {
+    type Target = OAuthProviderConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for GoogleOAuthConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 /// Microsoft and Google OAuth configuration for the personal-assistant API.
@@ -1206,8 +1239,8 @@ impl PaOAuthConfig {
     /// Returns the configuration associated with the selected provider.
     pub fn for_provider(&self, provider: OAuthProvider) -> &OAuthProviderConfig {
         match provider {
-            OAuthProvider::Microsoft => &self.microsoft,
-            OAuthProvider::Google => &self.google,
+            OAuthProvider::Microsoft => &self.microsoft.0,
+            OAuthProvider::Google => &self.google.0,
         }
     }
 
@@ -1295,6 +1328,30 @@ impl<'de> Deserialize<'de> for OAuthProviderConfig {
     }
 }
 
+impl<'de> Deserialize<'de> for MicrosoftOAuthConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = OAuthProviderConfigFields::deserialize(deserializer)?;
+        provider_config_from_fields(OAuthProvider::Microsoft, fields)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for GoogleOAuthConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = OAuthProviderConfigFields::deserialize(deserializer)?;
+        provider_config_from_fields(OAuthProvider::Google, fields)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 impl<'de> Deserialize<'de> for PaOAuthConfig {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -1306,12 +1363,14 @@ impl<'de> Deserialize<'de> for PaOAuthConfig {
             .map(|fields| provider_config_from_fields(OAuthProvider::Microsoft, fields))
             .transpose()
             .map_err(serde::de::Error::custom)?
+            .map(MicrosoftOAuthConfig)
             .unwrap_or_else(default_microsoft_oauth_config);
         let google = fields
             .google
             .map(|fields| provider_config_from_fields(OAuthProvider::Google, fields))
             .transpose()
             .map_err(serde::de::Error::custom)?
+            .map(GoogleOAuthConfig)
             .unwrap_or_else(default_google_oauth_config);
         Ok(Self { microsoft, google })
     }
@@ -1798,12 +1857,12 @@ fn default_provider_config(provider: OAuthProvider) -> OAuthProviderConfig {
     }
 }
 
-fn default_microsoft_oauth_config() -> OAuthProviderConfig {
-    default_provider_config(OAuthProvider::Microsoft)
+fn default_microsoft_oauth_config() -> MicrosoftOAuthConfig {
+    MicrosoftOAuthConfig(default_provider_config(OAuthProvider::Microsoft))
 }
 
-fn default_google_oauth_config() -> OAuthProviderConfig {
-    default_provider_config(OAuthProvider::Google)
+fn default_google_oauth_config() -> GoogleOAuthConfig {
+    GoogleOAuthConfig(default_provider_config(OAuthProvider::Google))
 }
 
 fn default_agent_api_listen() -> String {
@@ -2517,6 +2576,44 @@ google:
         assert_eq!(
             parsed.google.redirect_uri.as_str(),
             "https://localhost.example.test/callback"
+        );
+    }
+
+    #[test]
+    fn oauth_provider_deserialization_uses_provider_defaults() {
+        let microsoft: MicrosoftOAuthConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(
+            microsoft.authorize_url.as_str(),
+            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+        );
+        assert_eq!(
+            microsoft.token_url.as_str(),
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+        );
+        assert_eq!(
+            microsoft.redirect_uri.as_str(),
+            "http://127.0.0.1:8089/oauth/microsoft/callback"
+        );
+
+        let google: GoogleOAuthConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(
+            google.authorize_url.as_str(),
+            "https://accounts.google.com/o/oauth2/v2/auth"
+        );
+        assert_eq!(
+            google.token_url.as_str(),
+            "https://oauth2.googleapis.com/token"
+        );
+        assert_eq!(
+            google.redirect_uri.as_str(),
+            "http://127.0.0.1:8089/oauth/google/callback"
+        );
+        assert_eq!(
+            google.scopes,
+            vec![
+                "https://www.googleapis.com/auth/calendar.events".to_string(),
+                "https://www.googleapis.com/auth/gmail.modify".to_string(),
+            ]
         );
     }
 
