@@ -7785,6 +7785,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use ring::rand::{SecureRandom, SystemRandom};
     use rusqlite::{Connection, Transaction, types::Value};
     use time::{
         Duration as TimeDuration, OffsetDateTime, UtcOffset,
@@ -7841,6 +7842,14 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
         let _ = fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+    }
+
+    fn random_replay_nonce() -> String {
+        let mut bytes = [0_u8; 24];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .expect("runtime replay nonce generation");
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     fn disable_audit_append_only_triggers_for_fixture(connection: &Connection) {
@@ -18001,16 +18010,16 @@ END;
         let database = TempDatabase::new();
         let first = PaStore::open(&database.path, DATABASE_KEY).expect("open first store");
         let now = 1_700_000_000;
-        let nonce = "0123456789abcdef";
+        let nonce = random_replay_nonce();
 
         assert!(
             first
-                .consume_replay_nonce(nonce, now)
+                .consume_replay_nonce(&nonce, now)
                 .expect("first consume")
         );
         assert!(
             !first
-                .consume_replay_nonce(nonce, now)
+                .consume_replay_nonce(&nonce, now)
                 .expect("duplicate consume")
         );
         drop(first);
@@ -18018,12 +18027,12 @@ END;
         let reopened = PaStore::open(&database.path, DATABASE_KEY).expect("reopen store");
         assert!(
             !reopened
-                .consume_replay_nonce(nonce, now)
+                .consume_replay_nonce(&nonce, now)
                 .expect("reopened duplicate consume")
         );
         assert!(
             reopened
-                .consume_replay_nonce(nonce, now + crate::pa::auth::REPLAY_RETENTION_SECONDS)
+                .consume_replay_nonce(&nonce, now + crate::pa::auth::REPLAY_RETENTION_SECONDS,)
                 .expect("expiry-boundary consume")
         );
 
@@ -18031,7 +18040,7 @@ END;
             .connection()
             .query_row(
                 "SELECT consumed_at, expires_at FROM replay_nonces WHERE nonce = ?1",
-                [nonce],
+                [nonce.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("stored replay row");
@@ -18043,16 +18052,19 @@ END;
     fn replay_nonce_purges_expired_rows_but_keeps_live_rows() {
         let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
         let now = 1_700_000_000;
+        let expired_nonce = random_replay_nonce();
+        let live_nonce = random_replay_nonce();
+        let new_nonce = random_replay_nonce();
         store
             .connection()
             .execute(
                 "INSERT INTO replay_nonces (nonce, consumed_at, expires_at)
                  VALUES (?1, ?2, ?3), (?4, ?5, ?6)",
                 rusqlite::params![
-                    "expirednonce0000",
+                    &expired_nonce,
                     "2023-11-14T22:08:20Z",
                     "2023-11-14T22:13:20Z",
-                    "livenonce0000000",
+                    &live_nonce,
                     "2023-11-14T22:08:21Z",
                     "2023-11-14T22:13:21Z",
                 ],
@@ -18061,7 +18073,7 @@ END;
 
         assert!(
             store
-                .consume_replay_nonce("newnonce000000000", now)
+                .consume_replay_nonce(&new_nonce, now)
                 .expect("new consume")
         );
         let rows = store
@@ -18072,7 +18084,9 @@ END;
             .expect("query replay rows")
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("collect replay rows");
-        assert_eq!(rows, vec!["livenonce0000000", "newnonce000000000"]);
+        let mut expected = vec![live_nonce, new_nonce];
+        expected.sort();
+        assert_eq!(rows, expected);
     }
 
     #[test]
@@ -18083,16 +18097,18 @@ END;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let first_barrier = std::sync::Arc::clone(&barrier);
         let second_barrier = std::sync::Arc::clone(&barrier);
-        let nonce = "racingnonce00000";
+        let nonce = random_replay_nonce();
+        let first_nonce = nonce.clone();
+        let second_nonce = nonce.clone();
         let now = 1_700_000_000;
 
         let first_handle = std::thread::spawn(move || {
             first_barrier.wait();
-            first.consume_replay_nonce(nonce, now)
+            first.consume_replay_nonce(&first_nonce, now)
         });
         let second_handle = std::thread::spawn(move || {
             second_barrier.wait();
-            second.consume_replay_nonce(nonce, now)
+            second.consume_replay_nonce(&second_nonce, now)
         });
         let results = [
             first_handle.join().expect("first replay claimant panicked"),
@@ -18123,7 +18139,7 @@ END;
             .connection()
             .query_row(
                 "SELECT count(*) FROM replay_nonces WHERE nonce = ?1",
-                [nonce],
+                [nonce.as_str()],
                 |row| row.get(0),
             )
             .expect("count retained replay row");
@@ -18133,17 +18149,24 @@ END;
     #[test]
     fn replay_nonce_rejects_invalid_input_without_mutating_rows_or_leaking_it() {
         let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
-        let secret_nonce = "secret-replay-nonce-value!";
+        let expired_nonce = random_replay_nonce();
+        let live_nonce = random_replay_nonce();
+        let mut short_nonce = random_replay_nonce();
+        short_nonce.truncate(15);
+        let mut invalid_character_nonce = random_replay_nonce();
+        invalid_character_nonce.push('!');
+        let mut secret_nonce = random_replay_nonce();
+        secret_nonce.push('!');
         store
             .connection()
             .execute(
                 "INSERT INTO replay_nonces (nonce, consumed_at, expires_at)
                  VALUES (?1, ?2, ?3), (?4, ?5, ?6)",
                 rusqlite::params![
-                    "expirednonce0000",
+                    &expired_nonce,
                     "2023-11-14T22:08:20Z",
                     "2023-11-14T22:13:20Z",
-                    "livenonce0000000",
+                    &live_nonce,
                     "2023-11-14T22:13:19Z",
                     "2023-11-14T22:13:21Z",
                 ],
@@ -18172,20 +18195,21 @@ END;
                 .expect("collect replay snapshot")
         };
 
-        for nonce in ["short", "0123456789abcde!", secret_nonce] {
+        for nonce in [&short_nonce, &invalid_character_nonce, &secret_nonce] {
             let before = snapshot();
             let error = store
                 .consume_replay_nonce(nonce, 1_700_000_000)
                 .expect_err("invalid nonce");
             assert!(matches!(error, StoreError::InvalidInput { field: "nonce" }));
-            assert!(!error.to_string().contains(secret_nonce));
-            assert!(!format!("{error:?}").contains(secret_nonce));
+            assert!(!error.to_string().contains(&secret_nonce));
+            assert!(!format!("{error:?}").contains(&secret_nonce));
             assert_eq!(snapshot(), before);
         }
+        let valid_nonce = random_replay_nonce();
         for now in [i64::MIN, i64::MAX] {
             let before = snapshot();
             let error = store
-                .consume_replay_nonce("validnonce000000", now)
+                .consume_replay_nonce(&valid_nonce, now)
                 .expect_err("unrepresentable time");
             assert!(matches!(error, StoreError::InvalidInput { field: "now" }));
             assert_eq!(snapshot(), before);
