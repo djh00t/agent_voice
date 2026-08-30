@@ -542,8 +542,10 @@ fn decode_pcm_s16le(encoded: &str) -> Result<Vec<i16>> {
         bail!("invalid sherpa-onnx PCM payload length {}", bytes.len());
     }
     Ok(bytes
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| i16::from_le_bytes(*chunk))
         .collect())
 }
 
