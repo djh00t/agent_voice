@@ -1210,6 +1210,279 @@ impl PaOAuthConfig {
             OAuthProvider::Google => &self.google,
         }
     }
+
+    /// Normalizes supplied OAuth values and validates them without partial updates on failure.
+    #[allow(dead_code)]
+    pub(crate) fn normalize_and_validate(&mut self) -> Result<()> {
+        let mut normalized = self.clone();
+        normalized.normalize_and_validate_in_place()?;
+        *self = normalized;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn normalize_and_validate_in_place(&mut self) -> Result<()> {
+        normalize_and_validate_provider(OAuthProvider::Microsoft, &mut self.microsoft)?;
+        normalize_and_validate_provider(OAuthProvider::Google, &mut self.google)
+    }
+}
+
+impl OAuthProviderConfig {
+    /// Returns a configured client identifier or a field-specific error.
+    #[allow(dead_code)]
+    pub(crate) fn require_client_id(&self, provider: OAuthProvider) -> Result<&str> {
+        self.client_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !is_complete_placeholder(value))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} must be configured",
+                    oauth_field_path(provider, "client_id")
+                )
+            })
+    }
+
+    /// Returns a configured client secret or a field-specific error.
+    #[allow(dead_code)]
+    pub(crate) fn require_client_secret(&self, provider: OAuthProvider) -> Result<&str> {
+        self.client_secret
+            .as_ref()
+            .map(Secret::as_str)
+            .map(normalize_env_value)
+            .filter(|value| !value.trim().is_empty() && !is_complete_placeholder(value))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} must be configured",
+                    oauth_field_path(provider, "client_secret")
+                )
+            })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthProviderConfigFields {
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<Secret>,
+    #[serde(default)]
+    authorize_url: Option<String>,
+    #[serde(default)]
+    token_url: Option<String>,
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
+    #[serde(default)]
+    redirect_uri: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PaOAuthConfigFields {
+    #[serde(default)]
+    microsoft: Option<OAuthProviderConfigFields>,
+    #[serde(default)]
+    google: Option<OAuthProviderConfigFields>,
+}
+
+impl<'de> Deserialize<'de> for OAuthProviderConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = OAuthProviderConfigFields::deserialize(deserializer)?;
+        provider_config_from_fields(OAuthProvider::Microsoft, fields)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for PaOAuthConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = PaOAuthConfigFields::deserialize(deserializer)?;
+        let microsoft = fields
+            .microsoft
+            .map(|fields| provider_config_from_fields(OAuthProvider::Microsoft, fields))
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_else(default_microsoft_oauth_config);
+        let google = fields
+            .google
+            .map(|fields| provider_config_from_fields(OAuthProvider::Google, fields))
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_else(default_google_oauth_config);
+        Ok(Self { microsoft, google })
+    }
+}
+
+fn provider_config_from_fields(
+    provider: OAuthProvider,
+    fields: OAuthProviderConfigFields,
+) -> std::result::Result<OAuthProviderConfig, String> {
+    let mut config = default_provider_config(provider);
+    config.client_id = fields.client_id;
+    config.client_secret = fields.client_secret;
+    if let Some(value) = fields.authorize_url {
+        config.authorize_url = parse_oauth_url(provider, "authorize_url", &value)?;
+    }
+    if let Some(value) = fields.token_url {
+        config.token_url = parse_oauth_url(provider, "token_url", &value)?;
+    }
+    if let Some(scopes) = fields.scopes {
+        config.scopes = scopes;
+    }
+    if let Some(value) = fields.redirect_uri {
+        config.redirect_uri = parse_oauth_url(provider, "redirect_uri", &value)?;
+    }
+    Ok(config)
+}
+
+fn parse_oauth_url(
+    provider: OAuthProvider,
+    field: &str,
+    value: &str,
+) -> std::result::Result<reqwest::Url, String> {
+    reqwest::Url::parse(value).map_err(|_| {
+        format!(
+            "{} must be a valid absolute URL",
+            oauth_field_path(provider, field)
+        )
+    })
+}
+
+#[allow(dead_code)]
+fn normalize_and_validate_provider(
+    provider: OAuthProvider,
+    config: &mut OAuthProviderConfig,
+) -> Result<()> {
+    normalize_client_id(provider, &mut config.client_id)?;
+    normalize_client_secret(provider, &mut config.client_secret)?;
+    if config.client_secret.is_some() && config.client_id.is_none() {
+        bail!(
+            "{} must be configured when client_secret is supplied",
+            oauth_field_path(provider, "client_id")
+        );
+    }
+    validate_oauth_url(provider, "authorize_url", &config.authorize_url)?;
+    validate_oauth_url(provider, "token_url", &config.token_url)?;
+    validate_oauth_url(provider, "redirect_uri", &config.redirect_uri)?;
+    normalize_scopes(provider, &mut config.scopes)
+}
+
+#[allow(dead_code)]
+fn normalize_client_id(provider: OAuthProvider, client_id: &mut Option<String>) -> Result<()> {
+    let Some(value) = client_id else {
+        return Ok(());
+    };
+    let normalized = value.trim().to_string();
+    if normalized.is_empty() {
+        bail!(
+            "{} must not be blank",
+            oauth_field_path(provider, "client_id")
+        );
+    }
+    if is_complete_placeholder(&normalized) {
+        bail!(
+            "{} must not be an unresolved placeholder",
+            oauth_field_path(provider, "client_id")
+        );
+    }
+    *value = normalized;
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn normalize_client_secret(
+    provider: OAuthProvider,
+    client_secret: &mut Option<Secret>,
+) -> Result<()> {
+    let Some(secret) = client_secret else {
+        return Ok(());
+    };
+    let normalized = normalize_env_value(secret.as_str()).to_string();
+    if normalized.trim().is_empty() {
+        bail!(
+            "{} must not be blank",
+            oauth_field_path(provider, "client_secret")
+        );
+    }
+    if is_complete_placeholder(&normalized) {
+        bail!(
+            "{} must not be an unresolved placeholder",
+            oauth_field_path(provider, "client_secret")
+        );
+    }
+    secret.0 = normalized;
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_oauth_url(provider: OAuthProvider, field: &str, url: &reqwest::Url) -> Result<()> {
+    let path = oauth_field_path(provider, field);
+    if url.host().is_none() {
+        bail!("{} must be an absolute URL with a host", path);
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("{} must not include username or password", path);
+    }
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    if url.scheme() == "http" && url.host_str().is_some_and(is_loopback_host) {
+        return Ok(());
+    }
+    bail!("{} must use HTTPS or loopback HTTP", path)
+}
+
+#[allow(dead_code)]
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+#[allow(dead_code)]
+fn normalize_scopes(provider: OAuthProvider, scopes: &mut Vec<String>) -> Result<()> {
+    let path = oauth_field_path(provider, "scopes");
+    if scopes.is_empty() {
+        bail!("{} must not be empty", path);
+    }
+    for scope in scopes.iter_mut() {
+        *scope = scope.trim().to_string();
+        if scope.is_empty() {
+            bail!("{} must not contain blank items", path);
+        }
+    }
+    scopes.sort();
+    scopes.dedup();
+    if provider == OAuthProvider::Google && scopes.iter().any(|scope| scope == "offline_access") {
+        bail!("{} must not contain offline_access", path);
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn is_complete_placeholder(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("${") && value.ends_with('}') && value.len() >= 3
+}
+
+fn oauth_field_path(provider: OAuthProvider, field: &str) -> String {
+    format!(
+        "agent_api.oauth.{}.{}",
+        oauth_provider_name(provider),
+        field
+    )
+}
+
+fn oauth_provider_name(provider: OAuthProvider) -> &'static str {
+    match provider {
+        OAuthProvider::Microsoft => "microsoft",
+        OAuthProvider::Google => "google",
+    }
 }
 
 mod oauth_url {
@@ -2170,5 +2443,157 @@ model: gpt-realtime-2.1
         assert!(!debug.contains("do-not-leak"));
         assert!(!serialized.contains("do-not-leak"));
         assert!(serde_json::from_str::<Secret>("\"<redacted>\"").is_err());
+    }
+
+    #[test]
+    fn oauth_deserialization_uses_defaults() {
+        let defaults = PaOAuthConfig::default();
+        let parsed: PaOAuthConfig = serde_yaml::from_str("{}").unwrap();
+
+        assert_eq!(parsed, defaults);
+
+        let parsed: PaOAuthConfig = serde_yaml::from_str(
+            r#"
+microsoft:
+  client_id: " application-id "
+  client_secret: "application-secret"
+google:
+  redirect_uri: "https://localhost.example.test/callback"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.microsoft.authorize_url,
+            defaults.microsoft.authorize_url
+        );
+        assert_eq!(parsed.microsoft.token_url, defaults.microsoft.token_url);
+        assert_eq!(parsed.microsoft.scopes, defaults.microsoft.scopes);
+        assert_eq!(
+            parsed.microsoft.client_id.as_deref(),
+            Some(" application-id ")
+        );
+        assert_eq!(
+            parsed.microsoft.client_secret.as_ref().map(Secret::as_str),
+            Some("application-secret")
+        );
+        assert_eq!(parsed.google.authorize_url, defaults.google.authorize_url);
+        assert_eq!(parsed.google.token_url, defaults.google.token_url);
+        assert_eq!(parsed.google.scopes, defaults.google.scopes);
+        assert_eq!(
+            parsed.google.redirect_uri.as_str(),
+            "https://localhost.example.test/callback"
+        );
+    }
+
+    #[test]
+    fn oauth_scopes_normalize_or_fail_field_specifically() {
+        let mut config = PaOAuthConfig::default();
+        config.microsoft.scopes = vec![
+            " profile ".to_string(),
+            "Mail.Read".to_string(),
+            "profile".to_string(),
+            " offline_access ".to_string(),
+        ];
+
+        config.normalize_and_validate().unwrap();
+        assert_eq!(
+            config.microsoft.scopes,
+            vec![
+                "Mail.Read".to_string(),
+                "offline_access".to_string(),
+                "profile".to_string(),
+            ]
+        );
+        let normalized = config.clone();
+        config.normalize_and_validate().unwrap();
+        assert_eq!(config, normalized);
+
+        let mut blank = PaOAuthConfig::default();
+        blank.google.scopes = vec![" calendar ".to_string(), "  ".to_string()];
+        let error = blank.normalize_and_validate().unwrap_err().to_string();
+        assert!(error.contains("agent_api.oauth.google.scopes"));
+        assert!(error.contains("blank"));
+
+        let mut empty = PaOAuthConfig::default();
+        empty.google.scopes.clear();
+        let error = empty.normalize_and_validate().unwrap_err().to_string();
+        assert!(error.contains("agent_api.oauth.google.scopes"));
+        assert!(error.contains("empty"));
+
+        let mut forbidden = PaOAuthConfig::default();
+        forbidden.google.scopes = vec!["offline_access".to_string()];
+        let error = forbidden.normalize_and_validate().unwrap_err().to_string();
+        assert!(error.contains("agent_api.oauth.google.scopes"));
+        assert!(error.contains("offline_access"));
+    }
+
+    #[test]
+    fn oauth_urls_and_credentials_validate_before_use() {
+        let mut config = PaOAuthConfig::default();
+        config.microsoft.client_id = Some(" application-id ".to_string());
+        config.normalize_and_validate().unwrap();
+        assert_eq!(
+            config.microsoft.client_id.as_deref(),
+            Some("application-id")
+        );
+        assert_eq!(
+            config
+                .microsoft
+                .require_client_id(OAuthProvider::Microsoft)
+                .unwrap(),
+            "application-id"
+        );
+        let error = config
+            .microsoft
+            .require_client_secret(OAuthProvider::Microsoft)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("agent_api.oauth.microsoft.client_secret"));
+        assert!(!error.contains("application-id"));
+
+        let invalid_urls = [
+            (
+                "authorize_url",
+                "http://oauth.example.test/authorize?client_secret=hidden",
+            ),
+            ("token_url", "ftp://oauth.example.test/token"),
+            ("redirect_uri", "http://oauth.example.test/callback"),
+            (
+                "authorize_url",
+                "https://user:password@oauth.example.test/auth",
+            ),
+        ];
+        for (field, value) in invalid_urls {
+            let mut invalid = PaOAuthConfig::default();
+            let url = reqwest::Url::parse(value).unwrap();
+            match field {
+                "authorize_url" => invalid.microsoft.authorize_url = url,
+                "token_url" => invalid.microsoft.token_url = url,
+                "redirect_uri" => invalid.microsoft.redirect_uri = url,
+                _ => unreachable!(),
+            }
+            let error = invalid.normalize_and_validate().unwrap_err().to_string();
+            assert!(error.contains(&format!("agent_api.oauth.microsoft.{field}")));
+            assert!(!error.contains("client_secret=hidden"));
+            assert!(!error.contains("user:password@"));
+        }
+
+        let credential_cases = [
+            (Some("   "), None, "client_id"),
+            (Some("${MICROSOFT_CLIENT_ID}"), None, "client_id"),
+            (None, Some("   "), "client_secret"),
+            (None, Some("${MICROSOFT_CLIENT_SECRET}"), "client_secret"),
+            (None, Some("secret-only"), "client_id"),
+        ];
+        for (client_id, client_secret, field) in credential_cases {
+            let mut invalid = PaOAuthConfig::default();
+            invalid.microsoft.client_id = client_id.map(str::to_string);
+            invalid.microsoft.client_secret = client_secret.map(|value| Secret(value.to_string()));
+            let error = invalid.normalize_and_validate().unwrap_err().to_string();
+            assert!(error.contains(&format!("agent_api.oauth.microsoft.{field}")));
+            assert!(!error.contains("secret-only"));
+            assert!(!error.contains("MICROSOFT_CLIENT_SECRET"));
+        }
     }
 }
