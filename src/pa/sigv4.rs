@@ -12,6 +12,7 @@ const SERVICE: &str = "s3";
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const TERMINATOR: &str = "aws4_request";
 const MAX_REGION_LEN: usize = 64;
+const MIN_ACCESS_KEY_LEN: usize = 16;
 const MAX_ACCESS_KEY_LEN: usize = 128;
 const MAX_SECRET_LEN: usize = 4_096;
 const MAX_SESSION_TOKEN_LEN: usize = 4_096;
@@ -602,6 +603,7 @@ fn validate_credentials(credentials: &Credentials) -> Result<(), SigV4Error> {
 
 fn is_access_key_id(value: &str) -> bool {
     !value.is_empty()
+        && value.len() >= MIN_ACCESS_KEY_LEN
         && value.len() <= MAX_ACCESS_KEY_LEN
         && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
@@ -708,6 +710,31 @@ mod tests {
                 error.kind,
                 SigV4ErrorKind::InvalidCredential,
                 "{delimiter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn access_key_id_enforces_aws_length_bounds() {
+        for length in [15, 129] {
+            let credentials = Credentials {
+                access_key_id: "A".repeat(length),
+                secret_access_key: b"secret".to_vec(),
+                session_token: None,
+            };
+            let error = sign_request(&request(), &credentials, TIMESTAMP).unwrap_err();
+            assert_eq!(error.kind, SigV4ErrorKind::InvalidCredential, "{length}");
+        }
+
+        for length in [16, 128] {
+            let credentials = Credentials {
+                access_key_id: "A".repeat(length),
+                secret_access_key: b"secret".to_vec(),
+                session_token: None,
+            };
+            assert!(
+                sign_request(&request(), &credentials, TIMESTAMP).is_ok(),
+                "{length}"
             );
         }
     }
