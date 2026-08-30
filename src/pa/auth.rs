@@ -777,6 +777,7 @@ mod tests {
 
     #[test]
     fn persistent_replay_guard_fails_closed_when_storage_fails() {
+        let nonce = test_nonce();
         let mut replay_guard = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
         replay_guard
             .connection()
@@ -785,7 +786,7 @@ mod tests {
 
         assert!(!ReplayGuard::check_and_record(
             &mut replay_guard,
-            NONCE,
+            &nonce,
             NOW
         ));
     }
