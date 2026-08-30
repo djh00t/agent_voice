@@ -6,7 +6,16 @@
 - **Evidence date:** 2026-08-30 (Australia/Sydney)
 - **Worktree:** `/private/tmp/agent-voice-pa-task6-build`
 - **Branch:** `codex/agent-voice-pa-06-service-layer`
-- **Implementation commits:** `bb10f2d`, `1512f9e`
+- **Implementation commits:** `bb10f2d`, `1512f9e`, `3a9180c`
+- **Evidence commit:** `687567e`
+
+## Prerequisite evidence
+
+Issue #175's frozen-quote persistence boundary is implemented by `40439ac`
+in PR #204. Its save/load, immutable retry/conflict, strict reconstruction,
+reopen, concurrency, and rollback coverage passed within the 163-test store
+suite. PR #204 is green and mergeable and now contains `Closes #175`; this
+Task 6 stack must remain ordered after that prerequisite PR.
 
 ## Scope and ownership
 
@@ -85,7 +94,7 @@ quote from this operation.
 | Invalid limits fail before provider calls or writes | `invalid_limits_do_not_call_either_provider_or_write_a_quote` | PASS (LOCAL) |
 | First provider failure stops the workflow; second provider is not called | `outlook_failures_stop_before_google_and_write_no_quote` | PASS (LOCAL) |
 | Google failure after Outlook read writes no quote | `google_failures_follow_outlook_and_write_no_quote` | PASS (LOCAL) |
-| Store failure after both reads is surfaced without false availability | `store_failure_after_both_reads_returns_closed_store_error` | PASS (LOCAL) |
+| Store failure after both reads is surfaced and leaves zero quote rows | `store_failure_after_both_reads_returns_closed_store_error` | PASS (LOCAL) |
 | Empty availability does not create an empty quote | `no_available_slots_does_not_write_an_empty_quote` | PASS (LOCAL) |
 | Horizon/quote time overflow fails closed before provider access | `horizon_and_quote_expiry_overflow_fail_before_provider_calls` | PASS (LOCAL) |
 | Sensitive quote, slot, timezone, account, and token values stay out of output | `search_and_service_errors_redact_sensitive_values_from_display_and_debug`; manual `Debug` implementations | PASS (LOCAL/STATIC) |
@@ -169,8 +178,9 @@ calls.
   behavior was exercised.
 - **Backup/retention/observability:** owned by later packages and not claimed
   here.
-- **Rollback:** revert `1512f9e` and `bb10f2d` together if the service facade
-  must be withdrawn; no provider-side data is created by these commits.
+- **Rollback:** revert the complete Task 6c1 PR, including `bb10f2d`,
+  `1512f9e`, `687567e`, and `3a9180c`, if the service facade must be withdrawn;
+  no provider-side data is created by these commits.
 
 ## PR linkage and completion evidence
 
@@ -180,8 +190,8 @@ The implementation PR must contain the exact closing footer:
 Closes #178
 ```
 
-It must also reference feature #138 and identify commits `bb10f2d` and
-`1512f9e`. Issue #178 should remain open until that linked PR is reviewed,
+It must also reference feature #138 and identify commits `bb10f2d`, `1512f9e`,
+`687567e`, and `3a9180c`. Issue #178 should remain open until that linked PR is reviewed,
 all findings are resolved, CI is green, and the PR is merged.
 
 **Package status:** `status:review` / locally verified; CI and LIVE remain
@@ -190,7 +200,7 @@ explicitly unverified.
 ## Completion evidence record
 
 - **Implementer:** Task 6c1 implementation lane
-- **Commits:** `bb10f2d`, `1512f9e`
+- **Commits:** `bb10f2d`, `1512f9e`, `687567e`, `3a9180c`
 - **PR:** to be opened with `Closes #178`
 - **Commands/results:** listed in the LOCAL evidence table
 - **Reviewer:** pending independent review
