@@ -30,6 +30,7 @@ That makes the Docker and Compose workflow environment-first while still allowin
 - `OPENAI_LLM_MODEL`
 - `OPENAI_LLM_INSTRUCTIONS`
 - `OPENAI_VOICE_API_URL`
+- `OPENAI_VOICE_TRANSPORT`
 - `OPENAI_VOICE_MODEL`
 - `OPENAI_VOICE_NAME`
 - `OPENAI_VOICE_INSTRUCTIONS`
@@ -76,6 +77,7 @@ That makes the Docker and Compose workflow environment-first while still allowin
 
 - `VOICE_PROVIDER`
 - `OPENAI_VOICE_API_URL`
+- `OPENAI_VOICE_TRANSPORT`
 - `OPENAI_VOICE_MODEL`
 - `OPENAI_VOICE_NAME`
 - `OPENAI_VOICE_INSTRUCTIONS`
@@ -130,7 +132,7 @@ The default runtime is the split pipeline:
 - configured LLM backend generates the reply text
 - configured TTS backend generates assistant audio
 
-Set `VOICE_PROVIDER=openai` to switch assistant reply generation to an OpenAI audio chat-completions model such as `gpt-audio-1.5`.
+Set `VOICE_PROVIDER=openai` to switch assistant reply generation to an OpenAI voice model. Set `OPENAI_VOICE_TRANSPORT` to `chat_completions` (the default, with `gpt-audio-1.5`) or `realtime` (with `gpt-realtime-2.1` or `gpt-realtime-2.1-mini`).
 
 In voice-model mode:
 
