@@ -7832,16 +7832,19 @@ CREATE TABLE IF NOT EXISTS http_idempotency_records (
       typeof(id) = 'integer'
       AND typeof(scope) = 'text'
       AND length(CAST(scope AS BLOB)) BETWEEN 1 AND 64
+      AND instr(CAST(scope AS BLOB), x'00') = 0
       AND scope NOT GLOB '*[^A-Za-z0-9._:-]*'
     ),
     CHECK (
       typeof(idempotency_key) = 'text'
       AND length(CAST(idempotency_key AS BLOB)) BETWEEN 1 AND 128
+      AND instr(CAST(idempotency_key AS BLOB), x'00') = 0
       AND idempotency_key NOT GLOB '*[^A-Za-z0-9._~-]*'
     ),
     CHECK (
       typeof(fingerprint) = 'text'
       AND length(CAST(fingerprint AS BLOB)) = 64
+      AND instr(CAST(fingerprint AS BLOB), x'00') = 0
       AND fingerprint NOT GLOB '*[^0-9a-f]*'
     ),
     CHECK (typeof(state) = 'text'),
@@ -9420,6 +9423,44 @@ END;
             )
             .is_err()
         );
+        let nul_fingerprint = format!("{}\0!", "a".repeat(62));
+        assert_eq!(nul_fingerprint.len(), 64);
+        for (label, scope, key, fingerprint) in [
+            (
+                "embedded NUL in scope",
+                Some("ok\0!"),
+                Some("nul-scope-key"),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "embedded NUL in idempotency key",
+                Some("scope"),
+                Some("ok\0!"),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "embedded NUL with invalid fingerprint suffix",
+                Some("nul-fingerprint-scope"),
+                Some("nul-fingerprint-key"),
+                Some(nul_fingerprint.as_str()),
+            ),
+        ] {
+            assert!(
+                insert(
+                    scope,
+                    key,
+                    fingerprint,
+                    "in_progress",
+                    1,
+                    Some("1700000000"),
+                    None,
+                    None,
+                    None,
+                )
+                .is_err(),
+                "{label} was accepted"
+            );
+        }
         assert!(
             insert(
                 Some("scope"),
