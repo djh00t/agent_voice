@@ -1508,6 +1508,9 @@ fn validate_oauth_redirect_url(provider: OAuthProvider, url: &reqwest::Url) -> R
 }
 
 fn validate_oauth_url_shape(path: &str, url: &reqwest::Url) -> Result<()> {
+    if url.fragment().is_some() {
+        bail!("{} must not include a fragment", path);
+    }
     if url.host().is_none() {
         bail!("{} must be an absolute URL with a host", path);
     }
@@ -2705,6 +2708,18 @@ microsoft:
 
         assert!(error.contains("agent_api.oauth.google.scopes"));
         assert!(error.contains("whitespace"));
+    }
+
+    #[test]
+    fn oauth_redirect_uris_reject_fragments() {
+        let mut config = PaOAuthConfig::default();
+        config.microsoft.redirect_uri =
+            reqwest::Url::parse("https://oauth.example.test/callback#fragment").unwrap();
+
+        let error = config.normalize_and_validate().unwrap_err().to_string();
+
+        assert!(error.contains("agent_api.oauth.microsoft.redirect_uri"));
+        assert!(error.contains("fragment"));
     }
 
     #[test]
