@@ -9382,6 +9382,23 @@ END;
                     )
                     .expect("insert idempotency row");
             }
+            let idempotency_row: (String, String, String) = store
+                .connection()
+                .query_row(
+                    "SELECT scope, idempotency_key, fingerprint
+                     FROM http_idempotency_records",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("preserved idempotency row");
+            assert_eq!(
+                idempotency_row,
+                (
+                    "scope".to_owned(),
+                    "key".to_owned(),
+                    "fingerprint".to_owned()
+                )
+            );
             snapshots.push(snapshot(&store));
         }
 
