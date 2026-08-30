@@ -4,6 +4,7 @@ pub mod auth;
 pub mod availability;
 pub mod crypto;
 pub mod domain;
+pub mod http;
 pub mod providers;
 pub mod service;
 pub mod store;
