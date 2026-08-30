@@ -203,9 +203,23 @@ impl FakeCalendarRead {
             return Err(ProviderError::Conflict);
         }
 
-        let sequence = state.next_google_event_sequence;
+        let mut sequence = state.next_google_event_sequence;
+        let provider_event_id = loop {
+            let candidate = format!("{GOOGLE_PROPOSAL_EVENT_PREFIX}{sequence}");
+            let already_used = state
+                .changes
+                .iter()
+                .any(|change| change.provider_event_id() == candidate.as_str())
+                || state
+                    .google_proposal_events
+                    .iter()
+                    .any(|event| event.provider_event_id() == candidate.as_str());
+            if !already_used {
+                break candidate;
+            }
+            sequence = sequence.checked_add(1).ok_or(ProviderError::Unavailable)?;
+        };
         let next_sequence = sequence.checked_add(1).ok_or(ProviderError::Unavailable)?;
-        let provider_event_id = format!("{GOOGLE_PROPOSAL_EVENT_PREFIX}{sequence}");
         let event = CalendarEvent::new(
             provider_event_id,
             draft.operation_key(),
@@ -1860,6 +1874,63 @@ mod tests {
             .expect("sync");
         assert_eq!(page.items().len(), 1);
         assert_eq!(page.items()[0].event(), Some(&event));
+    }
+
+    #[tokio::test]
+    async fn google_create_skips_seeded_event_ids_and_deletes_only_created_identity() {
+        let control = FakeControl::new(now());
+        let fake = FakeGoogleCalendar::new(
+            control,
+            Vec::<BusyInterval>::new(),
+            [event_change("fake-google-proposal-event-1", "seeded")],
+        );
+        let draft = google_proposal_draft("google-seeded-id", "Discuss");
+
+        let created = fake.create_proposal(&draft).expect("proposal");
+        assert_eq!(created.provider_event_id(), "fake-google-proposal-event-2");
+
+        let request = CalendarSyncRequest::new(
+            range("2026-08-29T00:00:00Z", "2026-08-30T00:00:00Z"),
+            None,
+            10,
+        )
+        .expect("sync request");
+        let before_delete = fake
+            .sync_calendar(&session(), &request)
+            .await
+            .expect("sync before delete");
+        assert_eq!(
+            before_delete
+                .items()
+                .iter()
+                .map(CalendarChange::provider_event_id)
+                .collect::<Vec<_>>(),
+            vec![
+                "fake-google-proposal-event-1",
+                "fake-google-proposal-event-2"
+            ]
+        );
+
+        let created_id = provider_event_id(&created);
+        fake.delete_proposal(&created_id).expect("delete proposal");
+        let after_delete = fake
+            .sync_calendar(&session(), &request)
+            .await
+            .expect("sync after delete");
+        assert_eq!(after_delete.items().len(), 3);
+        assert_eq!(
+            after_delete.items()[0].provider_event_id(),
+            "fake-google-proposal-event-1"
+        );
+        assert_eq!(
+            after_delete.items()[1].provider_event_id(),
+            "fake-google-proposal-event-2"
+        );
+        assert_eq!(
+            after_delete.items()[2].provider_event_id(),
+            "fake-google-proposal-event-2"
+        );
+        assert!(after_delete.items()[2].event().is_none());
     }
 
     #[test]
