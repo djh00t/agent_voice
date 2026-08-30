@@ -7,7 +7,7 @@
 - **Worktree:** `/private/tmp/agent-voice-pa-06c3-submit-orchestration`
 - **Branch:** `codex/agent-voice-pa-06c3-submit-orchestration`
 - **Base:** `b42498e4e370c1ef4d1e03c98b7361c190ad82fb` (`origin/main`)
-- **Implementation commits:** `03f4880`, `5b1485a`
+- **Implementation commits:** `03f4880`, `5b1485a`, `ee27ebe`
 
 ## Scope
 
@@ -25,10 +25,11 @@ the capability. `SubmittedRequest` exposes only durable local IDs and
 `ProposalState::Pending`; it does not expose a provider event ID or claim that
 the request is booked or accepted.
 
-Submission timestamps are canonicalized to UTC whole seconds before quote
-consumption, matching the audit store precision. This prevents a valid
-subsecond submission from consuming the quote and writing notifications before
-the audit tail rejects its timestamp.
+Submission validation retains full-precision UTC for the quote's half-open
+`issued_at`/`expires_at` interval. Only after that decision, a separate durable
+timestamp is canonicalized to UTC whole seconds for quote consumption and the
+notification/audit tail, matching the audit store precision without creating a
+partial submission.
 
 The ambiguous-create recovery path is deliberately left for #211. A provider
 failure after a successful remote create leaves the consumed proposal
@@ -63,6 +64,16 @@ rtk cargo test pa::service::tests::nonzero_nanosecond_submission_retries_without
 It failed with `nonzero nanoseconds must be canonicalized: Store` after the
 submission path reached the audit tail.
 
+The fractional issuance boundary was also RED before retaining the full
+precision validation instant:
+
+```text
+rtk cargo test pa::service::tests::fractional_issued_at_is_valid_at_exact_issue --lib
+```
+
+It failed with `exact fractional issue must be valid: Store` because flooring
+the instant made it appear earlier than the fractional `issued_at`.
+
 ## Acceptance evidence (LOCAL)
 
 | Contract | Evidence |
@@ -75,16 +86,18 @@ submission path reached the audit tail.
 | Provider response validation | `mismatched_provider_event_is_rejected_before_mapping`; wrong title/owner is rejected before mapping or tail writes. |
 | Local tail retry | `exact_retry_repairs_a_missing_audit_without_provider_calls`; the audit tail failure leaves the valid prefix and retry repairs it without another provider create. |
 | Subsecond submission retry | `nonzero_nanosecond_submission_retries_without_partial_state`; a nonzero-nanosecond submission succeeds with a whole-second consumed timestamp, and an exact retry returns the same result without provider calls or duplicate rows. |
+| Fractional quote boundaries | `fractional_issued_at_is_valid_at_exact_issue` and `fractional_expires_at_remains_exclusive`; full-precision validation accepts exact issuance and rejects exact fractional expiry. |
 
 Commands and results:
 
 | Check | Result |
 | --- | --- |
-| `rtk cargo test --lib pa::service::tests` | PASS — 34 passed, 446 filtered out |
+| `rtk cargo test pa::service::tests::fractional --lib` | PASS — 2 passed, 480 filtered out |
+| `rtk cargo test --lib pa::service::tests` | PASS — 36 passed, 446 filtered out |
 | `rtk cargo clippy --all-targets --all-features -- -D warnings` | PASS — no issues found |
 | `rtk rustfmt --edition 2024 --check src/pa/service.rs` | PASS |
 | `rtk git diff --check` | PASS |
-| `rtk make check` | PASS — Rust tests, clippy, docs, and Docusaurus build completed; full suite ran 480 tests |
+| `rtk make check` | PASS — Rust tests, clippy, docs, and Docusaurus build completed; full suite ran 482 tests |
 
 The first `rtk make check` attempt stopped at `docs-build` because the clean
 worktree had no installed Docusaurus binary (`docusaurus: command not found`).
@@ -100,8 +113,9 @@ dependency change was made.
   timezone, requester inclusion, idempotency key, and recap.
 - Prepared quotes are checked for issuance/expiry before lookup or calendar
   reads; consumed quotes support exact retry after expiry.
-- Submission `now` is normalized to UTC whole seconds before the durable quote
-  consumption write, so audit timestamps cannot fail after local side effects.
+- Submission quote validity compares a full-precision UTC `validation_now`;
+  only the post-validation durable timestamp is normalized to whole seconds,
+  preserving both fractional boundaries and audit precision.
 - Provider events are checked for operation key, deterministic pending title,
   exact UTC range/timezone, exactly one owner attendee, and `NeedsAction` RSVP.
 - Mapping, notification, and audit keys are deterministic and use the store's
@@ -120,14 +134,15 @@ dependency change was made.
 - Separate focused tests for injected mapping and notification write failures
   remain useful follow-up coverage; the implementation uses the same
   idempotent local-tail mechanism for those rows.
-- Rollback is a code revert of `03f4880` and `5b1485a`; no remote deletion is
-  inferred or attempted.
+- Rollback is a code revert of `03f4880`, `5b1485a`, and `ee27ebe`; no remote
+  deletion is inferred or attempted.
 
 ## Completion evidence
 
 - **Implementer:** Codex delegated #210 lane
 - **Commits:** `03f4880` (`feat(service): orchestrate confirmed request submission`),
-  `5b1485a` (`fix(service): canonicalize submission audit time`)
+  `5b1485a` (`fix(service): canonicalize submission audit time`), `ee27ebe`
+  (`fix(service): preserve fractional quote boundaries`)
 - **Report commit:** added separately after implementation commit
 - **PR/push:** not created or pushed, per task instruction
 - **Reviewer:** not performed in this lane
