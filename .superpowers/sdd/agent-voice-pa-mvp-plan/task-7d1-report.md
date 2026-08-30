@@ -115,6 +115,23 @@ decimal Unix-second lease text and explicit UTC timestamp component ranges.
 All seven exact v14 selectors and the implementer full gate passed with 517
 tests and three compile-fail doctests.
 
+## Round-8 INTEGER lease-schema remediation
+
+Issue #256 requires `lease_until` to be a nonnegative SQLite INTEGER
+(`0..=i64::MAX`) so its index orders numerically. Before the source correction,
+the exact creation selector exited `101`: `PRAGMA table_info` reported
+`lease_until` as `TEXT` while the regression expected `INTEGER`. This was a
+true assertion failure, not a zero-test filter. Source-only commit
+`7ac5cef77b35a8c552e50d0bb1d97b81b2015186` changes the v14 column/checks and
+updates fixtures. The creation test inserts `9`, `10`, and `1700000000`, proves
+numeric order `[9, 10, 1700000000]`, and verifies the query plan uses
+`idx_http_idempotency_records_lease_until`.
+
+The four required exact selectors each exited `0` with `1 passed; 516
+filtered out`. Scoped rustfmt and `rtk git diff --check` each exited `0`. A
+fresh `rtk make check` exited `0`, running all 517 tests plus lint, rustdoc,
+and documentation checks.
+
 ## Evidence records
 
 | evidence_id | order | command | expected_exit | observed_exit | selector_or_diagnostic | evidence_tier | status | artifact_ref | non_claim | reviewer |
@@ -135,6 +152,9 @@ tests and three compile-fail doctests.
 | EV-13F-13 | 13 | v14 migration metadata and timestamp exact selectors | nonzero then 0 | 101 then 0 | canonical RFC3339 UTC defaults and malformed timestamp rejection | LOCAL | CONFIRMED | `7ad0976e9868a5b2e8da5ed790d2d37e07d4b690` | does not prove runtime reservation behavior | Codex PR review |
 | EV-13F-14 | 14 | v14 invalid-row exact selector | nonzero then 0 | 101 then 0 | embedded-NUL suffix bypasses rejected for all durable identities | LOCAL | CONFIRMED | `c64dd7f2c3f77c18155b428fd66670965776eb06` | does not prove runtime decoding | Codex PR review |
 | EV-13F-15 | 15 | v14 lease and timestamp exact selectors | nonzero then 0 | 101 then 0 | canonical decimal leases and RFC3339 component bounds enforced | LOCAL | CONFIRMED | `50f88723c06886b35610cc865d56249dda619191` | does not prove runtime reservation behavior | Codex PR review |
+| EV-13F-16 | 16 | v14 creation selector with numeric lease-order/query-plan proof | nonzero then 0 | 101 then 0 | INTEGER lease metadata; values 9, 10, 1700000000 order numerically; named lease index used | LOCAL | CONFIRMED | `7ac5cef77b35a8c552e50d0bb1d97b81b2015186` | does not prove downstream decoding or reservation behavior | NONE |
+| EV-13F-17 | 17 | four required v14 exact selectors | 0 | 0 | migration, idempotence, invalid-row constraints, and reopen preservation; each 1 passed, 516 filtered | LOCAL | CONFIRMED | `7ac5cef77b35a8c552e50d0bb1d97b81b2015186` | does not prove CI or live behavior | NONE |
+| EV-13F-18 | 18 | `rtk make check` | 0 | 0 | fresh 517-test suite, lint, rustdoc, and documentation checks | LOCAL | CONFIRMED | `7ac5cef77b35a8c552e50d0bb1d97b81b2015186` | does not prove CI, live, provider, OAuth, cluster, or UAT behavior | NONE |
 
 ## Round-1 findings and resolutions
 
@@ -160,7 +180,9 @@ tests and three compile-fail doctests.
   scope/key/fingerprint fields, state/generation/lease fields, the unique
   `(scope, idempotency_key)` invariant, explicit in-progress/completed response
   nullability/status/content-type checks, and
-  `idx_http_idempotency_records_lease_until`.
+  `idx_http_idempotency_records_lease_until`. `lease_until` is a nonnegative
+  SQLite INTEGER; numeric ordering and named-index use are proven by the
+  round-8 selector.
 - Migration execution remains transactional through the existing migration runner; `schema_migrations` records version 14 once.
 - Source diff is limited to v14 registration/body, four v14 schema tests with
   strengthened structural/partial/reopen assertions, and the two existing
@@ -197,6 +219,7 @@ Controller review must verify the exact base/stack, one-file source commit, migr
 - Round-5 source remediation: `7ad0976e9868a5b2e8da5ed790d2d37e07d4b690`.
 - Round-6 source remediation: `c64dd7f2c3f77c18155b428fd66670965776eb06`.
 - Round-7 source remediation: `50f88723c06886b35610cc865d56249dda619191`.
+- Round-8 source remediation: `7ac5cef77b35a8c552e50d0bb1d97b81b2015186`.
 - Prior report commits: `0f711bf03eecf009980de96e8b4990fb5de9389a`, `ddc35eab9aff4955d11b8ac1d54d5557c4bbaa8f`.
 - Report commit state: containing commit; resolve with `rtk git log -1 --format=%H -- .superpowers/sdd/agent-voice-pa-mvp-plan/task-7d1-report.md` after this report is committed.
 - Reviewer: pending controller review.
