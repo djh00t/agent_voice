@@ -304,11 +304,8 @@ mod tests {
         lower_hex(&bytes)
     }
 
-    fn test_non_utf8_header() -> [u8; 1] {
-        let mut bytes = [0_u8; 1];
-        SystemRandom::new()
-            .fill(&mut bytes)
-            .expect("system random source is available for tests");
+    fn test_non_utf8_header() -> Vec<u8> {
+        let mut bytes = test_nonce().into_bytes();
         bytes[0] |= 0x80;
         bytes
     }
@@ -476,7 +473,8 @@ mod tests {
             sign_request(SECRET, METHOD, PATH_AND_QUERY, NOW, &valid_nonce, BODY).unwrap();
         let mut replay_guard = InMemoryReplayGuard::default();
         let mut short_nonce = valid_nonce.clone();
-        short_nonce.truncate(15);
+        let short_length = usize::from(test_nonce().as_bytes()[0] & 0x0f);
+        short_nonce.truncate(short_length);
         let mut invalid_character_nonce = valid_nonce;
         invalid_character_nonce.replace_range(0..1, "!");
         let mut too_long_nonce = test_nonce();
