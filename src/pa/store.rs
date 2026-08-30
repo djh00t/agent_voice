@@ -7814,8 +7814,20 @@ CREATE TABLE IF NOT EXISTS http_idempotency_records (
     response_status INTEGER,
     response_content_type TEXT,
     response_body BLOB,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) CHECK (
+        typeof(created_at) = 'text'
+        AND length(CAST(created_at AS BLOB)) = 20
+        AND instr(CAST(created_at AS BLOB), x'00') = 0
+        AND created_at GLOB '????-??-??T??:??:??Z'
+        AND created_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at)
+    ),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) CHECK (
+        typeof(updated_at) = 'text'
+        AND length(CAST(updated_at AS BLOB)) = 20
+        AND instr(CAST(updated_at AS BLOB), x'00') = 0
+        AND updated_at GLOB '????-??-??T??:??:??Z'
+        AND updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', updated_at)
+    ),
     CHECK (
       typeof(id) = 'integer'
       AND typeof(scope) = 'text'
@@ -8899,14 +8911,14 @@ END;
                     "created_at".to_owned(),
                     "TEXT".to_owned(),
                     1,
-                    Some("CURRENT_TIMESTAMP".to_owned()),
+                    Some("strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_owned()),
                     0
                 ),
                 (
                     "updated_at".to_owned(),
                     "TEXT".to_owned(),
                     1,
-                    Some("CURRENT_TIMESTAMP".to_owned()),
+                    Some("strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_owned()),
                     0
                 ),
             ]
@@ -8945,6 +8957,45 @@ END;
             "http_idempotency_records",
             &["lease_until"],
         );
+
+        store
+            .connection()
+            .execute(
+                "INSERT INTO http_idempotency_records (
+                     scope, idempotency_key, fingerprint, state, lease_generation,
+                     lease_until
+                 ) VALUES (?1, ?2, ?3, 'in_progress', 1, ?4)",
+                rusqlite::params![
+                    "scope",
+                    "default-timestamps",
+                    VALID_HTTP_FINGERPRINT,
+                    "1700000000"
+                ],
+            )
+            .expect("insert row using timestamp defaults");
+        let defaults: (String, String) = store
+            .connection()
+            .query_row(
+                "SELECT created_at, updated_at
+                 FROM http_idempotency_records
+                 WHERE idempotency_key = 'default-timestamps'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read timestamp defaults");
+        for value in [defaults.0, defaults.1] {
+            assert_eq!(value.len(), 20, "canonical timestamps use whole seconds");
+            assert!(value.ends_with('Z'), "canonical timestamps are UTC");
+            let parsed =
+                OffsetDateTime::parse(&value, &Rfc3339).expect("default timestamp is RFC3339");
+            assert_eq!(parsed.offset(), UtcOffset::UTC);
+            assert_eq!(parsed.nanosecond(), 0);
+            assert_eq!(
+                parsed.format(&Rfc3339).expect("format timestamp"),
+                value,
+                "default timestamp is strict canonical RFC3339"
+            );
+        }
     }
 
     #[test]
@@ -9485,6 +9536,54 @@ END;
             values[index] = value;
             assert!(insert(values).is_err(), "{label} accepted the wrong type");
         }
+    }
+
+    #[test]
+    fn http_idempotency_v14_constraints_reject_noncanonical_timestamps() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let insert = |key: &str, created_at: &str, updated_at: &str| {
+            store.connection().execute(
+                "INSERT INTO http_idempotency_records (
+                     scope, idempotency_key, fingerprint, state, lease_generation,
+                     lease_until, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'in_progress', 1, ?4, ?5, ?6)",
+                rusqlite::params![
+                    "scope",
+                    key,
+                    VALID_HTTP_FINGERPRINT,
+                    "1700000000",
+                    created_at,
+                    updated_at,
+                ],
+            )
+        };
+        let canonical = "2025-01-01T00:00:00Z";
+        for (index, (label, created_at, updated_at)) in [
+            ("legacy created_at", "2025-01-01 00:00:00", canonical),
+            (
+                "fractional created_at",
+                "2025-01-01T00:00:00.000Z",
+                canonical,
+            ),
+            ("legacy updated_at", canonical, "2025-01-01 00:00:00"),
+            ("offset updated_at", canonical, "2025-01-01T00:00:00+00:00"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = format!("timestamp-{index}");
+            assert!(
+                insert(&key, created_at, updated_at).is_err(),
+                "{label} was accepted"
+            );
+        }
+        let row_count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM http_idempotency_records", [], |row| {
+                row.get(0)
+            })
+            .expect("row count");
+        assert_eq!(row_count, 0);
     }
 
     #[test]
