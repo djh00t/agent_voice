@@ -7816,9 +7816,33 @@ CREATE TABLE IF NOT EXISTS http_idempotency_records (
     response_body BLOB,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CHECK (length(trim(scope)) > 0),
-    CHECK (length(trim(idempotency_key)) > 0),
-    CHECK (length(trim(fingerprint)) > 0),
+    CHECK (
+      typeof(id) = 'integer'
+      AND typeof(scope) = 'text'
+      AND length(CAST(scope AS BLOB)) BETWEEN 1 AND 64
+      AND scope NOT GLOB '*[^A-Za-z0-9._:-]*'
+    ),
+    CHECK (
+      typeof(idempotency_key) = 'text'
+      AND length(CAST(idempotency_key AS BLOB)) BETWEEN 1 AND 128
+      AND idempotency_key NOT GLOB '*[^A-Za-z0-9._~-]*'
+    ),
+    CHECK (
+      typeof(fingerprint) = 'text'
+      AND length(CAST(fingerprint AS BLOB)) = 64
+      AND fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    CHECK (typeof(state) = 'text'),
+    CHECK (typeof(lease_generation) = 'integer'),
+    CHECK (typeof(lease_until) = 'text'),
+    CHECK (typeof(created_at) = 'text'),
+    CHECK (typeof(updated_at) = 'text'),
+    CHECK (
+      response_status IS NULL
+      OR (typeof(response_status) = 'integer' AND response_status BETWEEN 200 AND 599)
+    ),
+    CHECK (response_content_type IS NULL OR typeof(response_content_type) = 'text'),
+    CHECK (response_body IS NULL OR typeof(response_body) = 'blob'),
     UNIQUE (scope, idempotency_key),
     CHECK (
       (state = 'in_progress'
@@ -7920,6 +7944,8 @@ mod tests {
     };
 
     const DATABASE_KEY: &[u8] = b"task-4a-test-key";
+    const VALID_HTTP_FINGERPRINT: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct TempDatabase {
@@ -8989,7 +9015,7 @@ END;
         insert(
             Some("scope"),
             Some("in-progress"),
-            Some("fingerprint"),
+            Some(VALID_HTTP_FINGERPRINT),
             "in_progress",
             1,
             Some("1700000000"),
@@ -9001,7 +9027,7 @@ END;
         insert(
             Some("scope"),
             Some("completed"),
-            Some("fingerprint"),
+            Some(VALID_HTTP_FINGERPRINT),
             "completed",
             1,
             Some("1700000000"),
@@ -9174,6 +9200,60 @@ END;
                 Some("whitespace-fingerprint-key"),
                 Some("   "),
             ),
+            (
+                "tab-only scope",
+                Some("\t"),
+                Some("tab-scope-key"),
+                Some("fingerprint"),
+            ),
+            (
+                "newline-only scope",
+                Some("\n"),
+                Some("newline-scope-key"),
+                Some("fingerprint"),
+            ),
+            (
+                "non-breaking-space-only scope",
+                Some("\u{00a0}"),
+                Some("nbsp-scope-key"),
+                Some("fingerprint"),
+            ),
+            (
+                "tab-only idempotency key",
+                Some("scope"),
+                Some("\t"),
+                Some("fingerprint"),
+            ),
+            (
+                "newline-only idempotency key",
+                Some("scope"),
+                Some("\n"),
+                Some("fingerprint"),
+            ),
+            (
+                "non-breaking-space-only idempotency key",
+                Some("scope"),
+                Some("\u{00a0}"),
+                Some("fingerprint"),
+            ),
+            (
+                "tab-only fingerprint",
+                Some("tab-fingerprint-scope"),
+                Some("tab-fingerprint-key"),
+                Some("\t"),
+            ),
+            (
+                "newline-only fingerprint",
+                Some("newline-fingerprint-scope"),
+                Some("newline-fingerprint-key"),
+                Some("\n"),
+            ),
+            (
+                "non-breaking-space-only fingerprint",
+                Some("nbsp-fingerprint-scope"),
+                Some("nbsp-fingerprint-key"),
+                Some("\u{00a0}"),
+            ),
         ] {
             assert!(
                 insert(
@@ -9314,6 +9394,100 @@ END;
     }
 
     #[test]
+    fn http_idempotency_v14_constraints_reject_wrong_storage_classes() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let insert = |values: [Value; 11]| {
+            store.connection().execute(
+                "INSERT INTO http_idempotency_records (
+                     scope, idempotency_key, fingerprint, state, lease_generation,
+                     lease_until, response_status, response_content_type, response_body,
+                     created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    values[0].clone(),
+                    values[1].clone(),
+                    values[2].clone(),
+                    values[3].clone(),
+                    values[4].clone(),
+                    values[5].clone(),
+                    values[6].clone(),
+                    values[7].clone(),
+                    values[8].clone(),
+                    values[9].clone(),
+                    values[10].clone(),
+                ],
+            )
+        };
+        let in_progress = || {
+            [
+                Value::Text("scope".to_owned()),
+                Value::Text("key".to_owned()),
+                Value::Text(VALID_HTTP_FINGERPRINT.to_owned()),
+                Value::Text("in_progress".to_owned()),
+                Value::Integer(1),
+                Value::Text("1700000000".to_owned()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Text("2025-01-01T00:00:00Z".to_owned()),
+                Value::Text("2025-01-01T00:00:00Z".to_owned()),
+            ]
+        };
+        let completed = || {
+            [
+                Value::Text("scope".to_owned()),
+                Value::Text("key".to_owned()),
+                Value::Text(VALID_HTTP_FINGERPRINT.to_owned()),
+                Value::Text("completed".to_owned()),
+                Value::Integer(1),
+                Value::Text("1700000000".to_owned()),
+                Value::Integer(200),
+                Value::Text("application/json".to_owned()),
+                Value::Blob(b"{}".to_vec()),
+                Value::Text("2025-01-01T00:00:00Z".to_owned()),
+                Value::Text("2025-01-01T00:00:00Z".to_owned()),
+            ]
+        };
+
+        for (label, index, value) in [
+            ("scope", 0, Value::Blob(b"scope".to_vec())),
+            ("idempotency key", 1, Value::Blob(b"key".to_vec())),
+            ("fingerprint", 2, Value::Blob(b"fingerprint".to_vec())),
+            ("state", 3, Value::Blob(b"in_progress".to_vec())),
+            ("lease generation", 4, Value::Text("abc".to_owned())),
+            ("lease until", 5, Value::Blob(b"1700000000".to_vec())),
+            (
+                "created at",
+                9,
+                Value::Blob(b"2025-01-01T00:00:00Z".to_vec()),
+            ),
+            (
+                "updated at",
+                10,
+                Value::Blob(b"2025-01-01T00:00:00Z".to_vec()),
+            ),
+        ] {
+            let mut values = in_progress();
+            values[index] = value;
+            assert!(insert(values).is_err(), "{label} accepted the wrong type");
+        }
+
+        for (label, index, value) in [
+            ("response status", 6, Value::Real(200.5)),
+            (
+                "response content type",
+                7,
+                Value::Blob(b"application/json".to_vec()),
+            ),
+            ("response body", 8, Value::Text("{}".to_owned())),
+        ] {
+            let mut values = completed();
+            values[index] = value;
+            assert!(insert(values).is_err(), "{label} accepted the wrong type");
+        }
+    }
+
+    #[test]
     fn http_idempotency_v14_reopen_preserves_rows() {
         let database = TempDatabase::new();
         let v13_migrations = &MIGRATIONS[..MIGRATIONS
@@ -9435,7 +9609,7 @@ END;
                              scope, idempotency_key, fingerprint, state, lease_generation,
                              lease_until
                          ) VALUES (?1, ?2, ?3, 'in_progress', 1, ?4)",
-                        rusqlite::params!["scope", "key", "fingerprint", "1700000000"],
+                        rusqlite::params!["scope", "key", VALID_HTTP_FINGERPRINT, "1700000000"],
                     )
                     .expect("insert idempotency row");
             }
@@ -9453,7 +9627,7 @@ END;
                 (
                     "scope".to_owned(),
                     "key".to_owned(),
-                    "fingerprint".to_owned()
+                    VALID_HTTP_FINGERPRINT.to_owned()
                 )
             );
             snapshots.push(snapshot(&store));
