@@ -36,7 +36,7 @@ pub enum AuthError {
     TimestampOutsideAllowedSkew,
     /// The nonce was not 16-128 allowed ASCII bytes.
     InvalidNonce,
-    /// The signature was not lowercase/uppercase hexadecimal of a SHA-256 tag.
+    /// The signature was not lowercase hexadecimal of a SHA-256 tag.
     InvalidSignatureEncoding,
     /// The decoded signature did not authenticate the canonical request.
     InvalidSignature,
@@ -277,7 +277,6 @@ fn hex_digit(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
         b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
         _ => None,
     }
 }
@@ -489,6 +488,21 @@ mod tests {
             ),
             Err(AuthError::InvalidSignatureEncoding)
         );
+
+        let (_, _, signature) = signed_headers();
+        assert_eq!(
+            verify_with_headers(
+                METHOD,
+                PATH_AND_QUERY,
+                NOW.to_string().as_bytes(),
+                NONCE.as_bytes(),
+                signature.to_ascii_uppercase().as_bytes(),
+                BODY,
+                NOW,
+                &mut replay_guard,
+            ),
+            Err(AuthError::InvalidSignatureEncoding)
+        );
     }
 
     #[test]
@@ -524,6 +538,38 @@ mod tests {
             ),
             Err(AuthError::NonUtf8Header {
                 header: X_AV_TIMESTAMP
+            })
+        );
+
+        let mut replay_guard = InMemoryReplayGuard::default();
+        assert_eq!(
+            verify_with_headers(
+                METHOD,
+                PATH_AND_QUERY,
+                NOW.to_string().as_bytes(),
+                &[0xff],
+                signature.as_bytes(),
+                BODY,
+                NOW,
+                &mut replay_guard,
+            ),
+            Err(AuthError::NonUtf8Header { header: X_AV_NONCE })
+        );
+
+        let mut replay_guard = InMemoryReplayGuard::default();
+        assert_eq!(
+            verify_with_headers(
+                METHOD,
+                PATH_AND_QUERY,
+                NOW.to_string().as_bytes(),
+                nonce.as_bytes(),
+                &[0xff],
+                BODY,
+                NOW,
+                &mut replay_guard,
+            ),
+            Err(AuthError::NonUtf8Header {
+                header: X_AV_SIGNATURE
             })
         );
     }
@@ -624,5 +670,4 @@ mod tests {
         assert_eq!(X_AV_NONCE, "X-AV-Nonce");
         assert_eq!(X_AV_SIGNATURE, "X-AV-Signature");
     }
-
 }
