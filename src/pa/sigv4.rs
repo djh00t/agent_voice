@@ -85,7 +85,7 @@ pub enum SigV4ErrorKind {
     InvalidUri,
     /// The timestamp or signing date is not valid AWS format.
     InvalidTimestamp,
-    /// The signing region is empty, too long, or not printable ASCII.
+    /// The signing region is empty, too long, or not a valid AWS region token.
     InvalidRegion,
     /// The credential values are empty, too long, or malformed.
     InvalidCredential,
@@ -575,15 +575,14 @@ fn days_in_month(year: u16, month: u8) -> u8 {
 }
 
 fn validate_region(region: &str) -> Result<(), SigV4Error> {
-    if region.is_empty()
-        || region.len() > MAX_REGION_LEN
-        || !region
-            .bytes()
-            .all(|byte| byte.is_ascii() && (0x21..=0x7e).contains(&byte))
-    {
+    if region.is_empty() || region.len() > MAX_REGION_LEN || !region.bytes().all(is_region_byte) {
         return Err(SigV4Error::new(SigV4ErrorKind::InvalidRegion));
     }
     Ok(())
+}
+
+fn is_region_byte(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
 }
 
 fn validate_credentials(credentials: &Credentials) -> Result<(), SigV4Error> {
@@ -736,6 +735,41 @@ mod tests {
                 sign_request(&request(), &credentials, TIMESTAMP).is_ok(),
                 "{length}"
             );
+        }
+    }
+
+    #[test]
+    fn region_rejects_scope_delimiters_and_unsafe_bytes() {
+        for region in [
+            "us-east-1/foo",
+            "us-east-1,foo",
+            "us-east-1=foo",
+            "us-east-1 foo",
+            "US-EAST-1",
+            "us_east_1",
+            "us-éast-1",
+        ] {
+            let mut request = request();
+            request.region = region.into();
+            let error = sign_request(&request, &credentials(), TIMESTAMP).unwrap_err();
+            assert_eq!(error.kind, SigV4ErrorKind::InvalidRegion, "{region:?}");
+        }
+
+        for region in ["us-east-1", "us-gov-west-1", "cn-north-1", "eusc-de-east-1"] {
+            let mut request = request();
+            request.region = region.into();
+            assert!(
+                sign_request(&request, &credentials(), TIMESTAMP).is_ok(),
+                "{region:?}"
+            );
+        }
+    }
+
+    fn credentials() -> Credentials {
+        Credentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
+            secret_access_key: b"secret".to_vec(),
+            session_token: None,
         }
     }
 }
