@@ -13,9 +13,10 @@
 - Base revision supplied by the controller: `78f03dd2b33be2a276a5b00b80026ca0dc687a49`.
 - Earlier implementation commit: `446a66f8dea4b6adcbfeefcff8b4b9c69853491d` (`feat(pa-store): add durable HTTP idempotency schema`).
 - Round-1 source commit: `25a905225f34641699d5fa08fc3da3110ca6e2c6` (`test(pa-store): strengthen HTTP idempotency schema proof`).
+- Round-2 source follow-up commit: `25074b38e5a0e0bfe9c2505bb669badddbc740e7` (`test(pa-store): assert reopened idempotency row content`).
 - Before this round, tracked files were clean; the pre-existing untracked reviewer directory `.superpowers/sdd/issue-256/` was preserved and not touched. After the source commit, only this report was changed by this task; no excluded file changed.
 - Tool snapshot: `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `cargo 1.97.1 (c980f4866 2026-06-30)`.
-- Evidence timestamp: `2026-08-31T04:03:54+1000` command-session snapshot; final checks ran against the source content committed as `25a905225f34641699d5fa08fc3da3110ca6e2c6`.
+- Evidence timestamp: `2026-08-31T04:12:16+1000` command-session snapshot; round-2 checks ran against source commit `25074b38e5a0e0bfe9c2505bb669badddbc740e7`.
 
 ## RED provenance
 
@@ -55,6 +56,10 @@ nonzero RED remains recorded above.
 
 `rtk make check` exited `0` on the implementation revision. The run compiled the test and documentation profiles, ran the full Rust test suite (`514` tests observed), Clippy with warnings denied, rustdoc, and the locked website build. No warnings or failures remained in the command result.
 
+## Round-2 fresh verification
+
+After the round-2 source follow-up commit, all four exact selectors exited `0`, each with `1 passed; 513 filtered out`. `rtk rustfmt --edition 2024 --check src/pa/store.rs` exited `0`; unscoped `rtk git diff --check` exited `0`; and a fresh `rtk make check` exited `0`, including the observed `514`-test suite, Clippy, rustdoc, and locked website checks.
+
 ## Evidence records
 
 | evidence_id | order | command | expected_exit | observed_exit | selector_or_diagnostic | evidence_tier | status | artifact_ref | non_claim | reviewer |
@@ -63,7 +68,7 @@ nonzero RED remains recorded above.
 | EV-13F-01 | 1 | `rtk cargo test --lib pa::store::tests::http_idempotency_v14_migration_creates_schema -- --exact` | 0 | 0 | v14 table, unique key, state contract, lease index | LOCAL | CONFIRMED | `NONE` | does not prove typed values or HTTP behavior | NONE |
 | EV-13F-02 | 2 | `rtk cargo test --lib pa::store::tests::http_idempotency_v14_migration_is_idempotent -- --exact` | 0 | 0 | one v14 migration/table/index after reapply | LOCAL | CONFIRMED | `NONE` | does not prove concurrent reservation behavior | NONE |
 | EV-13F-03 | 3 | `rtk cargo test --lib pa::store::tests::http_idempotency_v14_constraints_reject_invalid_rows -- --exact` | 0 | 0 | invalid state/generation/required/duplicate/response rows rejected | LOCAL | CONFIRMED | `NONE` | does not prove downstream decoding or transitions | NONE |
-| EV-13F-04 | 4 | `rtk cargo test --lib pa::store::tests::http_idempotency_v14_reopen_preserves_rows -- --exact` | 0 | 0 | v13 data and v14 row survive reopen | LOCAL | CONFIRMED | `NONE` | does not prove deployment or recovery UAT | NONE |
+| EV-13F-04 | 4 | `rtk cargo test --lib pa::store::tests::http_idempotency_v14_reopen_preserves_rows -- --exact` | 0 | 0 | v13 data and exact (`scope`, `key`, `fingerprint`) row content survive three reopens with stable counts | LOCAL | CONFIRMED | `NONE` | does not prove deployment or recovery UAT | NONE |
 | EV-13F-05 | 5 | `rtk rustfmt --edition 2024 --check src/pa/store.rs` | 0 | 0 | owned source formatting | LOCAL | CONFIRMED | `NONE` | does not prove CI | NONE |
 | EV-13F-06 | 6 | `rtk git diff --check -- src/pa/store.rs` | 0 | 0 | owned source whitespace | STATIC | CONFIRMED | `NONE` | does not prove semantic review by another person | NONE |
 | EV-13F-07 | 7 | `rtk git diff --check` | 0 | 0 | unscoped repository whitespace | STATIC | CONFIRMED | `NONE` | does not prove excluded untracked artifacts are safe | NONE |
@@ -79,8 +84,9 @@ nonzero RED remains recorded above.
   `response_content_type`-only, and `response_body`-only in-progress inserts,
   each required to fail without changing the two valid rows.
 - Reopen/preservation proof: resolved by seeding a v13 configuration row and
-  replay nonce, then opening the file three times while asserting both rows
-  and stable table/index/configuration/replay/idempotency/migration counts.
+  replay nonce, then opening the file three times while asserting both rows,
+  the exact idempotency `(scope, key, fingerprint)` tuple, and stable
+  table/index/configuration/replay/idempotency/migration counts.
 - Unscoped diff evidence: resolved by running `rtk git diff --check` with exit
   `0`; the pre-existing untracked reviewer directory remains outside the
   owned diff and was not staged.
@@ -114,7 +120,9 @@ Controller review must verify the exact base/stack, one-file source commit, migr
 ## Completion evidence
 
 - Implementer: isolated stack owner; exact identity not recorded.
-- Source commit: `446a66f8dea4b6adcbfeefcff8b4b9c69853491d`.
-- Prior report commit: `0f711bf03eecf009980de96e8b4990fb5de9389a`; round-1 report update commit: pending separate one-file commit.
+- Source commit: `25a905225f34641699d5fa08fc3da3110ca6e2c6`.
+- Round-2 source follow-up: `25074b38e5a0e0bfe9c2505bb669badddbc740e7`.
+- Prior report commits: `0f711bf03eecf009980de96e8b4990fb5de9389a`, `ddc35eab9aff4955d11b8ac1d54d5557c4bbaa8f`.
+- Report commit state: containing commit; resolve with `rtk git log -1 --format=%H -- .superpowers/sdd/agent-voice-pa-mvp-plan/task-7d1-report.md` after this report is committed.
 - Reviewer: pending controller review.
 - CI/LIVE/provider/OAuth/cluster/UAT: `UNEXECUTED`.
