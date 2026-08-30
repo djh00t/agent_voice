@@ -1554,6 +1554,12 @@ fn normalize_scopes(provider: OAuthProvider, scopes: &mut Vec<String>) -> Result
         if scope.bytes().any(|byte| byte.is_ascii_whitespace()) {
             bail!("{} must not contain ASCII whitespace", path);
         }
+        if !is_oauth_scope_token(scope) {
+            bail!(
+                "{} must contain only RFC 6749 scope-token characters",
+                path
+            );
+        }
     }
     scopes.sort();
     scopes.dedup();
@@ -1561,6 +1567,12 @@ fn normalize_scopes(provider: OAuthProvider, scopes: &mut Vec<String>) -> Result
         bail!("{} must not contain offline_access", path);
     }
     Ok(())
+}
+
+fn is_oauth_scope_token(scope: &str) -> bool {
+    scope
+        .bytes()
+        .all(|byte| matches!(byte, b'!' | b'#'..=b'[' | b']'..=b'~'))
 }
 
 #[allow(dead_code)]
@@ -2708,6 +2720,37 @@ microsoft:
 
         assert!(error.contains("agent_api.oauth.google.scopes"));
         assert!(error.contains("whitespace"));
+    }
+
+    #[test]
+    fn oauth_scopes_accept_scope_token_boundaries_and_urls() {
+        let mut config = PaOAuthConfig::default();
+        let url_scope = "https://www.googleapis.com/auth/gmail.modify".to_string();
+        let punctuation_scope = "!#[]~".to_string();
+        config.google.scopes = vec![url_scope.clone(), punctuation_scope.clone()];
+
+        config.normalize_and_validate().unwrap();
+
+        assert!(config.google.scopes.contains(&url_scope));
+        assert!(config.google.scopes.contains(&punctuation_scope));
+    }
+
+    #[test]
+    fn oauth_scopes_reject_characters_outside_scope_token_grammar() {
+        for invalid_scope in [
+            "scope\"quote",
+            r"scope\backslash",
+            "scope\u{7f}del",
+            "scope-é",
+        ] {
+            let mut config = PaOAuthConfig::default();
+            config.google.scopes = vec![invalid_scope.to_string()];
+
+            let error = config.normalize_and_validate().unwrap_err().to_string();
+
+            assert!(error.contains("agent_api.oauth.google.scopes"));
+            assert!(error.contains("scope-token"));
+        }
     }
 
     #[test]
