@@ -22,6 +22,8 @@ pub mod config;
 pub mod llm;
 /// OpenAI API client logic and prompt orchestration.
 pub mod openai;
+/// Personal-assistant domain values and proposal contracts.
+pub mod pa;
 /// Persistent caller phone-book storage and validation helpers.
 pub mod phonebook;
 /// SIP call orchestration and runtime service state.
