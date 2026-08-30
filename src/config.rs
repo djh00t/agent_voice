@@ -1282,7 +1282,7 @@ impl OAuthProviderConfig {
         self.client_secret
             .as_ref()
             .map(Secret::as_str)
-            .map(normalize_env_value)
+            .map(str::trim)
             .filter(|value| !value.trim().is_empty() && !is_complete_placeholder(value))
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1460,7 +1460,7 @@ fn normalize_client_secret(
     let Some(secret) = client_secret else {
         return Ok(());
     };
-    let normalized = normalize_env_value(secret.as_str()).to_string();
+    let normalized = secret.as_str().trim().to_string();
     if normalized.trim().is_empty() {
         bail!(
             "{} must not be blank",
@@ -2614,6 +2614,40 @@ google:
                 "https://www.googleapis.com/auth/calendar.events".to_string(),
                 "https://www.googleapis.com/auth/gmail.modify".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn oauth_provider_secret_preserves_literal_quotes() {
+        let parsed: PaOAuthConfig = serde_yaml::from_str(
+            r#"
+microsoft:
+  client_id: application-id
+  client_secret: '"actual-secret"'
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.microsoft.client_secret.as_ref().map(Secret::as_str),
+            Some("\"actual-secret\"")
+        );
+        assert_eq!(
+            parsed
+                .microsoft
+                .require_client_secret(OAuthProvider::Microsoft)
+                .unwrap(),
+            "\"actual-secret\""
+        );
+
+        let mut normalized = parsed;
+        normalized.normalize_and_validate().unwrap();
+        assert_eq!(
+            normalized
+                .microsoft
+                .require_client_secret(OAuthProvider::Microsoft)
+                .unwrap(),
+            "\"actual-secret\""
         );
     }
 
