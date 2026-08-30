@@ -153,7 +153,7 @@ Current repository gate:
 rtk make check
 ```
 
-Result: PASS — 496 unit tests, 3 doctests, strict clippy, Rust API docs, and
+Result: PASS — 497 unit tests, 3 doctests, strict clippy, Rust API docs, and
 the Docusaurus production build. The fresh worktree first lacked the local
 Docusaurus binary; `rtk make docs-install` installed the lockfile-resolved
 website dependencies without changing tracked manifests or lockfiles.
@@ -260,7 +260,8 @@ Result: PASS — 1 passed, 496 filtered out.
   (`fix(service): reject non-UTC durable submission intervals`), `68e8e2e`
   (`test(service): cover local submission tail repair`), `499adc5`
   (`fix(service): bind mapping retries to proposal owner`), `95f216b`
-  (`fix(service): recheck submission meeting buffers`)
+  (`fix(service): recheck submission meeting buffers`), `748d613`
+  (`fix(service): recheck unmapped proposal retries`)
 - **Report commit:** added separately after reviewer remediation
 - **PR/push:** not created or pushed, per task instruction
 - **Reviewer:** not performed in this lane
