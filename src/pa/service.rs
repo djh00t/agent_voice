@@ -2872,6 +2872,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_retry_repairs_a_missing_mapping_without_duplicate_provider_create() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:mapping-retry",
+                IdempotencyKey::new("appointment:mapping-retry").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_submission_mapping
+                 BEFORE INSERT ON event_mappings
+                 BEGIN SELECT RAISE(ABORT, 'forced mapping failure'); END;",
+            )
+            .expect("install mapping failure");
+
+        let first_error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("mapping tail failure must be returned");
+        assert!(matches!(first_error, ServiceError::Store(_)));
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM event_mappings", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("mapping count"),
+            0
+        );
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_submission_mapping")
+            .expect("remove mapping failure");
+        outlook_control
+            .set_failure(FakeOperation::CalendarBusy, ProviderError::Unavailable)
+            .expect("outlook failure");
+        google_control
+            .set_failure(FakeOperation::CalendarBusy, ProviderError::Unavailable)
+            .expect("google busy failure");
+        google_control
+            .set_failure(
+                FakeOperation::CalendarProposalCreate,
+                ProviderError::Unavailable,
+            )
+            .expect("google create failure");
+
+        let retry = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now + Duration::minutes(1),
+            )
+            .await
+            .expect("retry repairs mapping");
+        assert!(retry.is_pending());
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn exact_retry_repairs_a_missing_notification_without_provider_calls() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:notification-retry",
+                IdempotencyKey::new("appointment:notification-retry").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_submission_notification
+                 BEFORE INSERT ON notification_outbox
+                 BEGIN SELECT RAISE(ABORT, 'forced notification failure'); END;",
+            )
+            .expect("install notification failure");
+
+        let first_error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("notification tail failure must be returned");
+        assert!(matches!(first_error, ServiceError::Store(_)));
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 0);
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_submission_notification")
+            .expect("remove notification failure");
+        for operation in [
+            FakeOperation::CalendarBusy,
+            FakeOperation::CalendarProposalFind,
+            FakeOperation::CalendarProposalCreate,
+        ] {
+            google_control
+                .set_failure(operation, ProviderError::Unavailable)
+                .expect("google failure");
+        }
+        outlook_control
+            .set_failure(FakeOperation::CalendarBusy, ProviderError::Unavailable)
+            .expect("outlook failure");
+
+        let retry = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now + Duration::minutes(1),
+            )
+            .await
+            .expect("retry repairs notification");
+        assert!(retry.is_pending());
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn nonzero_nanosecond_submission_retries_without_partial_state() {
         let now = now();
         let submission_now = now
