@@ -9,7 +9,8 @@
 - **Worktree:** `/private/tmp/agent-voice-pa-06e1-owner-prepare`
 - **Branch:** `codex/agent-voice-pa-06e1-owner-prepare`
 - **Base at implementation:** `a559829` (`origin/main` before the later main-line rebase)
-- **Implementation commit:** `fd5b501`
+- **Rebased onto:** `57643df` (current `origin/main`)
+- **Implementation commit:** `4ed1bc3`
 
 ## Scope
 
@@ -116,13 +117,13 @@ both service calls return the same result.
   deployment, publication, authenticated UAT, or live-provider evidence.
 - The later owner-task submission/provider package remains responsible for
   consuming this projection and performing any external calendar mutation.
-- Rollback is a code revert of `fd5b501`; no database deletion or remote
+- Rollback is a code revert of `4ed1bc3`; no database deletion or remote
   provider cleanup is inferred or attempted.
 
 ## Completion evidence
 
 - **Implementer:** delegated service lane for #212
-- **Implementation commit:** `fd5b501`
+- **Implementation commit:** `4ed1bc3`
 - **Report commit:** added separately after implementation
 - **PR/push:** not created or pushed, per task instruction
 - **Reviewer:** pending independent review
