@@ -41,11 +41,17 @@ pub enum FakeOperation {
     TriageClassify,
     /// Uploading one encrypted backup object.
     BackupPut,
+    /// Listing encrypted backup-object metadata by prefix.
+    BackupList,
+    /// Downloading one explicitly named encrypted backup object.
+    BackupGet,
+    /// Deleting one explicitly named encrypted backup object.
+    BackupDelete,
 }
 
 impl FakeOperation {
     /// Every supported operation in stable debug and state-array order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 16] = [
         Self::MailSync,
         Self::MailSend,
         Self::MailLabels,
@@ -59,6 +65,9 @@ impl FakeOperation {
         Self::CalendarDelete,
         Self::TriageClassify,
         Self::BackupPut,
+        Self::BackupList,
+        Self::BackupGet,
+        Self::BackupDelete,
     ];
 
     const fn index(self) -> usize {
@@ -76,6 +85,9 @@ impl FakeOperation {
             Self::CalendarDelete => 10,
             Self::TriageClassify => 11,
             Self::BackupPut => 12,
+            Self::BackupList => 13,
+            Self::BackupGet => 14,
+            Self::BackupDelete => 15,
         }
     }
 
@@ -431,6 +443,50 @@ mod tests {
     }
 
     #[test]
+    fn backup_lifecycle_operations_have_independent_failures_and_counts() {
+        let control = FakeControl::new(now());
+
+        control
+            .queue_failure(FakeOperation::BackupPut, ProviderError::Conflict)
+            .expect("queue put failure");
+        control
+            .queue_failure(FakeOperation::BackupList, ProviderError::Unavailable)
+            .expect("queue list failure");
+        control
+            .set_failure(FakeOperation::BackupGet, ProviderError::NotFound)
+            .expect("set get failure");
+        control
+            .queue_failure(FakeOperation::BackupDelete, ProviderError::TokenExpired)
+            .expect("queue delete failure");
+
+        assert_eq!(
+            control.begin(FakeOperation::BackupPut),
+            Err(ProviderError::Conflict)
+        );
+        assert_eq!(
+            control.begin(FakeOperation::BackupList),
+            Err(ProviderError::Unavailable)
+        );
+        assert_eq!(
+            control.begin(FakeOperation::BackupGet),
+            Err(ProviderError::NotFound)
+        );
+        assert_eq!(
+            control.begin(FakeOperation::BackupDelete),
+            Err(ProviderError::TokenExpired)
+        );
+
+        for operation in [
+            FakeOperation::BackupPut,
+            FakeOperation::BackupList,
+            FakeOperation::BackupGet,
+            FakeOperation::BackupDelete,
+        ] {
+            assert_eq!(control.invocation_count(operation), Ok(1));
+        }
+    }
+
+    #[test]
     fn partial_page_boundaries_are_non_negative_and_operation_scoped() {
         let control = FakeControl::new(now());
 
@@ -503,7 +559,7 @@ mod tests {
         assert_send_sync::<FakeOperation>();
         assert_send_sync::<FakeControl>();
 
-        assert_eq!(FakeOperation::ALL.len(), 13);
+        assert_eq!(FakeOperation::ALL.len(), 16);
         assert!(FakeOperation::ALL.contains(&FakeOperation::MailSync));
         assert!(FakeOperation::ALL.contains(&FakeOperation::MailSend));
         assert!(FakeOperation::ALL.contains(&FakeOperation::MailLabels));
@@ -517,6 +573,9 @@ mod tests {
         assert!(FakeOperation::ALL.contains(&FakeOperation::CalendarDelete));
         assert!(FakeOperation::ALL.contains(&FakeOperation::TriageClassify));
         assert!(FakeOperation::ALL.contains(&FakeOperation::BackupPut));
+        assert!(FakeOperation::ALL.contains(&FakeOperation::BackupList));
+        assert!(FakeOperation::ALL.contains(&FakeOperation::BackupGet));
+        assert!(FakeOperation::ALL.contains(&FakeOperation::BackupDelete));
     }
 
     #[test]
