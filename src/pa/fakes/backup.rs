@@ -172,7 +172,7 @@ mod tests {
         snapshot(
             "backup-sentinel-object-key",
             b"backup-sentinel-ciphertext",
-            "a3b7c87d9b77dc909f571008227641e45b11b4e2369ebcd57e87c714fd8b5fe5",
+            "2e46e41589939dd28a664c8d40d852b3800c01cdb32e87f3d7a6422f745c42e9",
             "backup-sentinel-encryption-format",
             "backup-sentinel-key-metadata",
             "backup-sentinel-encryption-metadata",
@@ -268,7 +268,7 @@ mod tests {
             snapshot(
                 "backup-sentinel-z-key",
                 b"backup-sentinel-z-ciphertext",
-                "f3b7c87d9b77dc909f571008227641e45b11b4e2369ebcd57e87c714fd8b5fe5",
+                "089d76f2759d5f8dc10b541e00875a601890d4fc89dae748261c8f1d64f2a492",
                 "backup-sentinel-encryption-format",
                 "backup-sentinel-key-metadata",
                 "backup-sentinel-encryption-metadata",
@@ -276,7 +276,7 @@ mod tests {
             snapshot(
                 "backup-sentinel-a-key",
                 b"backup-sentinel-a-ciphertext",
-                "e3b7c87d9b77dc909f571008227641e45b11b4e2369ebcd57e87c714fd8b5fe5",
+                "92762cbb819f1bceef362f2400603f484cee20321497c97f504c8838fc72e5c2",
                 "backup-sentinel-encryption-format",
                 "backup-sentinel-key-metadata",
                 "backup-sentinel-encryption-metadata",
@@ -284,7 +284,7 @@ mod tests {
             snapshot(
                 "backup-sentinel-m-key",
                 b"backup-sentinel-m-ciphertext",
-                "d3b7c87d9b77dc909f571008227641e45b11b4e2369ebcd57e87c714fd8b5fe5",
+                "a52c71b8fb5b070fd320e7397716b3b6984e0cab9884476744d9e616841ce475",
                 "backup-sentinel-encryption-format",
                 "backup-sentinel-key-metadata",
                 "backup-sentinel-encryption-metadata",
@@ -346,15 +346,15 @@ mod tests {
             snapshot(
                 first.object_key(),
                 b"backup-sentinel-changed-ct",
-                first.checksum(),
+                "982778ff9a64f092682d0984705397b9b2c8d2bfccc1f21c42f9ea3ff0321ed6",
                 first.encryption_format(),
                 first.key_metadata(),
                 first.encryption_metadata(),
             ),
             snapshot(
                 first.object_key(),
-                first.ciphertext(),
-                "b3b7c87d9b77dc909f571008227641e45b11b4e2369ebcd57e87c714fd8b5fe5",
+                b"backup-sentinel-checksum-change",
+                "8284e5182240e764e6d4d63b8aaea66bf77e68b8e2b4392d5ced51ef06c34df5",
                 first.encryption_format(),
                 first.key_metadata(),
                 first.encryption_metadata(),
@@ -362,7 +362,7 @@ mod tests {
             snapshot(
                 first.object_key(),
                 b"backup-sentinel-size-change",
-                first.checksum(),
+                "23c37cb167ad81ffd2eeff823155b6724d8891c4600c02e98d1b04eb4b00aa7a",
                 first.encryption_format(),
                 first.key_metadata(),
                 first.encryption_metadata(),
@@ -410,7 +410,7 @@ mod tests {
         let second = snapshot(
             "backup-sentinel-second-key",
             b"backup-sentinel-second-ciphertext",
-            "d3b7c87d9b77dc909f571008227641e45b11b4e2369ebcd57e87c714fd8b5fe5",
+            "e9ae061c75c5e9341b78da76ba3eba59e525609feaa04dd2ec06022fce38c66c",
             "backup-sentinel-encryption-format",
             "backup-sentinel-key-metadata",
             "backup-sentinel-encryption-metadata",
@@ -550,7 +550,7 @@ mod tests {
         for sentinel in [
             "backup-sentinel-object-key",
             "backup-sentinel-ciphertext",
-            "a3b7c87d9b77dc909f571008227641e45b11b4e2369ebcd57e87c714fd8b5fe5",
+            "2e46e41589939dd28a664c8d40d852b3800c01cdb32e87f3d7a6422f745c42e9",
             "backup-sentinel-encryption-format",
             "backup-sentinel-key-metadata",
             "backup-sentinel-encryption-metadata",
