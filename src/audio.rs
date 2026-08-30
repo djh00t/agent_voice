@@ -137,8 +137,10 @@ fn decode_streaming_wav_mono_i16(input: &[u8]) -> Result<(u32, Vec<i16>)> {
     let data = data.ok_or_else(|| anyhow::anyhow!("missing WAV data chunk"))?;
     let sample_count = data.len() / 2;
     let samples = data[..sample_count * 2]
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| i16::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
 
     let mono = match channels {
@@ -194,7 +196,9 @@ pub fn split_frames(samples: &[i16], frame_samples: usize) -> Vec<Vec<i16>> {
 
 fn stereo_to_mono(samples: &[i16]) -> Vec<i16> {
     samples
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| ((pair[0] as i32 + pair[1] as i32) / 2) as i16)
         .collect()
 }
