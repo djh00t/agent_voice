@@ -13,7 +13,7 @@ use time::{OffsetDateTime, UtcOffset};
 use super::availability::{AvailabilityError, AvailabilityPolicy};
 use super::domain::{
     AppointmentDraft, AppointmentKind, AppointmentSlot, CallerIdentity, DomainError,
-    IdempotencyKey, ProposalState, Quote, QuoteId,
+    IdempotencyKey, OwnerTaskDraft, ProposalState, Quote, QuoteId,
 };
 use super::providers::{
     CalendarAttendee, CalendarEvent, GoogleCalendarProvider, GoogleProposalDraft, MailAddress,
@@ -25,8 +25,10 @@ use super::store::{
     StoredAppointmentQuoteState, validate_message_idempotency_key, validate_message_source_id,
     validate_provider_message_id,
 };
+use crate::phonebook::normalize_caller_id;
 
 const PENDING_PROPOSAL_TITLE: &str = "Pending assistant request";
+const OWNER_VERIFICATION_VALID_FOR: time::Duration = time::Duration::seconds(60);
 
 /// The result type returned by personal-assistant services.
 pub type ServiceResult<T> = Result<T, ServiceError>;
@@ -179,6 +181,147 @@ impl ExplicitConfirmation {
 impl fmt::Debug for ExplicitConfirmation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ExplicitConfirmation(<redacted>)")
+    }
+}
+
+/// A capability minted only after the trusted boundary receives an explicit
+/// affirmative response from the owner.
+pub struct OwnerConfirmation(());
+
+impl OwnerConfirmation {
+    /// Mints the capability for an explicit affirmative response.
+    pub fn from_explicit_yes(confirmed: bool) -> ServiceResult<Self> {
+        confirmed
+            .then_some(Self(()))
+            .ok_or(ServiceError::InvalidInput {
+                field: "owner_confirmation",
+            })
+    }
+}
+
+impl fmt::Debug for OwnerConfirmation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnerConfirmation(<redacted>)")
+    }
+}
+
+/// An opaque, caller-bound owner verification capability with a short
+/// half-open validity window.
+pub struct OwnerVerified {
+    normalized_caller: String,
+    fingerprint: String,
+    verified_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+}
+
+impl OwnerVerified {
+    /// Issues a capability after normalizing and matching both owner numbers.
+    pub fn issue(
+        configured_owner_number: impl AsRef<str>,
+        caller_number: impl AsRef<str>,
+        _confirmation: OwnerConfirmation,
+        verified_at: OffsetDateTime,
+    ) -> ServiceResult<Self> {
+        let configured_owner_number =
+            normalize_owner_number(configured_owner_number.as_ref(), "configured_owner_number")?;
+        let normalized_caller = normalize_owner_number(caller_number.as_ref(), "caller_number")?;
+        if configured_owner_number != normalized_caller {
+            return Err(ServiceError::InvalidInput {
+                field: "owner_binding",
+            });
+        }
+        let verified_at = canonical_owner_time(verified_at, "verified_at")?;
+        let expires_at = verified_at
+            .checked_add(OWNER_VERIFICATION_VALID_FOR)
+            .ok_or(ServiceError::InvalidInput {
+                field: "owner_verification",
+            })?;
+        Ok(Self {
+            normalized_caller: normalized_caller.clone(),
+            fingerprint: owner_caller_fingerprint(&normalized_caller),
+            verified_at,
+            expires_at,
+        })
+    }
+
+    /// Checks the caller binding and half-open validity interval at `now`.
+    pub fn validate_at(
+        &self,
+        caller_number: impl AsRef<str>,
+        now: OffsetDateTime,
+    ) -> ServiceResult<()> {
+        let caller_number = normalize_owner_number(caller_number.as_ref(), "caller_number")?;
+        let now = canonical_owner_time(now, "now")?;
+        if caller_number != self.normalized_caller {
+            return Err(ServiceError::InvalidInput {
+                field: "owner_binding",
+            });
+        }
+        if now < self.verified_at {
+            return Err(ServiceError::InvalidInput {
+                field: "owner_verification",
+            });
+        }
+        if now >= self.expires_at {
+            return Err(ServiceError::InvalidInput {
+                field: "owner_verification",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the opaque SHA-256 fingerprint bound to the normalized caller.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+impl fmt::Debug for OwnerVerified {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnerVerified(<redacted>)")
+    }
+}
+
+/// The provider-free durable result of preparing one owner task placement.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreparedOwnerTask {
+    owner_task_draft_id: i64,
+    starts_at: OffsetDateTime,
+    ends_at: OffsetDateTime,
+    timezone: String,
+    operation_key: String,
+}
+
+impl PreparedOwnerTask {
+    /// Returns the durable owner-task draft identity.
+    pub const fn owner_task_draft_id(&self) -> i64 {
+        self.owner_task_draft_id
+    }
+
+    /// Returns the inclusive UTC placement start.
+    pub const fn starts_at(&self) -> OffsetDateTime {
+        self.starts_at
+    }
+
+    /// Returns the exclusive UTC placement end.
+    pub const fn ends_at(&self) -> OffsetDateTime {
+        self.ends_at
+    }
+
+    /// Returns the validated IANA display timezone.
+    pub fn timezone(&self) -> &str {
+        &self.timezone
+    }
+
+    /// Returns the immutable provider operation key.
+    pub fn operation_key(&self) -> &str {
+        &self.operation_key
+    }
+}
+
+impl fmt::Debug for PreparedOwnerTask {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedOwnerTask(<redacted>)")
     }
 }
 
@@ -640,6 +783,68 @@ impl<'a> PaService<'a> {
         })
     }
 
+    /// Atomically persists one verified owner task draft and its placement.
+    ///
+    /// All capability, caller, timestamp, and arithmetic checks happen before
+    /// entering the store boundary. The store then owns the immediate
+    /// transaction, exact retry, and immutable conflict behavior. No calendar
+    /// provider is consulted by this provider-free preparation step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_owner_task(
+        &self,
+        draft: OwnerTaskDraft,
+        source_id: Option<&str>,
+        starts_at: OffsetDateTime,
+        timezone: impl AsRef<str>,
+        operation_key: impl AsRef<str>,
+        verified: &OwnerVerified,
+        caller_number: impl AsRef<str>,
+        now: OffsetDateTime,
+    ) -> ServiceResult<PreparedOwnerTask> {
+        verified.validate_at(caller_number.as_ref(), now)?;
+        let starts_at = canonical_owner_time(starts_at, "starts_at")?;
+        let ends_at = starts_at
+            .checked_add(draft.duration().as_duration())
+            .ok_or(ServiceError::InvalidInput { field: "ends_at" })?;
+        let timezone = timezone.as_ref().to_owned();
+        let operation_key = operation_key.as_ref().to_owned();
+        let owner_fingerprint = verified.fingerprint();
+
+        let (stored_draft, placement) = self
+            .store
+            .save_prepared_owner_task(
+                source_id,
+                &draft,
+                starts_at,
+                ends_at,
+                &timezone,
+                &operation_key,
+                owner_fingerprint,
+            )
+            .map_err(ServiceError::Store)?;
+        if stored_draft.draft() != &draft
+            || stored_draft.source_id() != source_id
+            || placement.starts_at() != starts_at
+            || placement.ends_at() != ends_at
+            || placement.timezone() != timezone
+            || placement.operation_key() != operation_key
+            || placement.owner_fingerprint() != owner_fingerprint
+            || placement.owner_task_draft_id() != stored_draft.id()
+        {
+            return Err(ServiceError::Store(StoreError::Conflict {
+                resource: "owner task preparation",
+            }));
+        }
+
+        Ok(PreparedOwnerTask {
+            owner_task_draft_id: stored_draft.id(),
+            starts_at: placement.starts_at(),
+            ends_at: placement.ends_at(),
+            timezone: placement.timezone().to_owned(),
+            operation_key: placement.operation_key().to_owned(),
+        })
+    }
+
     /// Records one validated voice-call summary and queues its owner-only
     /// call-summary notification.
     ///
@@ -1095,6 +1300,35 @@ fn owner_fingerprint(owner: &str) -> String {
     fingerprint
 }
 
+fn owner_caller_fingerprint(normalized_caller: &str) -> String {
+    const DOMAIN: &[u8] = b"agent_voice_owner_v1\0";
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut material = Vec::with_capacity(DOMAIN.len() + normalized_caller.len());
+    material.extend_from_slice(DOMAIN);
+    material.extend_from_slice(normalized_caller.as_bytes());
+    let digest = digest::digest(&digest::SHA256, &material);
+    let mut fingerprint = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        fingerprint.push(char::from(HEX[usize::from(byte >> 4)]));
+        fingerprint.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    fingerprint
+}
+
+fn normalize_owner_number(raw: &str, field: &'static str) -> ServiceResult<String> {
+    normalize_caller_id(raw).ok_or(ServiceError::InvalidInput { field })
+}
+
+fn canonical_owner_time(
+    value: OffsetDateTime,
+    field: &'static str,
+) -> ServiceResult<OffsetDateTime> {
+    if value.offset() != UtcOffset::UTC || value.nanosecond() != 0 {
+        return Err(ServiceError::InvalidInput { field });
+    }
+    Ok(value)
+}
+
 fn validate_prepared_request(
     prepared: &PreparedRequest,
     quote: &super::store::StoredAppointmentQuote,
@@ -1286,13 +1520,16 @@ fn canonicalize_submission_timestamp(
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfirmedPreparedRequest, ExplicitConfirmation, PaService, ServiceError};
+    use super::{
+        ConfirmedPreparedRequest, ExplicitConfirmation, OwnerConfirmation, OwnerVerified,
+        PaService, ServiceError,
+    };
     use crate::pa::availability::{
         AvailabilityError, AvailabilityPolicy, BusyInterval, default_working_windows,
     };
     use crate::pa::domain::{
-        AppointmentKind, AppointmentSlot, CallerIdentity, ConfirmedEmail, IdempotencyKey, Quote,
-        QuoteId,
+        AppointmentKind, AppointmentSlot, CallerIdentity, ConfirmedEmail, IdempotencyKey,
+        OwnerTaskDraft, Quote, QuoteId, TaskKind,
     };
     use crate::pa::fakes::{FakeControl, FakeGoogleCalendar, FakeOperation, FakeOutlookCalendar};
     use crate::pa::providers::{
@@ -1315,6 +1552,46 @@ mod tests {
 
     fn now() -> OffsetDateTime {
         OffsetDateTime::parse("2026-08-31T08:00:00Z", &Rfc3339).expect("valid now")
+    }
+
+    #[test]
+    fn owner_verified_issues_opaque_fingerprint_and_enforces_half_open_window() {
+        let verified_at = now();
+        let confirmation =
+            OwnerConfirmation::from_explicit_yes(true).expect("explicit confirmation");
+        let verified = OwnerVerified::issue(
+            "tel:+61415850000",
+            "sip:+61415850000@example.test",
+            confirmation,
+            verified_at,
+        )
+        .expect("owner verification");
+
+        assert_eq!(
+            verified.fingerprint(),
+            "11218945771988bd333744514bdfe96670b9d20350c78e54d9df78e0a55efc16"
+        );
+        assert!(verified.validate_at("+61415850000", verified_at).is_ok());
+        assert!(
+            verified
+                .validate_at("+61415850000", verified_at + Duration::seconds(59))
+                .is_ok()
+        );
+        assert!(
+            verified
+                .validate_at("+61415850000", verified_at + Duration::seconds(60))
+                .is_err()
+        );
+        assert!(
+            verified
+                .validate_at("+61415850000", verified_at - Duration::seconds(1))
+                .is_err()
+        );
+
+        let debug = format!("{verified:?}");
+        assert!(!debug.contains("+61415850000"));
+        assert!(!debug.contains(verified.fingerprint()));
+        assert!(!debug.contains("2026-08-31"));
     }
 
     fn session() -> ProviderSession {
@@ -1357,6 +1634,654 @@ mod tests {
                 row.get(0)
             })
             .expect("quote row count")
+    }
+
+    fn owner_verified(now: OffsetDateTime) -> OwnerVerified {
+        OwnerVerified::issue(
+            "+61415850000",
+            "sip:+61415850000@example.test",
+            OwnerConfirmation::from_explicit_yes(true).expect("explicit confirmation"),
+            now,
+        )
+        .expect("owner verification")
+    }
+
+    fn owner_task_draft(key: &str) -> OwnerTaskDraft {
+        OwnerTaskDraft::with_duration(
+            TaskKind::Preparation,
+            "Prepare the agenda",
+            30,
+            None,
+            IdempotencyKey::new(key).expect("idempotency key"),
+        )
+        .expect("owner task draft")
+    }
+
+    #[test]
+    fn owner_confirmation_rejects_non_affirmative_and_owner_verification_rejects_bad_binding() {
+        assert!(matches!(
+            OwnerConfirmation::from_explicit_yes(false),
+            Err(ServiceError::InvalidInput {
+                field: "owner_confirmation"
+            })
+        ));
+
+        let verified_at = now();
+        for (configured, caller) in [
+            ("", "+61415850000"),
+            ("anonymous", "+61415850000"),
+            ("+61415850000", "private"),
+            ("+61415850000", "+61415850001"),
+        ] {
+            assert!(
+                OwnerVerified::issue(
+                    configured,
+                    caller,
+                    OwnerConfirmation::from_explicit_yes(true).expect("confirmation"),
+                    verified_at,
+                )
+                .is_err()
+            );
+        }
+
+        assert!(
+            OwnerVerified::issue(
+                "+61415850000",
+                "+61415850000",
+                OwnerConfirmation::from_explicit_yes(true).expect("confirmation"),
+                verified_at + Duration::nanoseconds(1),
+            )
+            .is_err()
+        );
+        assert!(
+            OwnerVerified::issue(
+                "+61415850000",
+                "+61415850000",
+                OwnerConfirmation::from_explicit_yes(true).expect("confirmation"),
+                verified_at.to_offset(UtcOffset::from_hms(10, 0, 0).expect("offset")),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn prepare_owner_task_persists_one_atomic_redacted_provider_free_aggregate() {
+        let now = now();
+        let control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&control, &control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::default(),
+        );
+        let verified = owner_verified(now);
+        let draft = owner_task_draft("owner-prepare-aggregate");
+        let starts_at = now + Duration::hours(1);
+
+        let prepared = service
+            .prepare_owner_task(
+                draft.clone(),
+                Some("voice:owner-prepare"),
+                starts_at,
+                "Australia/Sydney",
+                "owner-task-operation-1",
+                &verified,
+                "+61415850000",
+                now,
+            )
+            .expect("prepare owner task");
+
+        assert!(prepared.owner_task_draft_id() > 0);
+        assert_eq!(prepared.starts_at(), starts_at);
+        assert_eq!(prepared.ends_at(), starts_at + Duration::minutes(30));
+        assert_eq!(prepared.timezone(), "Australia/Sydney");
+        assert_eq!(prepared.operation_key(), "owner-task-operation-1");
+        assert_eq!(
+            store
+                .load_owner_task_draft_by_id(prepared.owner_task_draft_id())
+                .expect("draft")
+                .draft(),
+            &draft
+        );
+        let placement = store
+            .load_owner_task_placement(prepared.owner_task_draft_id())
+            .expect("placement");
+        assert_eq!(placement.owner_fingerprint(), verified.fingerprint());
+        assert!(placement.owner_fingerprint().len() == 64);
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM owner_task_drafts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("draft count"),
+            1
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM owner_task_placements", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("placement count"),
+            1
+        );
+        assert!(!format!("{prepared:?}").contains("owner-task-operation-1"));
+        assert!(!format!("{prepared:?}").contains(verified.fingerprint()));
+        assert_no_calendar_operations(&control);
+    }
+
+    #[test]
+    fn prepare_owner_task_rejects_invalid_capability_and_input_before_any_write() {
+        let now = now();
+        let control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&control, &control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::default(),
+        );
+        let draft = owner_task_draft("owner-prepare-invalid");
+        let starts_at = now + Duration::hours(1);
+        let cases = [
+            (
+                owner_verified(now),
+                "+61415850000",
+                now - Duration::seconds(1),
+            ),
+            (
+                owner_verified(now),
+                "+61415850000",
+                now + Duration::seconds(60),
+            ),
+            (owner_verified(now), "+61415850001", now),
+            (owner_verified(now), "anonymous", now),
+        ];
+        for (verified, caller, validation_now) in cases {
+            assert!(
+                service
+                    .prepare_owner_task(
+                        draft.clone(),
+                        Some("voice:owner-prepare-invalid"),
+                        starts_at,
+                        "UTC",
+                        "owner-task-invalid",
+                        &verified,
+                        caller,
+                        validation_now,
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            service
+                .prepare_owner_task(
+                    draft.clone(),
+                    Some("voice:owner-prepare-invalid"),
+                    starts_at + Duration::nanoseconds(1),
+                    "UTC",
+                    "owner-task-invalid",
+                    &owner_verified(now),
+                    "+61415850000",
+                    now,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .prepare_owner_task(
+                    draft.clone(),
+                    Some("voice:owner-prepare-invalid"),
+                    starts_at,
+                    "not/a-timezone",
+                    "owner-task-invalid",
+                    &owner_verified(now),
+                    "+61415850000",
+                    now,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .prepare_owner_task(
+                    draft.clone(),
+                    Some("voice:owner-prepare-invalid"),
+                    starts_at,
+                    "UTC",
+                    " ",
+                    &owner_verified(now),
+                    "+61415850000",
+                    now,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .prepare_owner_task(
+                    draft,
+                    Some("voice:owner-prepare-invalid"),
+                    OffsetDateTime::parse("9999-12-31T23:59:59Z", &Rfc3339).expect("maximum time"),
+                    "UTC",
+                    "owner-task-overflow",
+                    &owner_verified(now),
+                    "+61415850000",
+                    now,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM owner_task_drafts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("draft count"),
+            0
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM owner_task_placements", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("placement count"),
+            0
+        );
+        assert_no_calendar_operations(&control);
+    }
+
+    #[test]
+    fn prepare_owner_task_retries_exactly_and_rejects_every_immutable_conflict() {
+        let now = now();
+        let control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&control, &control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::default(),
+        );
+        let draft = owner_task_draft("owner-prepare-retry");
+        let starts_at = now + Duration::hours(1);
+        let verified = owner_verified(now);
+        let first = service
+            .prepare_owner_task(
+                draft.clone(),
+                Some("voice:owner-prepare-retry"),
+                starts_at,
+                "UTC",
+                "owner-task-retry",
+                &verified,
+                "+61415850000",
+                now,
+            )
+            .expect("first prepare");
+        assert_eq!(
+            service
+                .prepare_owner_task(
+                    draft.clone(),
+                    Some("voice:owner-prepare-retry"),
+                    starts_at,
+                    "UTC",
+                    "owner-task-retry",
+                    &verified,
+                    "+61415850000",
+                    now,
+                )
+                .expect("exact retry"),
+            first
+        );
+
+        let changed_draft = OwnerTaskDraft::with_duration(
+            TaskKind::Preparation,
+            "Prepare a different agenda",
+            30,
+            None,
+            IdempotencyKey::new("owner-prepare-retry").expect("idempotency key"),
+        )
+        .expect("changed draft");
+        let alternate_verified = OwnerVerified::issue(
+            "+61415850001",
+            "+61415850001",
+            OwnerConfirmation::from_explicit_yes(true).expect("confirmation"),
+            now,
+        )
+        .expect("alternate verification");
+        for (candidate_draft, source_id, candidate_start, timezone, operation_key, capability) in [
+            (
+                draft.clone(),
+                Some("voice:owner-prepare-other-source"),
+                starts_at,
+                "UTC",
+                "owner-task-retry",
+                &verified,
+            ),
+            (
+                changed_draft,
+                Some("voice:owner-prepare-retry"),
+                starts_at,
+                "UTC",
+                "owner-task-retry",
+                &verified,
+            ),
+            (
+                draft.clone(),
+                Some("voice:owner-prepare-retry"),
+                starts_at + Duration::minutes(1),
+                "UTC",
+                "owner-task-retry",
+                &verified,
+            ),
+            (
+                draft.clone(),
+                Some("voice:owner-prepare-retry"),
+                starts_at,
+                "Australia/Sydney",
+                "owner-task-retry",
+                &verified,
+            ),
+            (
+                draft.clone(),
+                Some("voice:owner-prepare-retry"),
+                starts_at,
+                "UTC",
+                "owner-task-other",
+                &verified,
+            ),
+            (
+                draft.clone(),
+                Some("voice:owner-prepare-retry"),
+                starts_at,
+                "UTC",
+                "owner-task-retry",
+                &alternate_verified,
+            ),
+        ] {
+            assert!(
+                service
+                    .prepare_owner_task(
+                        candidate_draft,
+                        source_id,
+                        candidate_start,
+                        timezone,
+                        operation_key,
+                        capability,
+                        "+61415850000",
+                        now,
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM owner_task_drafts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("draft count"),
+            1
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM owner_task_placements", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("placement count"),
+            1
+        );
+    }
+
+    #[test]
+    fn prepare_owner_task_rolls_back_draft_when_placement_write_fails() {
+        let now = now();
+        let control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&control, &control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::default(),
+        );
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_owner_placement
+                 BEFORE INSERT ON owner_task_placements
+                 BEGIN SELECT RAISE(ABORT, 'injected placement failure'); END;",
+            )
+            .expect("install placement trigger");
+        assert!(
+            service
+                .prepare_owner_task(
+                    owner_task_draft("owner-prepare-atomic"),
+                    Some("voice:owner-prepare-atomic"),
+                    now + Duration::hours(1),
+                    "UTC",
+                    "owner-task-atomic",
+                    &owner_verified(now),
+                    "+61415850000",
+                    now,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM owner_task_drafts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("draft count"),
+            0
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM owner_task_placements", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("placement count"),
+            0
+        );
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER reject_owner_placement")
+            .expect("drop placement trigger");
+        service
+            .prepare_owner_task(
+                owner_task_draft("owner-prepare-atomic"),
+                Some("voice:owner-prepare-atomic"),
+                now + Duration::hours(1),
+                "UTC",
+                "owner-task-atomic",
+                &owner_verified(now),
+                "+61415850000",
+                now,
+            )
+            .expect("retry after rollback");
+    }
+
+    #[test]
+    fn prepare_owner_task_rejects_legacy_fingerprint_without_overwriting_it() {
+        let now = now();
+        let control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&control, &control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::default(),
+        );
+        let draft = owner_task_draft("owner-prepare-legacy");
+        let stored_draft = store
+            .save_owner_task_draft(Some("voice:owner-prepare-legacy"), &draft)
+            .expect("draft");
+        store
+            .connection()
+            .execute(
+                "INSERT INTO owner_task_placements(
+                     owner_task_draft_id, starts_at, ends_at, timezone,
+                     operation_key, owner_fingerprint, state
+                 ) VALUES (?1, ?2, ?3, 'UTC', 'owner-task-legacy', 'legacy', 'prepared')",
+                rusqlite::params![
+                    stored_draft.id(),
+                    (now + Duration::hours(1)).format(&Rfc3339).expect("start"),
+                    (now + Duration::hours(1) + Duration::minutes(30))
+                        .format(&Rfc3339)
+                        .expect("end"),
+                ],
+            )
+            .expect("legacy placement");
+
+        assert!(
+            service
+                .prepare_owner_task(
+                    draft,
+                    Some("voice:owner-prepare-legacy"),
+                    now + Duration::hours(1),
+                    "UTC",
+                    "owner-task-legacy",
+                    &owner_verified(now),
+                    "+61415850000",
+                    now,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .load_owner_task_placement(stored_draft.id())
+                .expect("legacy placement remains")
+                .owner_fingerprint(),
+            "legacy"
+        );
+        assert_no_calendar_operations(&control);
+    }
+
+    #[test]
+    fn concurrent_identical_owner_prepares_converge_to_one_stable_aggregate() {
+        let now = now();
+        let path = std::env::temp_dir().join(format!(
+            "agent_voice_owner_prepare_race_{}_{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let first_store = PaStore::open(&path, b"service-test-key").expect("first store");
+        let second_store = PaStore::open(&path, b"service-test-key").expect("second store");
+        let first_control = control(now);
+        let second_control = first_control.clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_barrier = std::sync::Arc::clone(&barrier);
+        let second_barrier = std::sync::Arc::clone(&barrier);
+        let first_handle = std::thread::spawn(move || {
+            let outlook = FakeOutlookCalendar::new(
+                &first_control,
+                Vec::<BusyInterval>::new(),
+                Vec::<CalendarChange>::new(),
+            );
+            let google = FakeGoogleCalendar::new(
+                &first_control,
+                Vec::<BusyInterval>::new(),
+                Vec::<CalendarChange>::new(),
+            );
+            let outlook_session = session();
+            let google_session = session();
+            let service = PaService::new(
+                &first_store,
+                &outlook,
+                &outlook_session,
+                &google,
+                &google_session,
+                &AvailabilityPolicy::default(),
+            );
+            first_barrier.wait();
+            service.prepare_owner_task(
+                owner_task_draft("owner-prepare-race"),
+                Some("voice:owner-prepare-race"),
+                now + Duration::hours(1),
+                "UTC",
+                "owner-task-race",
+                &owner_verified(now),
+                "+61415850000",
+                now,
+            )
+        });
+        let second_handle = std::thread::spawn(move || {
+            let outlook = FakeOutlookCalendar::new(
+                &second_control,
+                Vec::<BusyInterval>::new(),
+                Vec::<CalendarChange>::new(),
+            );
+            let google = FakeGoogleCalendar::new(
+                &second_control,
+                Vec::<BusyInterval>::new(),
+                Vec::<CalendarChange>::new(),
+            );
+            let outlook_session = session();
+            let google_session = session();
+            let service = PaService::new(
+                &second_store,
+                &outlook,
+                &outlook_session,
+                &google,
+                &google_session,
+                &AvailabilityPolicy::default(),
+            );
+            second_barrier.wait();
+            service.prepare_owner_task(
+                owner_task_draft("owner-prepare-race"),
+                Some("voice:owner-prepare-race"),
+                now + Duration::hours(1),
+                "UTC",
+                "owner-task-race",
+                &owner_verified(now),
+                "+61415850000",
+                now,
+            )
+        });
+        let first = first_handle.join().expect("first prepare thread");
+        let second = second_handle.join().expect("second prepare thread");
+        let first = first.expect("first prepare");
+        let second = second.expect("second prepare");
+        assert_eq!(first, second);
+
+        let reopened = PaStore::open(&path, b"service-test-key").expect("reopen store");
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row("SELECT count(*) FROM owner_task_drafts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("draft count"),
+            1
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row("SELECT count(*) FROM owner_task_placements", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("placement count"),
+            1
+        );
+        drop(reopened);
+        std::fs::remove_file(path).expect("remove race database");
     }
 
     fn assert_no_calendar_operations(control: &FakeControl) {
