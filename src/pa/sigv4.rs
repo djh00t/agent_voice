@@ -372,7 +372,7 @@ fn canonical_uri_and_query(uri: &str) -> Result<(String, String), SigV4Error> {
     if !raw_path.starts_with('/') {
         return Err(SigV4Error::new(SigV4ErrorKind::InvalidUri));
     }
-    let canonical_path = percent_encode(raw_path.as_bytes(), true);
+    let canonical_path = percent_encode_path(raw_path.as_bytes());
     let canonical_query = canonical_query(raw_query);
     Ok((canonical_path, canonical_query))
 }
@@ -400,9 +400,35 @@ fn canonical_query(raw_query: &str) -> String {
 }
 
 fn percent_encode(value: &[u8], preserve_slash: bool) -> String {
+    percent_encode_with_options(value, preserve_slash, false)
+}
+
+fn percent_encode_path(value: &[u8]) -> String {
+    percent_encode_with_options(value, true, true)
+}
+
+fn percent_encode_with_options(
+    value: &[u8],
+    preserve_slash: bool,
+    preserve_valid_escapes: bool,
+) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::with_capacity(value.len());
-    for &byte in value {
+    let mut index = 0;
+    while index < value.len() {
+        let byte = value[index];
+        if preserve_valid_escapes
+            && byte == b'%'
+            && index + 2 < value.len()
+            && is_hex_byte(value[index + 1])
+            && is_hex_byte(value[index + 2])
+        {
+            encoded.push('%');
+            encoded.push(value[index + 1] as char);
+            encoded.push(value[index + 2] as char);
+            index += 3;
+            continue;
+        }
         if byte.is_ascii_alphanumeric()
             || matches!(byte, b'-' | b'.' | b'_' | b'~')
             || (preserve_slash && byte == b'/')
@@ -413,8 +439,13 @@ fn percent_encode(value: &[u8], preserve_slash: bool) -> String {
             encoded.push(HEX[(byte >> 4) as usize] as char);
             encoded.push(HEX[(byte & 0x0f) as usize] as char);
         }
+        index += 1;
     }
     encoded
+}
+
+fn is_hex_byte(byte: u8) -> bool {
+    byte.is_ascii_digit() || matches!(byte, b'a'..=b'f' | b'A'..=b'F')
 }
 
 fn normalize_header_name(name: &str) -> Result<String, SigV4Error> {
@@ -615,4 +646,36 @@ fn lower_hex(bytes: &[u8]) -> String {
         result.push(HEX[(byte & 0x0f) as usize] as char);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TIMESTAMP: &str = "20130524T000000Z";
+    const PAYLOAD_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    fn headers() -> Vec<(String, String)> {
+        vec![
+            ("host".into(), "examplebucket.s3.amazonaws.com".into()),
+            ("x-amz-content-sha256".into(), PAYLOAD_HASH.into()),
+            ("x-amz-date".into(), TIMESTAMP.into()),
+        ]
+    }
+
+    #[test]
+    fn canonical_uri_preserves_valid_percent_escapes() {
+        let canonical = canonical_request("GET", "/folder/a%20b", &headers(), PAYLOAD_HASH)
+            .expect("origin-form URI is valid");
+
+        assert!(canonical.starts_with("GET\n/folder/a%20b\n\n"));
+    }
+
+    #[test]
+    fn canonical_uri_encodes_unescaped_bytes_and_malformed_percent() {
+        let canonical = canonical_request("GET", "/folder/a%2/%ZZ café", &headers(), PAYLOAD_HASH)
+            .expect("origin-form URI is valid");
+
+        assert!(canonical.starts_with("GET\n/folder/a%252/%25ZZ%20caf%C3%A9\n\n"));
+    }
 }
