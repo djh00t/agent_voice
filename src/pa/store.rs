@@ -642,7 +642,7 @@ impl fmt::Debug for StoredTask {
     }
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 12;
+const CURRENT_SCHEMA_VERSION: i64 = 13;
 const BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 struct Migration {
@@ -696,8 +696,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: apply_schema_v11,
     },
     Migration {
-        version: CURRENT_SCHEMA_VERSION,
+        version: 12,
         apply: apply_schema_v12,
+    },
+    Migration {
+        version: CURRENT_SCHEMA_VERSION,
+        apply: apply_schema_v13,
     },
 ];
 
@@ -7782,6 +7786,16 @@ END;
     Ok(())
 }
 
+fn apply_schema_v13(transaction: &Transaction<'_>) -> StoreResult<()> {
+    transaction.execute_batch(
+        r#"
+ALTER TABLE configuration ADD COLUMN version INTEGER NOT NULL DEFAULT 1
+  CHECK (typeof(version) = 'integer' AND version >= 1);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn normalize_legacy_audit_timestamp(value: &str) -> StoreResult<String> {
     let parsed = OffsetDateTime::parse(value, &Rfc3339)
         .map(|value| value.to_offset(time::UtcOffset::UTC))
@@ -8739,6 +8753,167 @@ END;
             })
             .expect("reopened migration count");
         assert_eq!(reopened_count, migration_count);
+    }
+
+    #[test]
+    fn configuration_version_survives_file_reopen() {
+        let database = TempDatabase::new();
+        let v12_migrations = &MIGRATIONS[..MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 13)
+            .unwrap_or(MIGRATIONS.len())];
+        let expected_configuration = {
+            let mut connection = Connection::open(&database.path).expect("open v12 database");
+            apply_sqlcipher_key(&connection, DATABASE_KEY).expect("apply SQLCipher key");
+            verify_sqlcipher(&connection).expect("verify SQLCipher");
+            run_migrations_with(&mut connection, v12_migrations).expect("apply v12 schema");
+            connection
+                .execute(
+                    "UPDATE configuration
+                     SET owner_timezone = 'Australia/Sydney',
+                         owner_email = 'owner@example.com',
+                         working_days = 'monday,wednesday',
+                         meeting_buffer_minutes = 15
+                     WHERE id = 1",
+                    [],
+                )
+                .expect("seed existing configuration values");
+            let mut statement = connection
+                .prepare(
+                    "SELECT owner_timezone, owner_email, owner_phone, working_days,
+                            working_window_start, working_window_end, minimum_notice_minutes,
+                            booking_horizon_days, meeting_buffer_minutes, retention_days,
+                            task_duration_bill_minutes, task_duration_callback_minutes,
+                            task_duration_reading_minutes, task_duration_email_reply_minutes,
+                            task_duration_preparation_minutes, email_triage_model
+                     FROM configuration WHERE id = 1",
+                )
+                .expect("configuration snapshot query");
+            statement
+                .query_row([], |row| {
+                    (0..16)
+                        .map(|column| row.get::<_, Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .expect("configuration snapshot")
+        };
+
+        let store = PaStore::open(&database.path, DATABASE_KEY).expect("upgrade v12 store");
+        let schema_version: i64 = store
+            .connection()
+            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("schema version");
+        assert_eq!(schema_version, 13);
+        let migration_count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("migration count");
+        assert_eq!(migration_count, 13);
+        let version: i64 = store
+            .connection()
+            .query_row(
+                "SELECT version FROM configuration WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("configuration version");
+        assert_eq!(version, 1);
+        let actual_configuration = store
+            .connection()
+            .prepare(
+                "SELECT owner_timezone, owner_email, owner_phone, working_days,
+                        working_window_start, working_window_end, minimum_notice_minutes,
+                        booking_horizon_days, meeting_buffer_minutes, retention_days,
+                        task_duration_bill_minutes, task_duration_callback_minutes,
+                        task_duration_reading_minutes, task_duration_email_reply_minutes,
+                        task_duration_preparation_minutes, email_triage_model
+                 FROM configuration WHERE id = 1",
+            )
+            .expect("configuration snapshot query")
+            .query_row([], |row| {
+                (0..16)
+                    .map(|column| row.get::<_, Value>(column))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("configuration snapshot");
+        assert_eq!(actual_configuration, expected_configuration);
+
+        store
+            .connection()
+            .execute("UPDATE configuration SET version = 7 WHERE id = 1", [])
+            .expect("set configuration version");
+        drop(store);
+
+        let reopened = PaStore::open(&database.path, DATABASE_KEY).expect("reopen store");
+        let reopened_version: i64 = reopened
+            .connection()
+            .query_row(
+                "SELECT version FROM configuration WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("reopened configuration version");
+        assert_eq!(reopened_version, 7);
+    }
+
+    #[test]
+    fn configuration_version_migration_is_idempotent() {
+        let mut connection = keyed_connection_for_migration_test();
+        let v12_migrations = &MIGRATIONS[..MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 13)
+            .unwrap_or(MIGRATIONS.len())];
+        run_migrations_with(&mut connection, v12_migrations).expect("apply v12 schema");
+        run_migrations_with(&mut connection, MIGRATIONS).expect("apply v13 schema");
+        run_migrations_with(&mut connection, MIGRATIONS).expect("reapply v13 schema");
+
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM schema_migrations WHERE version = 13",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v13 migration count");
+        assert_eq!(migration_count, 1);
+        let version_column_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('configuration') WHERE name = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("configuration version column count");
+        assert_eq!(version_column_count, 1);
+
+        connection
+            .execute("UPDATE configuration SET version = 7 WHERE id = 1", [])
+            .expect("set configuration version");
+        for invalid in [
+            Value::Integer(0),
+            Value::Integer(-1),
+            Value::Real(1.5),
+            Value::Text("text".to_owned()),
+        ] {
+            assert!(
+                connection
+                    .execute(
+                        "UPDATE configuration SET version = ?1 WHERE id = 1",
+                        [&invalid],
+                    )
+                    .is_err()
+            );
+            let version: i64 = connection
+                .query_row(
+                    "SELECT version FROM configuration WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("valid configuration version remains");
+            assert_eq!(version, 7);
+        }
     }
 
     #[test]
