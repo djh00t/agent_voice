@@ -1,8 +1,8 @@
 //! OpenAI client integration for STT, TTS, and response generation.
 
+use std::env;
 use std::sync::Arc;
 use std::time::Duration;
-use std::env;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
