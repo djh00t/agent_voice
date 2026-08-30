@@ -26,6 +26,8 @@ pub mod openai;
 pub mod pa;
 /// Persistent caller phone-book storage and validation helpers.
 pub mod phonebook;
+/// Inert boundary for the future OpenAI Realtime provider integration.
+pub mod realtime;
 /// SIP call orchestration and runtime service state.
 pub mod service;
 /// Local sherpa-onnx speech bridge support.
