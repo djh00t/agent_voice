@@ -4,6 +4,8 @@
 //! or legacy integration. Later packages may add value and dispatch modules
 //! without changing this module's side-effect-free registration contract.
 
+pub mod values;
+
 #[cfg(test)]
 mod tests {
     #[test]
