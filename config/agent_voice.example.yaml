@@ -42,6 +42,7 @@ llm:
 voice:
   provider: "openai"
   openai:
+    transport: "chat_completions"
     api_url: "https://api.openai.com/v1/chat/completions"
     model: "gpt-audio-1.5"
     voice: "alloy"
