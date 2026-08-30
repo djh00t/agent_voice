@@ -288,6 +288,17 @@ impl FakeGmail {
     /// Sends one validated Gmail message with deterministic idempotency.
     pub(crate) fn send_mail<'a>(&'a self, mail: &'a OutboundMail) -> ProviderFuture<'a, SentMail> {
         Box::pin(async move {
+            let seeded_message_ids = {
+                let read_state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ProviderError::Unavailable)?;
+                read_state
+                    .messages
+                    .iter()
+                    .map(|message| message.source_id().as_str().to_owned())
+                    .collect::<BTreeSet<_>>()
+            };
             let mut state = self
                 .send_state
                 .lock()
@@ -301,10 +312,17 @@ impl FakeGmail {
             }
 
             self.control.begin(FakeOperation::MailSend)?;
-            let sequence = state.next_sent_message_sequence;
+            let mut sequence = state.next_sent_message_sequence;
+            let provider_message_id = loop {
+                let candidate = format!("{GMAIL_SENT_MESSAGE_PREFIX}{sequence}");
+                if !seeded_message_ids.contains(&candidate) {
+                    break candidate;
+                }
+                sequence = sequence.checked_add(1).ok_or(ProviderError::Unavailable)?;
+            };
             let next_sequence = sequence.checked_add(1).ok_or(ProviderError::Unavailable)?;
             let sent = SentMail::new(
-                format!("{GMAIL_SENT_MESSAGE_PREFIX}{sequence}"),
+                provider_message_id,
                 self.control.now(),
             )?;
             state.sent_by_operation_key.insert(
@@ -448,6 +466,25 @@ mod tests {
         }
         assert_eq!(fake.sent_mail_receipts(), Ok(vec![sent]));
         assert_eq!(control.invocation_count(FakeOperation::MailSend), Ok(1));
+    }
+
+    #[tokio::test]
+    async fn gmail_send_skips_seeded_sent_message_ids() {
+        let fake = FakeGmail::new(
+            FakeControl::new(now()),
+            [message("fake-gmail-sent-1"), message("fake-gmail-sent-2")],
+        );
+        let sent = fake
+            .send_mail(&outbound(
+                "seeded-message-id-op",
+                "recipient@example.test",
+                "Subject",
+                "Body",
+            ))
+            .await
+            .expect("send");
+
+        assert_eq!(sent.provider_message_id(), "fake-gmail-sent-3");
     }
 
     #[tokio::test]
