@@ -1,5 +1,6 @@
 //! Runtime configuration loading for SIP, OpenAI, behavior, and accounting.
 
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1115,6 +1116,114 @@ pub struct SherpaOnnxKokoroConfig {
     pub lang: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// OAuth provider supported by the personal-assistant configuration.
+pub enum OAuthProvider {
+    Microsoft,
+    Google,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+/// Credential wrapper that cannot expose its plaintext through formatting or serialization.
+pub struct Secret(String);
+
+impl Secret {
+    #[allow(dead_code)]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl Serialize for Secret {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str("<redacted>")
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.trim() == "<redacted>" {
+            return Err(serde::de::Error::custom(
+                "redacted OAuth secret cannot be used as a credential",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// Shared OAuth provider endpoints, credentials, scopes, and redirect target.
+pub struct OAuthProviderConfig {
+    pub client_id: Option<String>,
+    pub client_secret: Option<Secret>,
+    #[serde(with = "oauth_url")]
+    pub authorize_url: reqwest::Url,
+    #[serde(with = "oauth_url")]
+    pub token_url: reqwest::Url,
+    pub scopes: Vec<String>,
+    #[serde(with = "oauth_url")]
+    pub redirect_uri: reqwest::Url,
+}
+
+/// OAuth settings for Microsoft identity and calendar/mail access.
+pub type MicrosoftOAuthConfig = OAuthProviderConfig;
+/// OAuth settings for Google identity and calendar/mail access.
+pub type GoogleOAuthConfig = OAuthProviderConfig;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// Microsoft and Google OAuth configuration for the personal-assistant API.
+pub struct PaOAuthConfig {
+    #[serde(default = "default_microsoft_oauth_config")]
+    pub microsoft: MicrosoftOAuthConfig,
+    #[serde(default = "default_google_oauth_config")]
+    pub google: GoogleOAuthConfig,
+}
+
+impl Default for PaOAuthConfig {
+    fn default() -> Self {
+        Self {
+            microsoft: default_microsoft_oauth_config(),
+            google: default_google_oauth_config(),
+        }
+    }
+}
+
+impl PaOAuthConfig {
+    /// Returns the configuration associated with the selected provider.
+    pub fn for_provider(&self, provider: OAuthProvider) -> &OAuthProviderConfig {
+        match provider {
+            OAuthProvider::Microsoft => &self.microsoft,
+            OAuthProvider::Google => &self.google,
+        }
+    }
+}
+
+mod oauth_url {
+    pub(super) fn serialize<S>(
+        url: &reqwest::Url,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(url.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 /// HTTP listener settings for the local agent control API.
 pub struct AgentApiConfig {
@@ -1340,6 +1449,54 @@ const fn default_auto_answer() -> bool {
 
 fn default_log_level() -> String {
     "info,agent_voice=debug".to_string()
+}
+
+fn default_provider_config(provider: OAuthProvider) -> OAuthProviderConfig {
+    match provider {
+        OAuthProvider::Microsoft => OAuthProviderConfig {
+            client_id: None,
+            client_secret: None,
+            authorize_url: reqwest::Url::parse(
+                "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            )
+            .expect("Microsoft authorize URL is valid"),
+            token_url: reqwest::Url::parse(
+                "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            )
+            .expect("Microsoft token URL is valid"),
+            scopes: vec![
+                "Calendars.ReadWrite".to_string(),
+                "Mail.Read".to_string(),
+                "offline_access".to_string(),
+                "openid".to_string(),
+                "profile".to_string(),
+            ],
+            redirect_uri: reqwest::Url::parse("http://127.0.0.1:8089/oauth/microsoft/callback")
+                .expect("Microsoft redirect URL is valid"),
+        },
+        OAuthProvider::Google => OAuthProviderConfig {
+            client_id: None,
+            client_secret: None,
+            authorize_url: reqwest::Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
+                .expect("Google authorize URL is valid"),
+            token_url: reqwest::Url::parse("https://oauth2.googleapis.com/token")
+                .expect("Google token URL is valid"),
+            scopes: vec![
+                "https://www.googleapis.com/auth/calendar.events".to_string(),
+                "https://www.googleapis.com/auth/gmail.modify".to_string(),
+            ],
+            redirect_uri: reqwest::Url::parse("http://127.0.0.1:8089/oauth/google/callback")
+                .expect("Google redirect URL is valid"),
+        },
+    }
+}
+
+fn default_microsoft_oauth_config() -> OAuthProviderConfig {
+    default_provider_config(OAuthProvider::Microsoft)
+}
+
+fn default_google_oauth_config() -> OAuthProviderConfig {
+    default_provider_config(OAuthProvider::Google)
 }
 
 fn default_agent_api_listen() -> String {
@@ -1943,5 +2100,75 @@ model: gpt-realtime-2.1
             openai: incompatible,
         };
         assert!(voice.validate().is_err());
+    }
+
+    #[test]
+    fn oauth_value_defaults_are_provider_specific() {
+        let defaults = PaOAuthConfig::default();
+        let microsoft = defaults.for_provider(OAuthProvider::Microsoft);
+        let google = defaults.for_provider(OAuthProvider::Google);
+
+        assert_eq!(microsoft.client_id, None);
+        assert_eq!(microsoft.client_secret, None);
+        assert_eq!(
+            microsoft.authorize_url.as_str(),
+            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+        );
+        assert_eq!(
+            microsoft.token_url.as_str(),
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+        );
+        assert_eq!(
+            microsoft.redirect_uri.as_str(),
+            "http://127.0.0.1:8089/oauth/microsoft/callback"
+        );
+        assert_eq!(
+            microsoft.scopes,
+            vec![
+                "Calendars.ReadWrite",
+                "Mail.Read",
+                "offline_access",
+                "openid",
+                "profile",
+            ]
+        );
+
+        assert_eq!(google.client_id, None);
+        assert_eq!(google.client_secret, None);
+        assert_eq!(
+            google.authorize_url.as_str(),
+            "https://accounts.google.com/o/oauth2/v2/auth"
+        );
+        assert_eq!(
+            google.token_url.as_str(),
+            "https://oauth2.googleapis.com/token"
+        );
+        assert_eq!(
+            google.redirect_uri.as_str(),
+            "http://127.0.0.1:8089/oauth/google/callback"
+        );
+        assert_eq!(
+            google.scopes,
+            vec![
+                "https://www.googleapis.com/auth/calendar.events",
+                "https://www.googleapis.com/auth/gmail.modify",
+            ]
+        );
+        assert_eq!(defaults, PaOAuthConfig::default());
+    }
+
+    #[test]
+    fn oauth_secret_never_formats_or_serializes_plaintext() {
+        let secret = Secret("do-not-leak".to_string());
+
+        let debug = format!("{secret:?}");
+        let serialized = serde_json::to_string(&secret).unwrap();
+
+        assert_eq!(secret.as_str(), "do-not-leak");
+        assert_eq!(debug, "[REDACTED]");
+        assert_eq!(serialized, "\"<redacted>\"");
+        assert!(!debug.contains("do-not-leak"));
+        assert!(!serialized.contains("do-not-leak"));
+        assert!(serde_json::from_str::<Secret>("\"<redacted>\"").is_err());
     }
 }
