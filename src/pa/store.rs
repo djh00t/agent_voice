@@ -7810,7 +7810,17 @@ CREATE TABLE IF NOT EXISTS http_idempotency_records (
     fingerprint TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('in_progress', 'completed')),
     lease_generation INTEGER NOT NULL CHECK (lease_generation > 0),
-    lease_until TEXT NOT NULL,
+    lease_until TEXT NOT NULL CHECK (
+        typeof(lease_until) = 'text'
+        AND length(CAST(lease_until AS BLOB)) BETWEEN 1 AND 19
+        AND lease_until GLOB '[0-9]*'
+        AND lease_until NOT GLOB '*[^0-9]*'
+        AND (lease_until = '0' OR substr(lease_until, 1, 1) <> '0')
+        AND (
+            length(lease_until) < 19
+            OR lease_until <= '9223372036854775807'
+        )
+    ),
     response_status INTEGER,
     response_content_type TEXT,
     response_body BLOB,
@@ -7818,14 +7828,24 @@ CREATE TABLE IF NOT EXISTS http_idempotency_records (
         typeof(created_at) = 'text'
         AND length(CAST(created_at AS BLOB)) = 20
         AND instr(CAST(created_at AS BLOB), x'00') = 0
-        AND created_at GLOB '????-??-??T??:??:??Z'
+        AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        AND substr(created_at, 6, 2) BETWEEN '01' AND '12'
+        AND substr(created_at, 9, 2) BETWEEN '01' AND '31'
+        AND substr(created_at, 12, 2) BETWEEN '00' AND '23'
+        AND substr(created_at, 15, 2) BETWEEN '00' AND '59'
+        AND substr(created_at, 18, 2) BETWEEN '00' AND '59'
         AND created_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at)
     ),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) CHECK (
         typeof(updated_at) = 'text'
         AND length(CAST(updated_at AS BLOB)) = 20
         AND instr(CAST(updated_at AS BLOB), x'00') = 0
-        AND updated_at GLOB '????-??-??T??:??:??Z'
+        AND updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        AND substr(updated_at, 6, 2) BETWEEN '01' AND '12'
+        AND substr(updated_at, 9, 2) BETWEEN '01' AND '31'
+        AND substr(updated_at, 12, 2) BETWEEN '00' AND '23'
+        AND substr(updated_at, 15, 2) BETWEEN '00' AND '59'
+        AND substr(updated_at, 18, 2) BETWEEN '00' AND '59'
         AND updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', updated_at)
     ),
     CHECK (
@@ -9608,10 +9628,41 @@ END;
             ),
             ("legacy updated_at", canonical, "2025-01-01 00:00:00"),
             ("offset updated_at", canonical, "2025-01-01T00:00:00+00:00"),
+            ("hour 24 created_at", "2025-01-01T24:00:00Z", canonical),
+            ("month zero created_at", "2025-00-01T00:00:00Z", canonical),
+            ("month 13 created_at", "2025-13-01T00:00:00Z", canonical),
+            ("day zero created_at", "2025-01-00T00:00:00Z", canonical),
+            ("day 32 created_at", "2025-01-32T00:00:00Z", canonical),
+            (
+                "day outside month created_at",
+                "2025-02-29T00:00:00Z",
+                canonical,
+            ),
+            ("minute 60 created_at", "2025-01-01T00:60:00Z", canonical),
+            ("second 60 created_at", "2025-01-01T00:00:60Z", canonical),
+            ("hour 24 updated_at", canonical, "2025-01-01T24:00:00Z"),
+            ("minute 60 updated_at", canonical, "2025-01-01T00:60:00Z"),
+            ("second 60 updated_at", canonical, "2025-01-01T00:00:60Z"),
         ]
         .into_iter()
         .enumerate()
         {
+            if label.contains("hour")
+                || label.contains("month")
+                || label.contains("day")
+                || label.contains("minute")
+                || label.contains("second")
+            {
+                let value = if created_at != canonical {
+                    created_at
+                } else {
+                    updated_at
+                };
+                assert!(
+                    OffsetDateTime::parse(value, &Rfc3339).is_err(),
+                    "{label} must be rejected by strict RFC3339 parsing"
+                );
+            }
             let key = format!("timestamp-{index}");
             assert!(
                 insert(&key, created_at, updated_at).is_err(),
@@ -9625,6 +9676,58 @@ END;
             })
             .expect("row count");
         assert_eq!(row_count, 0);
+    }
+
+    #[test]
+    fn http_idempotency_v14_constraints_reject_noncanonical_lease_until() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let insert = |key: &str, lease_until: &str| {
+            store.connection().execute(
+                "INSERT INTO http_idempotency_records (
+                     scope, idempotency_key, fingerprint, state, lease_generation,
+                     lease_until
+                 ) VALUES ('scope', ?1, ?2, 'in_progress', 1, ?3)",
+                rusqlite::params![key, VALID_HTTP_FINGERPRINT, lease_until],
+            )
+        };
+
+        for (index, (label, lease_until)) in [
+            ("empty", ""),
+            ("nondecimal", "1700000000x"),
+            ("signed positive", "+1700000000"),
+            ("signed negative", "-1"),
+            ("leading zero", "01700000000"),
+            ("overflow", "9223372036854775808"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                insert(&format!("invalid-lease-{index}"), lease_until).is_err(),
+                "{label} lease_until was accepted"
+            );
+        }
+
+        for (key, lease_until) in [
+            ("zero", "0"),
+            ("positive", "1700000000"),
+            ("maximum", "9223372036854775807"),
+        ] {
+            insert(key, lease_until).expect("canonical lease_until was rejected");
+        }
+
+        let stored: Vec<String> = store
+            .connection()
+            .prepare(
+                "SELECT lease_until FROM http_idempotency_records
+                 ORDER BY idempotency_key",
+            )
+            .expect("lease values query")
+            .query_map([], |row| row.get(0))
+            .expect("lease values")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("lease values rows");
+        assert_eq!(stored, vec!["9223372036854775807", "1700000000", "0"]);
     }
 
     #[test]
