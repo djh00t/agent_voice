@@ -218,6 +218,14 @@ impl FakeCalendarRead {
             }
             return Err(ProviderError::Conflict);
         }
+        if state
+            .changes
+            .iter()
+            .filter_map(CalendarChange::event)
+            .any(|event| event.operation_key() == draft.operation_key())
+        {
+            return Err(ProviderError::Conflict);
+        }
 
         let mut sequence = state.next_google_event_sequence;
         let provider_event_id = loop {
@@ -1998,6 +2006,30 @@ mod tests {
                 .invocation_count(FakeOperation::CalendarProposalCreate)
                 .expect("count"),
             6
+        );
+    }
+
+    #[test]
+    fn google_create_rejects_seeded_operation_key_without_duplicate() {
+        let control = FakeControl::new(now());
+        let fake = FakeGoogleCalendar::new(
+            control.clone(),
+            Vec::<BusyInterval>::new(),
+            [event_change("seeded-event", "Seeded")],
+        );
+        let draft = google_proposal_draft("sentinel-operation-key", "Discuss");
+
+        assert_eq!(fake.create_proposal(&draft), Err(ProviderError::Conflict));
+        let state = fake.read.state.lock().expect("state");
+        assert!(state.google_proposal_events.is_empty());
+        assert!(state.google_proposal_create_drafts.is_empty());
+        assert_eq!(state.changes.len(), 1);
+        assert_eq!(state.changes[0].provider_event_id(), "seeded-event");
+        assert_eq!(
+            control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("count"),
+            1
         );
     }
 
