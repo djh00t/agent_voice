@@ -667,7 +667,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(unix)]
@@ -696,8 +696,23 @@ mod tests {
                     "agent-voice-writer-contract-{}-{sequence}",
                     std::process::id()
                 ));
-                match fs::create_dir(&path) {
-                    Ok(()) => return Self { path },
+                let mut builder = fs::DirBuilder::new();
+                #[cfg(unix)]
+                builder.mode(0o700);
+                match builder.create(&path) {
+                    Ok(()) => {
+                        #[cfg(unix)]
+                        assert_eq!(
+                            fs::symlink_metadata(&path)
+                                .expect("test directory metadata")
+                                .permissions()
+                                .mode()
+                                & 0o022,
+                            0,
+                            "test directory must not be group/world writable"
+                        );
+                        return Self { path };
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                     Err(error) => panic!("failed to create test directory: {error}"),
                 }
