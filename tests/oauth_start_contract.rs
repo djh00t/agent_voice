@@ -1,5 +1,7 @@
+#[allow(dead_code)]
 #[path = "../src/config.rs"]
 mod config;
+#[allow(dead_code)]
 #[path = "../src/pa/oauth_start.rs"]
 mod oauth_start;
 
