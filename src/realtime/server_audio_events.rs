@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-    use serde_json::{Value, json};
+    use base64::Engine as _;
+    use serde_json::{json, Value};
 
     use super::super::values::{G711Ulaw, OpaqueId, RealtimeValueError, TranscriptText};
     use super::RealtimeServerAudioEvent;
@@ -255,6 +255,44 @@ mod tests {
             assert!(error.contains("missing required field"));
         }
 
+        for (raw, secret) in [
+            (
+                r#"{"type":"response.audio.done","type":"response.output_audio.done","event_id":"event-1","response_id":"response-1","item_id":"item-1","output_index":1,"content_index":2}"#,
+                "response.audio.done",
+            ),
+            (
+                r#"{"type":"response.output_audio.done","event_id":"event-1","response_id":"response-1","response_id":"response-2","item_id":"item-1","output_index":1,"content_index":2}"#,
+                "response-2",
+            ),
+            (
+                r#"{"type":"response.output_audio.done","event_id":"event-1","event_id":"event-2","response_id":"response-1","item_id":"item-1","output_index":1,"content_index":2}"#,
+                "event-2",
+            ),
+            (
+                r#"{"type":"response.output_audio.done","event_id":"event-1","response_id":"response-1","item_id":"item-1","item_id":"item-2","output_index":1,"content_index":2}"#,
+                "item-2",
+            ),
+            (
+                r#"{"type":"response.output_audio.done","event_id":"event-1","response_id":"response-1","item_id":"item-1","output_index":1,"output_index":2,"content_index":2}"#,
+                "2",
+            ),
+            (
+                r#"{"type":"response.output_audio.done","event_id":"event-1","response_id":"response-1","item_id":"item-1","output_index":1,"content_index":2,"content_index":3}"#,
+                "3",
+            ),
+            (
+                r#"{"type":"response.output_audio.delta","event_id":"event-1","response_id":"response-1","item_id":"item-1","output_index":1,"content_index":2,"delta":"AAEC+g==","delta":"AQID"}"#,
+                "AQID",
+            ),
+            (
+                r#"{"type":"response.output_audio_transcript.done","event_id":"event-1","response_id":"response-1","item_id":"item-1","output_index":1,"content_index":2,"transcript":"draft","transcript":"final"}"#,
+                "final",
+            ),
+        ] {
+            let error = redacted_error(raw, secret);
+            assert!(error.contains("invalid JSON"));
+        }
+
         for raw in [
             r#"{"type":"response.output_audio.delta","event_id":"bad id","response_id":"response-1","item_id":"item-1","output_index":1,"content_index":2,"delta":"AAEC+g=="}"#,
             r#"{"type":"response.output_audio_transcript.done","event_id":"event-1","response_id":"response-1","item_id":"item-1","output_index":-1,"content_index":2,"transcript":"safe"}"#,
@@ -284,7 +322,7 @@ mod tests {
 
 use std::fmt;
 
-use serde::de::Error as DeError;
+use serde::de::{DeserializeSeed, Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
@@ -508,6 +546,99 @@ fn finish(map: Map<String, Value>) -> Result<(), RealtimeValueError> {
     }
 }
 
+struct UniqueValueSeed;
+
+impl<'de> DeserializeSeed<'de> for UniqueValueSeed {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueValueVisitor)
+    }
+}
+
+struct UniqueValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom(RealtimeValueError::InvalidJson))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(Value::String(value))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueValueVisitor)
+    }
+
+    fn visit_seq<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = access.next_element_seed(UniqueValueSeed)? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut map = Map::new();
+        while let Some(key) = access.next_key::<String>()? {
+            if map.contains_key(&key) {
+                return Err(A::Error::custom(RealtimeValueError::InvalidJson));
+            }
+            let value = access.next_value_seed(UniqueValueSeed)?;
+            map.insert(key, value);
+        }
+        Ok(Value::Object(map))
+    }
+}
+
 fn opaque_id(value: Value) -> Result<OpaqueId, RealtimeValueError> {
     match value {
         Value::String(value) => OpaqueId::new(value),
@@ -625,7 +756,8 @@ impl<'de> Deserialize<'de> for RealtimeServerAudioEvent {
     where
         D: Deserializer<'de>,
     {
-        let value = Value::deserialize(deserializer)
+        let value = deserializer
+            .deserialize_any(UniqueValueVisitor)
             .map_err(|_| D::Error::custom(RealtimeValueError::InvalidJson))?;
         parse_event(value).map_err(D::Error::custom)
     }
