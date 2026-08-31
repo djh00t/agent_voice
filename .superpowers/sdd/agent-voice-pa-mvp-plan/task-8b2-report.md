@@ -5,7 +5,7 @@
 - **Base:** `a20a28be3be37c84cbe5046415497b7053dd8906` (`origin/main`)
 - **Branch:** `codex/issue-250`
 - **Worktree:** `/Users/djh/work/src/github.com_local/djh00t/agent_voice`
-- **Implementation commits:** `f8909586f051b292afbc5cea5487cc41cc2d0a08` (tests), `7d636e769e2ee65328fc1fb61e0a4bb1d21b6c2c` (implementation), `0a5c4c86b29bac6387df300b6fd5aecff08457f6` (warning cleanup), `7b7a369c8c391ffde98646f7df3255f3ab1cc55a` (diagnostic redaction test hardening), `6d2955896f26b84e12c3253e87bc2aa867632b79` (verifier handoff test), `631357c257a5d99697fe50ba567de49d80db1ba9` (verifier handoff)
+- **Implementation commits:** `f8909586f051b292afbc5cea5487cc41cc2d0a08` (tests), `7d636e769e2ee65328fc1fb61e0a4bb1d21b6c2c` (implementation), `0a5c4c86b29bac6387df300b6fd5aecff08457f6` (warning cleanup), `7b7a369c8c391ffde98646f7df3255f3ab1cc55a` (diagnostic redaction test hardening), `6d2955896f26b84e12c3253e87bc2aa867632b79` (verifier handoff test), `631357c257a5d99697fe50ba567de49d80db1ba9` (verifier handoff), `282e43c1f1a7ffcc538bdf397a035e3ee4f3b81e` (assertion redaction regression)
 - **Report commit:** `THIS_REPORT_COMMIT` (resolve with `rtk git rev-parse HEAD` after checkout)
 
 ## Scope
@@ -167,6 +167,50 @@ verifiers, credentials, tokens, complete query URLs, or provider diagnostics.
     "timestamp_utc": "2026-08-31T17:20:50Z"
   },
   {
+    "tier": "LOCAL",
+    "kind": "RED",
+    "selector_or_scope": "verifier_mismatch_assertion_does_not_leak_expected_value",
+    "command_or_check": "rtk cargo test --test oauth_callback_contract verifier_mismatch_assertion_does_not_leak_expected_value -- --exact",
+    "expected": "nonzero redaction-regression failure against operand-formatting assertion",
+    "exit_code": 101,
+    "observed": "failed because the caught assert_eq panic included the expected verifier sentinel",
+    "commit": "0f1d2a31a1d0d0839822673d126b306c6fc80718",
+    "timestamp_utc": "2026-08-31T17:34:33Z"
+  },
+  {
+    "tier": "LOCAL",
+    "kind": "GREEN",
+    "selector_or_scope": "verifier_mismatch_assertion_does_not_leak_expected_value",
+    "command_or_check": "rtk cargo test --test oauth_callback_contract verifier_mismatch_assertion_does_not_leak_expected_value -- --exact",
+    "expected": "caught verifier assertion panic omits the expected sentinel",
+    "exit_code": 0,
+    "observed": "1 passed, 30 filtered out",
+    "commit": "282e43c1f1a7ffcc538bdf397a035e3ee4f3b81e",
+    "timestamp_utc": "2026-08-31T17:34:33Z"
+  },
+  {
+    "tier": "LOCAL",
+    "kind": "GREEN",
+    "selector_or_scope": "oauth_callback_contract assertion redaction regression",
+    "command_or_check": "rtk cargo test --test oauth_callback_contract",
+    "expected": "all direct-path callback contract tests pass with assertion redaction coverage",
+    "exit_code": 0,
+    "observed": "31 passed in the direct-path suite",
+    "commit": "282e43c1f1a7ffcc538bdf397a035e3ee4f3b81e",
+    "timestamp_utc": "2026-08-31T17:34:33Z"
+  },
+  {
+    "tier": "LOCAL",
+    "kind": "GREEN",
+    "selector_or_scope": "repository validation gate assertion redaction regression",
+    "command_or_check": "rtk make check",
+    "expected": "Rust tests, strict lint, Rust docs, and website build pass",
+    "exit_code": 0,
+    "observed": "567 Rust tests ran; lint, Rust docs, and the remaining repository checks completed successfully with no warnings",
+    "commit": "282e43c1f1a7ffcc538bdf397a035e3ee4f3b81e",
+    "timestamp_utc": "2026-08-31T17:43:10Z"
+  },
+  {
     "tier": "STATIC",
     "kind": "REVIEW",
     "selector_or_scope": "issue #250 lifecycle metadata",
@@ -202,13 +246,13 @@ verifiers, credentials, tokens, complete query URLs, or provider diagnostics.
   {
     "tier": "CI",
     "kind": "GREEN",
-    "selector_or_scope": "PR #313 status checks at head 631357c257a5d99697fe50ba567de49d80db1ba9",
+    "selector_or_scope": "PR #313 status checks at head 282e43c1f1a7ffcc538bdf397a035e3ee4f3b81e",
     "command_or_check": "rtk gh pr checks 313 --repo djh00t/agent_voice; rtk gh pr view 313 --repo djh00t/agent_voice --json headRefOid,statusCheckRollup,mergeStateStatus,mergeable",
     "expected": "all five independent PR checks pass",
     "exit_code": 0,
     "observed": "CI Checks Summary reported Passed: 5 and Failed: 0; Quality Gates, Compose Config, Analyze (javascript-typescript), Analyze (rust), and CodeQL each completed successfully, with CLEAN/MERGEABLE PR state",
-    "commit": "631357c257a5d99697fe50ba567de49d80db1ba9",
-    "timestamp_utc": "2026-08-31T17:21:33Z"
+    "commit": "282e43c1f1a7ffcc538bdf397a035e3ee4f3b81e",
+    "timestamp_utc": "2026-08-31T17:42:48Z"
   },
   {
     "tier": "LIVE",
