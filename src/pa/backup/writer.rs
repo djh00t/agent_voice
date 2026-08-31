@@ -182,7 +182,6 @@ fn write_inner(
         .file_mut()
         .sync_all()
         .map_err(|_| WriterError::Sync)?;
-    temporary.close_file();
 
     ensure_destination_absent(destination)?;
     temporary.ensure_owned()?;
@@ -408,10 +407,6 @@ impl TemporaryFile {
             .expect("temporary file remains open until publication")
     }
 
-    fn close_file(&mut self) {
-        self.file.take();
-    }
-
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -419,10 +414,10 @@ impl TemporaryFile {
 
 impl Drop for TemporaryFile {
     fn drop(&mut self) {
-        self.file.take();
         if self.armed {
             remove_if_owned(&self.path, &self.identity);
         }
+        self.file.take();
     }
 }
 
