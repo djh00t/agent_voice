@@ -504,8 +504,7 @@ impl AppConfig {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 /// Validated destination and freshness policy for encrypted backups.
 pub struct BackupConfig {
     #[serde(default = "default_backup_enabled")]
@@ -524,6 +523,64 @@ pub struct BackupConfig {
     pub temp_dir: PathBuf,
     #[serde(default = "default_backup_max_age_hours")]
     pub max_age_hours: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupConfigFields {
+    #[serde(default = "default_backup_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    bucket: String,
+    #[serde(default = "default_backup_prefix")]
+    prefix: String,
+    #[serde(default)]
+    region: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default = "default_backup_retention_days")]
+    retention_days: u16,
+    #[serde(default = "default_backup_temp_dir")]
+    temp_dir: PathBuf,
+    #[serde(default = "default_backup_max_age_hours")]
+    max_age_hours: u32,
+}
+
+impl<'de> Deserialize<'de> for BackupConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        if value.as_mapping().is_some_and(|mapping| {
+            mapping
+                .keys()
+                .any(|key| key.as_str().is_some_and(is_secret_shaped_backup_field))
+        }) {
+            return Err(serde::de::Error::custom("backup: secret_field_rejected"));
+        }
+
+        let fields: BackupConfigFields = serde_yaml::from_value(value)
+            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        Ok(Self {
+            enabled: fields.enabled,
+            bucket: fields.bucket,
+            prefix: fields.prefix,
+            region: fields.region,
+            endpoint: fields.endpoint,
+            retention_days: fields.retention_days,
+            temp_dir: fields.temp_dir,
+            max_age_hours: fields.max_age_hours,
+        })
+    }
+}
+
+fn is_secret_shaped_backup_field(field: &str) -> bool {
+    let normalized = field.to_ascii_lowercase().replace(['-', '.'], "_");
+    normalized.contains("master_key")
+        || normalized.contains("raw_secret")
+        || normalized == "raw_key"
+        || normalized == "secret"
 }
 
 impl Default for BackupConfig {
@@ -671,7 +728,7 @@ fn require_backup_env_value(field: &str, value: &str) -> Result<String> {
 }
 
 fn parse_backup_bool(value: &str) -> Result<bool> {
-    parse_bool(value).ok_or_else(|| backup_error("enabled", "invalid_enabled"))
+    parse_bool(value).ok_or_else(|| backup_error("enabled", "missing_required"))
 }
 
 fn parse_backup_retention(value: &str) -> Result<u16> {
@@ -3435,6 +3492,35 @@ agent_api:
         let invalid = HashMap::from([("BACKUP_RETENTION_DAYS".to_string(), "0".to_string())]);
         assert!(backup.apply_env_overrides_from_map(&invalid).is_err());
         assert_eq!(backup, before);
+    }
+
+    #[test]
+    fn backup_config_enabled_override_rejects_blank_and_malformed() {
+        let expected = BackupConfig::default();
+        for value in ["", "maybe"] {
+            let mut backup = expected.clone();
+            let env = HashMap::from([("BACKUP_ENABLED".to_string(), value.to_string())]);
+
+            let error = backup
+                .apply_env_overrides_from_map(&env)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "backup.enabled: missing_required");
+            assert_eq!(backup, expected);
+        }
+    }
+
+    #[test]
+    fn backup_config_rejects_secret_shaped_unknown_yaml_fields() {
+        for field in ["master_key", "raw_secret"] {
+            let yaml =
+                format!("enabled: true\nbucket: agent-voice-test\n{field}: do-not-log-this\n");
+            let error = serde_yaml::from_str::<BackupConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "backup: secret_field_rejected");
+            assert!(!error.contains("do-not-log-this"));
+        }
     }
 
     #[test]
