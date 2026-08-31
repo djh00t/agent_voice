@@ -5,7 +5,7 @@
 - **Evidence date:** 2026-08-31 (Australia/Sydney)
 - **Worktree:** `/Users/djh/.codex/worktrees/agent_voice-224`
 - **Branch:** `codex/issue-224`
-- **Base:** `b1b83562b3f2f92b58445448a76ab770a977597f` (`origin/main`)
+- **Base:** `5469cad6` (`origin/main`)
 
 ## Contract and readback
 
@@ -122,7 +122,7 @@ at tests/realtime_server_response_events_contract.rs:215 and :242
 2 errors, 1 warning
 ```
 
-After `35b40d1`, the same selector passed and covered both invalid paths and a
+After `10b2018`, the same selector passed and covered both invalid paths and a
 valid cancelled round trip:
 
 ```text
@@ -211,16 +211,16 @@ readback was:
 After rebasing onto the current `origin/main`, the equivalent delivery and
 repair commits are:
 
-- `dc6afad` — harness only: `tests/realtime_server_response_events_contract.rs`
-- `91cec30` — implementation and inline test only:
+- `b18b10a` — harness only: `tests/realtime_server_response_events_contract.rs`
+- `7a6cbe7` — implementation and inline test only:
   `src/realtime/server_response_events.rs`
-- `2fff304` — report only:
+- `001f59c` — report only:
   `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
-- `af32e33` — report-only finalization:
+- `661c3ee` — report-only finalization:
   `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
-- `35b40d1` — repair implementation and regression test only:
+- `10b2018` — repair implementation and regression test only:
   `src/realtime/server_response_events.rs`
-- `97d06fe` — report-only rebased readback:
+- `04b7533` — report-only rebased readback:
   `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
 
 This report update is the next report-only repair commit and records the
