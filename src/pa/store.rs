@@ -29,6 +29,7 @@ pub const MAX_AUDIT_LIST_LIMIT: usize = 100;
 
 /// Maximum UTF-8 byte length accepted for message machine identifiers.
 pub const MAX_MESSAGE_ID_LENGTH: usize = 256;
+const MAX_PROVIDER_CURSOR_LENGTH: usize = MAX_MESSAGE_ID_LENGTH;
 /// Maximum UTF-8 byte length accepted for a structured message summary.
 pub const MAX_MESSAGE_SUMMARY_LENGTH: usize = 4096;
 /// Maximum UTF-8 byte length accepted for an extracted message subject.
@@ -2317,76 +2318,119 @@ impl PaStore {
         Ok(())
     }
 
-    /// Atomically upserts a provider cursor under its stable stream ID.
-    pub fn save_provider_cursor(
-        &self,
-        stream_id: impl AsRef<str>,
-        expected_cursor: Option<&str>,
-        cursor: impl AsRef<str>,
-    ) -> StoreResult<()> {
-        let stream_id = validate_non_empty(stream_id.as_ref().to_owned(), "stream_id")?;
-        let cursor = validate_non_empty(cursor.as_ref().to_owned(), "cursor")?;
-        match expected_cursor {
-            None => {
-                let inserted = self.connection.execute(
-                    "INSERT INTO provider_cursors(provider, cursor) VALUES (?1, ?2)
-                     ON CONFLICT(provider) DO NOTHING",
-                    params![stream_id, cursor],
-                )?;
-                if inserted == 0 {
-                    return Err(StoreError::CursorConflict {
-                        resource: "provider cursor",
-                    });
-                }
-            }
-            Some(expected_cursor) => {
-                let expected_cursor =
-                    validate_non_empty(expected_cursor.to_owned(), "expected_cursor")?;
-                let updated = self.connection.execute(
-                    "UPDATE provider_cursors
-                     SET cursor = ?1,
-                         updated_at = CASE WHEN cursor = ?1 THEN updated_at ELSE CURRENT_TIMESTAMP END
-                     WHERE provider = ?2 AND cursor = ?3",
-                    params![cursor, stream_id, expected_cursor],
-                )?;
-                if updated == 0 {
-                    return Err(StoreError::CursorConflict {
-                        resource: "provider cursor",
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Returns a provider cursor by stable stream ID.
-    pub fn load_provider_cursor(&self, stream_id: impl AsRef<str>) -> StoreResult<String> {
-        let stream_id = validate_non_empty(stream_id.as_ref().to_owned(), "stream_id")?;
-        self.connection
+    /// Loads the opaque cursor for one validated provider stream.
+    ///
+    /// Both an absent row and a present nullable cursor are represented as
+    /// `None`; an invalid stored value fails closed as a redacted corruption
+    /// error.
+    pub fn load_provider_cursor(&self, stream_id: impl AsRef<str>) -> StoreResult<Option<String>> {
+        let stream_id =
+            validate_provider_cursor_identifier(stream_id.as_ref().to_owned(), "stream_id")?;
+        let cursor = self
+            .connection
             .query_row(
                 "SELECT cursor FROM provider_cursors WHERE provider = ?1",
-                params![stream_id],
+                params![&stream_id],
                 |row| row.get::<_, Option<String>>(0),
             )
-            .optional()?
-            .flatten()
-            .ok_or(StoreError::NotFound {
-                resource: "provider cursor",
-            })
+            .optional()
+            .map_err(provider_cursor_sqlite_error)?;
+        match cursor {
+            None | Some(None) => Ok(None),
+            Some(Some(cursor)) => validate_provider_cursor_identifier(cursor, "cursor")
+                .map(Some)
+                .map_err(|_| stored_record_invalid("provider cursor")),
+        }
     }
 
-    /// Deletes a provider cursor by stable stream ID.
-    pub fn delete_provider_cursor(&self, stream_id: impl AsRef<str>) -> StoreResult<()> {
-        let stream_id = validate_non_empty(stream_id.as_ref().to_owned(), "stream_id")?;
-        let deleted = self.connection.execute(
-            "DELETE FROM provider_cursors WHERE provider = ?1",
-            params![stream_id],
-        )?;
-        if deleted == 0 {
-            return Err(StoreError::NotFound {
-                resource: "provider cursor",
-            });
+    /// Atomically compares and advances one opaque provider cursor.
+    ///
+    /// Validation completes before the immediate transaction begins. The
+    /// transaction fences concurrent store handles, while equal retries avoid
+    /// touching the row timestamp and stale callers receive a redacted
+    /// conflict without mutation.
+    pub fn advance_provider_cursor(
+        &self,
+        stream_id: &str,
+        expected: Option<&str>,
+        next: &str,
+    ) -> StoreResult<()> {
+        let stream_id = validate_provider_cursor_identifier(stream_id.to_owned(), "stream_id")?;
+        let expected = expected
+            .map(|value| validate_provider_cursor_identifier(value.to_owned(), "expected"))
+            .transpose()?;
+        let next = validate_provider_cursor_identifier(next.to_owned(), "next")?;
+
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .map_err(provider_cursor_sqlite_error)?;
+        let current = load_provider_cursor_row(&transaction, &stream_id)?;
+        let current = match current {
+            None => None,
+            Some(None) => Some(None),
+            Some(Some(cursor)) => Some(Some(
+                validate_provider_cursor_identifier(cursor, "cursor")
+                    .map_err(|_| stored_record_invalid("provider cursor"))?,
+            )),
+        };
+
+        match current {
+            None => {
+                if expected.is_some() {
+                    return Err(StoreError::CursorConflict {
+                        resource: "provider cursor",
+                    });
+                }
+                let inserted = transaction
+                    .execute(
+                        "INSERT INTO provider_cursors(provider, cursor) VALUES (?1, ?2)
+                         ON CONFLICT(provider) DO NOTHING",
+                        params![&stream_id, &next],
+                    )
+                    .map_err(provider_cursor_sqlite_error)?;
+                if inserted != 1 {
+                    return Err(StoreError::CursorConflict {
+                        resource: "provider cursor",
+                    });
+                }
+            }
+            Some(current) => {
+                if expected.as_deref() != current.as_deref() {
+                    return Err(StoreError::CursorConflict {
+                        resource: "provider cursor",
+                    });
+                }
+                if current.as_deref() == Some(next.as_str()) {
+                    transaction.commit().map_err(provider_cursor_sqlite_error)?;
+                    return Ok(());
+                }
+
+                let updated = match current {
+                    Some(current) => transaction
+                        .execute(
+                            "UPDATE provider_cursors
+                             SET cursor = ?1, updated_at = CURRENT_TIMESTAMP
+                             WHERE provider = ?2 AND cursor = ?3",
+                            params![&next, &stream_id, &current],
+                        )
+                        .map_err(provider_cursor_sqlite_error)?,
+                    None => transaction
+                        .execute(
+                            "UPDATE provider_cursors
+                             SET cursor = ?1, updated_at = CURRENT_TIMESTAMP
+                             WHERE provider = ?2 AND cursor IS NULL",
+                            params![&next, &stream_id],
+                        )
+                        .map_err(provider_cursor_sqlite_error)?,
+                };
+                if updated != 1 {
+                    return Err(StoreError::CursorConflict {
+                        resource: "provider cursor",
+                    });
+                }
+            }
         }
+        transaction.commit().map_err(provider_cursor_sqlite_error)?;
         Ok(())
     }
 
@@ -6657,8 +6701,20 @@ fn parse_message_timestamp_text(value: String) -> StoreResult<String> {
 }
 
 fn validate_message_identifier(value: String, field: &'static str) -> StoreResult<String> {
+    validate_machine_identifier_with_limit(value, field, MAX_MESSAGE_ID_LENGTH)
+}
+
+fn validate_provider_cursor_identifier(value: String, field: &'static str) -> StoreResult<String> {
+    validate_machine_identifier_with_limit(value, field, MAX_PROVIDER_CURSOR_LENGTH)
+}
+
+fn validate_machine_identifier_with_limit(
+    value: String,
+    field: &'static str,
+    maximum_length: usize,
+) -> StoreResult<String> {
     if value.is_empty()
-        || value.len() > MAX_MESSAGE_ID_LENGTH
+        || value.len() > maximum_length
         || value.chars().any(char::is_whitespace)
         || value.chars().any(char::is_control)
         || !value
@@ -6668,6 +6724,24 @@ fn validate_message_identifier(value: String, field: &'static str) -> StoreResul
         return Err(StoreError::InvalidInput { field });
     }
     Ok(value)
+}
+
+fn load_provider_cursor_row(
+    transaction: &Transaction<'_>,
+    stream_id: &str,
+) -> StoreResult<Option<Option<String>>> {
+    transaction
+        .query_row(
+            "SELECT cursor FROM provider_cursors WHERE provider = ?1",
+            params![stream_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(provider_cursor_sqlite_error)
+}
+
+fn provider_cursor_sqlite_error(_: rusqlite::Error) -> StoreError {
+    StoreError::Sqlite(rusqlite::Error::InvalidQuery)
 }
 
 fn validate_task_identifier(value: String, field: &'static str) -> StoreResult<String> {
