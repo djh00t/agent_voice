@@ -125,7 +125,7 @@ impl From<WriterFault> for FaultStage {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 unsafe extern "C" {
     fn renameat2(
         old_directory: std::os::raw::c_int,
@@ -138,13 +138,6 @@ unsafe extern "C" {
 
 #[cfg(unix)]
 unsafe extern "C" {
-    fn linkat(
-        old_directory: std::os::raw::c_int,
-        old_path: *const std::os::raw::c_char,
-        new_directory: std::os::raw::c_int,
-        new_path: *const std::os::raw::c_char,
-        flags: std::os::raw::c_int,
-    ) -> std::os::raw::c_int;
     fn openat(
         directory: std::os::raw::c_int,
         path: *const std::os::raw::c_char,
@@ -155,6 +148,17 @@ unsafe extern "C" {
         directory: std::os::raw::c_int,
         path: *const std::os::raw::c_char,
         flags: std::os::raw::c_int,
+    ) -> std::os::raw::c_int;
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe extern "C" {
+    fn renameatx_np(
+        old_directory: std::os::raw::c_int,
+        old_path: *const std::os::raw::c_char,
+        new_directory: std::os::raw::c_int,
+        new_path: *const std::os::raw::c_char,
+        flags: std::os::raw::c_uint,
     ) -> std::os::raw::c_int;
 }
 
@@ -292,25 +296,28 @@ fn publish_without_replacement_owned(
         return Err(io::Error::other("temporary file identity changed"));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        match rename_without_replacement_linux(parent, &source_name, &destination_name) {
-            Ok(()) => return Ok(()),
-            Err(error) if rename_noreplace_unavailable(&error) => {}
-            Err(error) => return Err(error),
-        }
+        rename_without_replacement_linux(parent, &source_name, &destination_name)
     }
 
-    link_without_replacement(parent, &source_name, &destination_name)?;
-    if !path_matches_identity_at(parent, &source_name, source_identity) {
-        let _ = unlink_at(parent, &destination_name);
-        return Err(io::Error::other("temporary file identity changed"));
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        rename_without_replacement_darwin(parent, &source_name, &destination_name)
     }
-    if let Err(error) = unlink_at(parent, &source_name) {
-        let _ = unlink_at(parent, &destination_name);
-        return Err(error);
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    {
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "atomic no-replace publication is unavailable on this platform",
+        ))
     }
-    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -326,7 +333,7 @@ fn publish_without_replacement_owned(
     ))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn rename_without_replacement_linux(
     parent: &File,
     source: &CStr,
@@ -350,9 +357,29 @@ fn rename_without_replacement_linux(
     }
 }
 
-#[cfg(target_os = "linux")]
-fn rename_noreplace_unavailable(error: &io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(22 | 38 | 95))
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn rename_without_replacement_darwin(
+    parent: &File,
+    source: &CStr,
+    destination: &CStr,
+) -> io::Result<()> {
+    const RENAME_EXCL: std::os::raw::c_uint = 0x00000004;
+    const RENAME_NOFOLLOW_ANY: std::os::raw::c_uint = 0x00000010;
+
+    let result = unsafe {
+        renameatx_np(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            RENAME_EXCL | RENAME_NOFOLLOW_ANY,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[cfg(unix)]
@@ -368,7 +395,8 @@ fn path_name(path: &Path) -> io::Result<CString> {
 
 #[cfg(unix)]
 fn open_at(parent: &File, name: &CStr) -> io::Result<File> {
-    let descriptor = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), 0, 0) };
+    let flags = no_follow_open_flags()?;
+    let descriptor = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags, 0) };
     if descriptor < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -376,20 +404,26 @@ fn open_at(parent: &File, name: &CStr) -> io::Result<File> {
 }
 
 #[cfg(unix)]
-fn link_without_replacement(parent: &File, source: &CStr, destination: &CStr) -> io::Result<()> {
-    let result = unsafe {
-        linkat(
-            parent.as_raw_fd(),
-            source.as_ptr(),
-            parent.as_raw_fd(),
-            destination.as_ptr(),
-            0,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+fn no_follow_open_flags() -> io::Result<std::os::raw::c_int> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        Ok(0o400000 | 0o4000)
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        Ok(0x100 | 0x4)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    {
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "no-follow directory entry access is unavailable on this platform",
+        ))
     }
 }
 
@@ -666,6 +700,13 @@ fn sync_parent_directory(_parent: &File) -> io::Result<()> {
 mod tests {
     use std::error::Error;
     use std::fs;
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    use std::os::unix::fs::symlink;
     #[cfg(unix)]
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -761,12 +802,22 @@ mod tests {
             .expect("writer test lock is not poisoned")
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     fn published_or_directory_sync(result: Result<(), WriterError>) {
         assert_eq!(result, Ok(()));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn atomic_writer_contract() {
         let _lock = lock_tests();
@@ -819,7 +870,12 @@ mod tests {
         assert!(directory.temporary_entries().is_empty());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn pre_rename_faults_remove_only_their_temporary_sibling() {
         let _lock = lock_tests();
@@ -846,7 +902,12 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn directory_sync_fault_leaves_complete_bytes_without_a_temporary_sibling() {
         let _lock = lock_tests();
@@ -868,7 +929,12 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn a_failed_attempt_can_retry_the_same_bytes_at_a_new_destination() {
         let _lock = lock_tests();
@@ -891,7 +957,12 @@ mod tests {
         assert!(directory.temporary_entries().is_empty());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn create_new_collision_preserves_the_foreign_sibling() {
         let _lock = lock_tests();
@@ -915,7 +986,12 @@ mod tests {
         assert!(directory.temporary_entries().is_empty());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn no_replace_publication_preserves_an_existing_destination() {
         let _lock = lock_tests();
@@ -935,7 +1011,41 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn source_symlink_is_not_published() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let source = directory.destination("source.tmp");
+        let alias = directory.destination("source-alias.tmp");
+        let destination = directory.destination("destination.bin");
+        fs::write(&alias, SNAPSHOT).expect("source bytes");
+        symlink(&alias, &source).expect("replace source with symlink");
+
+        let result = super::publish_without_replacement(&source, &destination);
+
+        assert!(result.is_err(), "source symlink must fail publication");
+        assert!(!destination.exists());
+        assert!(
+            fs::symlink_metadata(&source)
+                .expect("source symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&alias).expect("aliased source remains"), SNAPSHOT);
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn concurrent_destination_creation_is_not_replaced() {
         let _lock = lock_tests();
@@ -962,7 +1072,12 @@ mod tests {
         assert!(directory.temporary_entries().is_empty());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn generated_temporary_sibling_never_equals_the_destination() {
         let _lock = lock_tests();
@@ -1010,7 +1125,12 @@ mod tests {
         assert!(directory.temporary_entries().is_empty());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn replaced_temporary_sibling_is_not_published_or_deleted() {
         let _lock = lock_tests();
@@ -1045,7 +1165,58 @@ mod tests {
         assert_eq!(directory.temporary_entries().len(), 1);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn replaced_temporary_symlink_is_not_published_or_deleted() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let destination = directory.destination("destination.bin");
+        let alias = directory.destination("temporary-alias.tmp");
+        let barrier = Arc::new(Barrier::new(2));
+        super::set_publication_barrier(Some(Arc::clone(&barrier)));
+
+        let writer_destination = destination.clone();
+        let writer =
+            std::thread::spawn(move || AtomicSnapshotWriter::write(&writer_destination, SNAPSHOT));
+        barrier.wait();
+        let entries = directory.temporary_entries();
+        assert_eq!(entries.len(), 1, "writer should own one temporary sibling");
+        let temporary = entries
+            .into_iter()
+            .next()
+            .expect("writer temporary sibling exists");
+        fs::hard_link(&temporary, &alias).expect("retain temporary identity as an alias");
+        fs::remove_file(&temporary).expect("remove writer temporary sibling");
+        symlink(&alias, &temporary).expect("replace writer temporary sibling with symlink");
+        barrier.wait();
+
+        let result = writer.join().expect("writer thread completes");
+        super::set_publication_barrier(None);
+        assert_eq!(result, Err(WriterError::Rename));
+        assert!(!destination.exists());
+        assert!(
+            fs::symlink_metadata(&temporary)
+                .expect("foreign symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read(&alias).expect("aliased snapshot remains"),
+            SNAPSHOT
+        );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn validated_parent_handle_pins_publication() {
         let _lock = lock_tests();
@@ -1099,7 +1270,12 @@ mod tests {
         fs::remove_dir(&moved).expect("remove moved parent");
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
     #[test]
     fn writer_fails_closed_before_temporary_creation_on_unsupported_platform() {
         let _lock = lock_tests();
