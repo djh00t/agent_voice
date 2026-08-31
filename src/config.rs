@@ -80,9 +80,13 @@ impl AppConfig {
 
             if indent == 0 && trimmed.starts_with("backup:") {
                 backup_indent = Some(indent);
-                if let Some(entries) = trimmed
-                    .strip_prefix("backup:")
-                    .map(str::trim)
+                let flow_value = trimmed.strip_prefix("backup:").map(str::trim).map(|value| {
+                    value
+                        .split_once('#')
+                        .map_or(value, |(value, _)| value)
+                        .trim()
+                });
+                if let Some(entries) = flow_value
                     .and_then(|value| value.strip_prefix('{'))
                     .and_then(|value| value.strip_suffix('}'))
                 {
@@ -4030,6 +4034,25 @@ agent_api:
             );
             assert_backup_policy_load_error(yaml, expected, literal, "flow");
         }
+    }
+
+    #[test]
+    fn app_config_load_rejects_flow_policy_literal_followed_by_comment() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml =
+            replace_backup_yaml_mapping(&base_yaml, "backup: { retention_days: +30 } # policy");
+
+        assert_backup_policy_load_error(
+            yaml,
+            "backup.retention_days: invalid_retention",
+            "+30",
+            "flow-comment",
+        );
     }
 
     #[test]
