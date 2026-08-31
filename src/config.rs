@@ -3485,13 +3485,15 @@ agent_api:
         .to_string();
         assert!(!unknown.contains("do-not-log-this"));
 
-        let mut backup = BackupConfig::default();
-        backup.enabled = true;
-        backup.bucket = "sentinel-bucket".to_string();
-        backup.prefix = "sentinel-prefix".to_string();
-        backup.region = "sentinel-region".to_string();
-        backup.endpoint = Some("https://sentinel.example.test/".to_string());
-        backup.temp_dir = PathBuf::from("sentinel-temp-dir");
+        let backup = BackupConfig {
+            enabled: true,
+            bucket: "sentinel-bucket".to_string(),
+            prefix: "sentinel-prefix".to_string(),
+            region: "sentinel-region".to_string(),
+            endpoint: Some("https://sentinel.example.test/".to_string()),
+            temp_dir: PathBuf::from("sentinel-temp-dir"),
+            ..BackupConfig::default()
+        };
         let debug = format!("{backup:?}");
         for sentinel in [
             "sentinel-bucket",
@@ -3513,8 +3515,10 @@ agent_api:
         assert!(backup.normalize_and_validate_for_test().is_ok());
         assert!(backup.normalize_and_validate().is_err());
 
-        let mut blank = BackupConfig::default();
-        blank.enabled = true;
+        let mut blank = BackupConfig {
+            enabled: true,
+            ..BackupConfig::default()
+        };
         assert!(blank.normalize_and_validate().is_err());
         assert!(AppConfig::default().backup.normalize_and_validate().is_ok());
 
