@@ -10,7 +10,7 @@ use serde::de::{Error as DeError, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use time::{Time, format_description::FormatItem, macros::format_description};
 
-use crate::pa::store::{PaStore, StoreError, StoreResult};
+use crate::pa::store::{MAX_TASK_DURATION_MINUTES, PaStore, StoreError, StoreResult};
 
 const CONFIGURATION_ID: i64 = 1;
 const MODEL_MAX_BYTES: usize = 128;
@@ -163,7 +163,7 @@ impl TaskDurationsPatch {
             (self.preparation, "task_duration_preparation_minutes"),
         ] {
             if let Some(value) = value {
-                validate_positive(value, field)?;
+                validate_task_duration_minutes(value, field)?;
             }
         }
         Ok(())
@@ -722,7 +722,7 @@ fn validate_config(config: &AdminConfig) -> StoreResult<()> {
             "task_duration_preparation_minutes",
         ),
     ] {
-        validate_positive(value, field)?;
+        validate_task_duration_minutes(value, field)?;
     }
     validate_model(&config.model, "model")?;
     if canonical_timestamp(&config.updated_at).is_none() {
@@ -809,6 +809,15 @@ fn validate_non_negative(value: i64, field: &'static str) -> StoreResult<()> {
 
 fn validate_positive(value: i64, field: &'static str) -> StoreResult<()> {
     if value < 1 {
+        Err(invalid(field))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_task_duration_minutes(value: i64, field: &'static str) -> StoreResult<()> {
+    validate_positive(value, field)?;
+    if value > MAX_TASK_DURATION_MINUTES {
         Err(invalid(field))
     } else {
         Ok(())
