@@ -27,6 +27,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub accounting: AccountingConfig,
     #[serde(default)]
+    pub backup: BackupConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
 }
 
@@ -44,7 +46,11 @@ impl AppConfig {
             }
             None => Self::default(),
         };
-        config.apply_env_overrides_from_map(&std::env::vars().collect());
+        let env = std::env::vars().collect();
+        config.apply_env_overrides_from_map(&env)?;
+        let mut backup = config.backup.clone();
+        backup.normalize_and_validate()?;
+        config.backup = backup;
         let mut oauth = config.agent_api.oauth.clone();
         oauth.normalize_and_validate()?;
         config.agent_api.oauth = oauth;
@@ -63,7 +69,10 @@ impl AppConfig {
         .find(|candidate| candidate.exists())
     }
 
-    fn apply_env_overrides_from_map(&mut self, env: &std::collections::HashMap<String, String>) {
+    fn apply_env_overrides_from_map(
+        &mut self,
+        env: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
         apply_string(env, "SIP_USERNAME", &mut self.sip.username);
         apply_string(env, "SIP_PASSWORD", &mut self.sip.password);
         apply_string(env, "SIP_HOST", &mut self.sip.host);
@@ -396,6 +405,8 @@ impl AppConfig {
             &mut self.accounting.refresh_pricing_on_startup,
         );
         apply_string(env, "AGENT_VOICE_LOG_LEVEL", &mut self.logging.level);
+        self.backup.apply_env_overrides_from_map(env)?;
+        Ok(())
     }
 
     fn sync_legacy_openai_sections(&mut self) {
@@ -491,6 +502,347 @@ impl AppConfig {
         }
         config
     }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+/// Validated destination and freshness policy for encrypted backups.
+pub struct BackupConfig {
+    #[serde(default = "default_backup_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default = "default_backup_prefix")]
+    pub prefix: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "default_backup_retention_days")]
+    pub retention_days: u16,
+    #[serde(default = "default_backup_temp_dir")]
+    pub temp_dir: PathBuf,
+    #[serde(default = "default_backup_max_age_hours")]
+    pub max_age_hours: u32,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_backup_enabled(),
+            bucket: String::new(),
+            prefix: default_backup_prefix(),
+            region: String::new(),
+            endpoint: None,
+            retention_days: default_backup_retention_days(),
+            temp_dir: default_backup_temp_dir(),
+            max_age_hours: default_backup_max_age_hours(),
+        }
+    }
+}
+
+impl fmt::Debug for BackupConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let marker = |value: &str| {
+            if value.is_empty() {
+                "absent"
+            } else {
+                "[REDACTED]"
+            }
+        };
+        formatter
+            .debug_struct("BackupConfig")
+            .field("enabled", &self.enabled)
+            .field("bucket", &marker(&self.bucket))
+            .field("prefix", &marker(&self.prefix))
+            .field("region", &marker(&self.region))
+            .field(
+                "endpoint",
+                &self
+                    .endpoint
+                    .as_ref()
+                    .map(|_| "[REDACTED]")
+                    .unwrap_or("absent"),
+            )
+            .field("retention_days", &self.retention_days)
+            .field(
+                "temp_dir",
+                &if self.temp_dir.as_os_str().is_empty() {
+                    "absent"
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .field("max_age_hours", &self.max_age_hours)
+            .finish()
+    }
+}
+
+impl BackupConfig {
+    fn apply_env_overrides_from_map(
+        &mut self,
+        env: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let mut updated = self.clone();
+        if let Some(value) = env.get("BACKUP_ENABLED") {
+            let value = normalize_env_value(value);
+            updated.enabled = parse_backup_bool(value)?;
+        }
+        if let Some(value) = env.get("BACKUP_BUCKET") {
+            updated.bucket = require_backup_env_value("bucket", value)?;
+        }
+        if let Some(value) = env.get("BACKUP_PREFIX") {
+            updated.prefix = require_backup_env_value("prefix", value)?;
+        }
+        if let Some(value) = env.get("BACKUP_REGION") {
+            updated.region = require_backup_env_value("region", value)?;
+        }
+        if let Some(value) = env.get("BACKUP_ENDPOINT") {
+            updated.endpoint = Some(require_backup_env_value("endpoint", value)?);
+        }
+        if let Some(value) = env.get("BACKUP_RETENTION_DAYS") {
+            updated.retention_days = parse_backup_retention(value)?;
+        }
+        if let Some(value) = env.get("BACKUP_TEMP_DIR") {
+            updated.temp_dir = PathBuf::from(require_backup_env_value("temp_dir", value)?);
+        }
+        if let Some(value) = env.get("BACKUP_MAX_AGE_HOURS") {
+            updated.max_age_hours = parse_backup_max_age(value)?;
+        }
+        *self = updated;
+        Ok(())
+    }
+
+    fn normalize_and_validate(&mut self) -> Result<()> {
+        self.normalize_and_validate_with_loopback(false)
+    }
+
+    #[cfg(test)]
+    fn normalize_and_validate_for_test(&mut self) -> Result<()> {
+        self.normalize_and_validate_with_loopback(true)
+    }
+
+    fn normalize_and_validate_with_loopback(&mut self, allow_loopback_http: bool) -> Result<()> {
+        let normalized = self.clone();
+        normalized.validate(allow_loopback_http)?;
+        *self = normalized;
+        Ok(())
+    }
+
+    fn validate(&self, allow_loopback_http: bool) -> Result<()> {
+        if self.bucket.is_empty() {
+            if self.enabled {
+                return Err(backup_error("bucket", "missing_required"));
+            }
+        } else {
+            validate_backup_bucket(&self.bucket)?;
+        }
+
+        if self.region.is_empty() {
+            if self.enabled {
+                return Err(backup_error("region", "missing_required"));
+            }
+        } else {
+            validate_backup_region(&self.region)?;
+        }
+
+        validate_backup_prefix(&self.prefix)?;
+        validate_backup_endpoint(self.endpoint.as_deref(), allow_loopback_http)?;
+        if !(1..=3650).contains(&self.retention_days) {
+            return Err(backup_error("retention_days", "invalid_retention"));
+        }
+        if !(1..=168).contains(&self.max_age_hours) {
+            return Err(backup_error("max_age_hours", "invalid_max_age"));
+        }
+        validate_backup_temp_dir(&self.temp_dir)
+    }
+}
+
+fn backup_error(field: &str, code: &str) -> anyhow::Error {
+    anyhow::anyhow!("backup.{field}: {code}")
+}
+
+fn require_backup_env_value(field: &str, value: &str) -> Result<String> {
+    let normalized = normalize_env_value(value);
+    if normalized.trim().is_empty() {
+        return Err(backup_error(field, &format!("invalid_{field}")));
+    }
+    Ok(normalized.to_string())
+}
+
+fn parse_backup_bool(value: &str) -> Result<bool> {
+    parse_bool(value).ok_or_else(|| backup_error("enabled", "invalid_enabled"))
+}
+
+fn parse_backup_retention(value: &str) -> Result<u16> {
+    let parsed = parse_backup_number("retention", value)?;
+    if (1..=3650).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(backup_error("retention_days", "invalid_retention"))
+    }
+}
+
+fn parse_backup_max_age(value: &str) -> Result<u32> {
+    let parsed = parse_backup_number("max_age", value)?;
+    if (1..=168).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(backup_error("max_age_hours", "invalid_max_age"))
+    }
+}
+
+fn parse_backup_number<T>(field: &str, value: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+{
+    let normalized = normalize_env_value(value);
+    if normalized.is_empty() || !normalized.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(backup_error(field, &format!("invalid_{field}")));
+    }
+    normalized
+        .parse::<T>()
+        .map_err(|_| backup_error(field, &format!("invalid_{field}")))
+}
+
+fn validate_backup_bucket(bucket: &str) -> Result<()> {
+    let bytes = bucket.as_bytes();
+    if !(3..=63).contains(&bytes.len())
+        || !bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+        })
+        || !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        || bucket.contains("..")
+        || bucket.contains("-.")
+        || bucket.contains(".-")
+        || is_ipv4_shaped(bucket)
+    {
+        return Err(backup_error("bucket", "invalid_bucket"));
+    }
+    Ok(())
+}
+
+fn is_ipv4_shaped(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts.iter().all(|part| {
+            !part.is_empty() && part.len() <= 3 && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn validate_backup_region(region: &str) -> Result<()> {
+    let bytes = region.as_bytes();
+    if !(1..=63).contains(&bytes.len())
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        || !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err(backup_error("region", "invalid_region"));
+    }
+    Ok(())
+}
+
+fn validate_backup_prefix(prefix: &str) -> Result<()> {
+    let bytes = prefix.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 256
+        || prefix.starts_with('/')
+        || prefix.ends_with('/')
+        || prefix.contains("//")
+        || prefix.contains('\\')
+        || prefix.contains('?')
+        || prefix.contains('#')
+        || bytes.iter().any(|byte| byte.is_ascii_control())
+    {
+        return Err(backup_error("prefix", "invalid_prefix"));
+    }
+    for component in prefix.split('/') {
+        if component == "."
+            || component == ".."
+            || component.is_empty()
+            || !component.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~')
+            })
+        {
+            return Err(backup_error("prefix", "invalid_prefix"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_backup_endpoint(endpoint: Option<&str>, allow_loopback_http: bool) -> Result<()> {
+    let Some(endpoint) = endpoint else {
+        return Ok(());
+    };
+    let url =
+        reqwest::Url::parse(endpoint).map_err(|_| backup_error("endpoint", "invalid_endpoint"))?;
+    let host = url
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| backup_error("endpoint", "invalid_endpoint"))?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(backup_error("endpoint", "invalid_endpoint"));
+    }
+
+    match url.scheme() {
+        "https" => {
+            if url.port().is_some_and(|port| port != 443) || !is_dns_host(host) {
+                return Err(backup_error("endpoint", "invalid_endpoint"));
+            }
+        }
+        "http" if allow_loopback_http && is_exact_loopback_host(host) => {}
+        _ => return Err(backup_error("endpoint", "invalid_endpoint")),
+    }
+    Ok(())
+}
+
+fn is_dns_host(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() || host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+fn is_exact_loopback_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn validate_backup_temp_dir(path: &Path) -> Result<()> {
+    let value = path
+        .to_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| backup_error("temp_dir", "invalid_temp_dir"))?;
+    if value.bytes().any(|byte| byte.is_ascii_control())
+        || path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(backup_error("temp_dir", "invalid_temp_dir"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1857,6 +2209,26 @@ const fn default_refresh_pricing_on_startup() -> bool {
     true
 }
 
+const fn default_backup_enabled() -> bool {
+    false
+}
+
+fn default_backup_prefix() -> String {
+    "backups".to_string()
+}
+
+const fn default_backup_retention_days() -> u16 {
+    30
+}
+
+fn default_backup_temp_dir() -> PathBuf {
+    PathBuf::from("./backup-tmp")
+}
+
+const fn default_backup_max_age_hours() -> u32 {
+    24
+}
+
 fn default_incoming_greeting_text() -> String {
     "Welcome".to_string()
 }
@@ -2274,7 +2646,7 @@ mod tests {
             ),
         ]);
 
-        config.apply_env_overrides_from_map(&env);
+        config.apply_env_overrides_from_map(&env).unwrap();
 
         assert_eq!(config.sip.username, "alice");
         assert_eq!(config.sip.password, "secret");
@@ -2330,7 +2702,7 @@ mod tests {
             ("INCOMING_ANSWER_DELAY_MS".to_string(), "'2000'".to_string()),
         ]);
 
-        config.apply_env_overrides_from_map(&env);
+        config.apply_env_overrides_from_map(&env).unwrap();
 
         assert_eq!(config.sip.username, "alice");
         assert_eq!(config.openai.api_key(), "sk-test");
@@ -2365,7 +2737,7 @@ mod tests {
             ),
         ]);
 
-        config.apply_env_overrides_from_map(&env);
+        config.apply_env_overrides_from_map(&env).unwrap();
 
         assert_eq!(config.speech.stt_provider, SpeechProvider::SherpaOnnx);
         assert_eq!(config.speech.tts_provider, SpeechProvider::SherpaOnnx);
@@ -2388,7 +2760,7 @@ mod tests {
             ("OPENAI_VOICE_NAME".to_string(), "alloy".to_string()),
         ]);
 
-        config.apply_env_overrides_from_map(&env);
+        config.apply_env_overrides_from_map(&env).unwrap();
 
         assert_eq!(config.llm.provider, LlmProvider::None);
         assert_eq!(config.voice.provider, VoiceProvider::OpenAi);
@@ -2421,7 +2793,7 @@ model: gpt-realtime-2.1
                 "gpt-realtime-2.1".to_string(),
             ),
         ]);
-        config.apply_env_overrides_from_map(&env);
+        config.apply_env_overrides_from_map(&env).unwrap();
         let serialized = serde_yaml::to_value(&config.voice.openai).unwrap();
         assert_eq!(serialized["transport"], "realtime");
         assert_eq!(config.voice.openai.model, "gpt-realtime-2.1");
@@ -2995,5 +3367,170 @@ agent_api:
         for placeholder in placeholders {
             assert_eq!(example.matches(placeholder).count(), 1);
         }
+    }
+
+    #[test]
+    fn backup_config_contract() {
+        let mut backup = BackupConfig {
+            enabled: true,
+            bucket: "agent-voice-test".to_string(),
+            prefix: "snapshots/pa".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("https://s3.example.test/".to_string()),
+            retention_days: 30,
+            temp_dir: PathBuf::from("./backup-tmp"),
+            max_age_hours: 24,
+        };
+
+        backup.normalize_and_validate().unwrap();
+        let round_trip: BackupConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&backup).unwrap()).unwrap();
+        assert_eq!(round_trip, backup);
+    }
+
+    #[test]
+    fn backup_config_defaults_disabled_and_safe() {
+        let mut backup = BackupConfig::default();
+
+        assert!(!backup.enabled);
+        assert!(backup.bucket.is_empty());
+        assert_eq!(backup.prefix, "backups");
+        assert!(backup.region.is_empty());
+        assert_eq!(backup.endpoint, None);
+        assert_eq!(backup.retention_days, 30);
+        assert_eq!(backup.temp_dir, PathBuf::from("./backup-tmp"));
+        assert_eq!(backup.max_age_hours, 24);
+        backup.normalize_and_validate().unwrap();
+        assert_eq!(AppConfig::default().backup, backup);
+    }
+
+    #[test]
+    fn backup_config_env_overrides_are_strict_and_normalized() {
+        let mut backup = BackupConfig::default();
+        let env = HashMap::from([
+            ("BACKUP_ENABLED".to_string(), " 'true' ".to_string()),
+            (
+                "BACKUP_BUCKET".to_string(),
+                " agent-voice-test ".to_string(),
+            ),
+            ("BACKUP_PREFIX".to_string(), " 'snapshots/pa' ".to_string()),
+            ("BACKUP_REGION".to_string(), "us-east-1".to_string()),
+            (
+                "BACKUP_ENDPOINT".to_string(),
+                "https://s3.example.test/".to_string(),
+            ),
+            ("BACKUP_RETENTION_DAYS".to_string(), "30".to_string()),
+            ("BACKUP_TEMP_DIR".to_string(), "./backup-tmp".to_string()),
+            ("BACKUP_MAX_AGE_HOURS".to_string(), "24".to_string()),
+        ]);
+
+        backup.apply_env_overrides_from_map(&env).unwrap();
+        assert!(backup.enabled);
+        assert_eq!(backup.bucket, "agent-voice-test");
+        assert_eq!(backup.prefix, "snapshots/pa");
+        assert_eq!(backup.endpoint.as_deref(), Some("https://s3.example.test/"));
+        backup.normalize_and_validate().unwrap();
+
+        let before = backup.clone();
+        let invalid = HashMap::from([("BACKUP_RETENTION_DAYS".to_string(), "0".to_string())]);
+        assert!(backup.apply_env_overrides_from_map(&invalid).is_err());
+        assert_eq!(backup, before);
+    }
+
+    #[test]
+    fn backup_config_rejects_destination_escape_and_secrets() {
+        let invalid_values = [
+            ("bucket", "Agent-Voice-Test"),
+            ("bucket", "192.168.1.1"),
+            ("region", "us east 1"),
+            ("prefix", "/snapshots/pa"),
+            ("prefix", "snapshots/../pa"),
+            ("prefix", "snapshots//pa"),
+            ("endpoint", "http://s3.example.test/"),
+            ("endpoint", "https://user:password@s3.example.test/"),
+            ("temp_dir", "../backup-tmp"),
+        ];
+
+        for (field, value) in invalid_values {
+            let mut backup = BackupConfig {
+                enabled: true,
+                bucket: "agent-voice-test".to_string(),
+                prefix: "snapshots/pa".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some("https://s3.example.test/".to_string()),
+                retention_days: 30,
+                temp_dir: PathBuf::from("./backup-tmp"),
+                max_age_hours: 24,
+            };
+            match field {
+                "bucket" => backup.bucket = value.to_string(),
+                "region" => backup.region = value.to_string(),
+                "prefix" => backup.prefix = value.to_string(),
+                "endpoint" => backup.endpoint = Some(value.to_string()),
+                "temp_dir" => backup.temp_dir = PathBuf::from(value),
+                _ => unreachable!(),
+            }
+            let error = backup.normalize_and_validate().unwrap_err().to_string();
+            assert!(
+                error.contains("invalid_") || error.contains("missing_required"),
+                "unexpected error for {field}: {error}"
+            );
+            assert!(!error.contains(value));
+        }
+
+        let unknown = serde_yaml::from_str::<BackupConfig>(
+            "enabled: true\nbucket: agent-voice-test\nmaster_key: do-not-log-this\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!unknown.contains("do-not-log-this"));
+
+        let mut backup = BackupConfig::default();
+        backup.enabled = true;
+        backup.bucket = "sentinel-bucket".to_string();
+        backup.prefix = "sentinel-prefix".to_string();
+        backup.region = "sentinel-region".to_string();
+        backup.endpoint = Some("https://sentinel.example.test/".to_string());
+        backup.temp_dir = PathBuf::from("sentinel-temp-dir");
+        let debug = format!("{backup:?}");
+        for sentinel in [
+            "sentinel-bucket",
+            "sentinel-prefix",
+            "sentinel-region",
+            "sentinel.example.test",
+            "sentinel-temp-dir",
+        ] {
+            assert!(!debug.contains(sentinel));
+        }
+    }
+
+    #[test]
+    fn backup_config_snapshot_and_runtime_handoffs() {
+        let mut backup: BackupConfig = serde_yaml::from_str(
+            "enabled: true\nbucket: agent-voice-test\nprefix: snapshots/pa\nregion: us-east-1\nendpoint: http://127.0.0.1:8089/\nretention_days: 30\ntemp_dir: ./backup-tmp\nmax_age_hours: 24\n",
+        )
+        .unwrap();
+        assert!(backup.normalize_and_validate_for_test().is_ok());
+        assert!(backup.normalize_and_validate().is_err());
+
+        let mut blank = BackupConfig::default();
+        blank.enabled = true;
+        assert!(blank.normalize_and_validate().is_err());
+        assert!(AppConfig::default().backup.normalize_and_validate().is_ok());
+
+        let example = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/agent_voice.example.yaml"
+        ));
+        let yaml: serde_yaml::Value = serde_yaml::from_str(example).unwrap();
+        let example_backup = &yaml["backup"];
+        assert_eq!(example_backup["enabled"], false);
+        assert_eq!(example_backup["bucket"], "");
+        assert_eq!(example_backup["prefix"], "backups");
+        assert_eq!(example_backup["region"], "");
+        assert_eq!(example_backup["endpoint"], serde_yaml::Value::Null);
+        assert_eq!(example_backup["retention_days"], 30);
+        assert_eq!(example_backup["temp_dir"], "./backup-tmp");
+        assert_eq!(example_backup["max_age_hours"], 24);
     }
 }
