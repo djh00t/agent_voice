@@ -21,6 +21,7 @@ use oauth_start::{InMemoryOAuthStateStore, OAuthError, OAuthResult, OAuthStateSt
 
 const NOW: DateTime<Utc> = DateTime::from_timestamp(1_725_000_000, 0).unwrap();
 const EXPECTED_CODE: &str = "authorization-code with spaces";
+const EXPECTED_VERIFIER: &str = "reserved-verifier";
 const CALLBACK_SENTINEL: &str = "authorization-code-secret";
 
 fn callback(code: &str, state: &str) -> OAuthCallback {
@@ -70,6 +71,23 @@ fn valid_callback_returns_exact_code_and_consumes_state_once() {
             NOW,
         ),
         OAuthError::StateAlreadyUsed,
+    );
+}
+
+#[test]
+fn valid_callback_preserves_consumed_verifier_for_token_exchange() {
+    let mut store = reserved_store();
+    let authorization_code = oauth_callback::validate_callback(
+        &mut store,
+        callback(EXPECTED_CODE, "reserved-state"),
+        NOW,
+    )
+    .expect("valid callback");
+
+    assert_eq!(
+        authorization_code.verifier(),
+        EXPECTED_VERIFIER,
+        "consumed PKCE verifier was not preserved"
     );
 }
 
@@ -181,6 +199,14 @@ fn authorization_code_debug_and_display_are_fixed_and_redacted() {
     assert!(
         !display.contains(CALLBACK_SENTINEL),
         "display output leaked the code"
+    );
+    assert!(
+        !debug.contains(EXPECTED_VERIFIER),
+        "debug output leaked the PKCE verifier"
+    );
+    assert!(
+        !display.contains(EXPECTED_VERIFIER),
+        "display output leaked the PKCE verifier"
     );
 
     let callback_value = callback(CALLBACK_SENTINEL, "state-secret");
