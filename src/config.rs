@@ -132,7 +132,9 @@ impl AppConfig {
                 }
                 Some(_) => unreachable!("only YAML quote bytes are tracked"),
                 None => match byte {
-                    b'"' | b'\'' => quote = Some(byte),
+                    b'"' | b'\'' if Self::flow_quote_opens_at_scalar_start(value, start, index) => {
+                        quote = Some(byte)
+                    }
                     b',' => {
                         entries.push(&value[start..index]);
                         start = index + 1;
@@ -145,6 +147,14 @@ impl AppConfig {
 
         entries.push(&value[start..]);
         entries
+    }
+
+    fn flow_quote_opens_at_scalar_start(value: &str, start: usize, index: usize) -> bool {
+        let prefix = value[start..index].trim_start();
+        prefix.is_empty()
+            || prefix
+                .rsplit_once(':')
+                .is_some_and(|(_, value)| value.trim().is_empty())
     }
 
     fn backup_yaml_top_level_value(line: &str) -> Option<&str> {
@@ -4190,6 +4200,27 @@ agent_api:
             "backup.retention_days: invalid_retention",
             "+30",
             "flow-doubled-single-quote",
+        );
+    }
+
+    #[test]
+    fn app_config_load_rejects_flow_policy_literal_after_plain_apostrophe() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml = replace_backup_yaml_mapping(
+            &base_yaml,
+            "backup: { temp_dir: foo'bar, retention_days: +30 }",
+        );
+
+        assert_backup_policy_load_error(
+            yaml,
+            "backup.retention_days: invalid_retention",
+            "+30",
+            "flow-plain-apostrophe",
         );
     }
 
