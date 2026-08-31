@@ -311,16 +311,14 @@ fn proposal_from_row(row: &Row<'_>) -> rusqlite::Result<AdminProposal> {
 }
 
 fn read_failures(connection: &rusqlite::Connection) -> StoreResult<Vec<AdminFailure>> {
-    let unknown = connection
-        .query_row(
-            "SELECT id FROM audit_events WHERE event_type NOT IN ('message_recorded', 'request_submitted', 'owner_task_submitted', 'proposal_created', 'proposal_accepted', 'proposal_declined', 'proposal_expired', 'proposal_promoted', 'notification_enqueued', 'notification_sent', 'notification_retry_scheduled', 'provider_cursor_advanced') LIMIT 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
+    let mut validation = connection
+        .prepare("SELECT id, event_type, occurred_at FROM audit_events ORDER BY id DESC LIMIT ?1")
         .map_err(|_| invalid())?;
-    if unknown.is_some() {
-        return Err(invalid());
+    for row in validation
+        .query_map([LIMIT], audit_event_from_row)
+        .map_err(|_| invalid())?
+    {
+        row.map_err(|_| invalid())?;
     }
     let mut statement = connection
         .prepare("SELECT id, event_type, occurred_at FROM audit_events WHERE event_type = 'notification_retry_scheduled' ORDER BY id ASC LIMIT ?1")
