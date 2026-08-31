@@ -173,6 +173,10 @@ fn valid_object_key(object_key: &str) -> bool {
     !object_key.trim().is_empty()
         && object_key.len() <= 256
         && !object_key.chars().any(char::is_control)
+        && !object_key.starts_with('/')
+        && !object_key
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
 }
 
 fn valid_checksum_shape(checksum: &str) -> bool {
@@ -351,6 +355,18 @@ mod tests {
         );
         assert_eq!(
             derive_metadata(CIPHERTEXT, created_at(), "a".repeat(257)),
+            Err(MetadataError::InvalidObjectKey)
+        );
+        assert_eq!(
+            derive_metadata(CIPHERTEXT, created_at(), "/absolute"),
+            Err(MetadataError::InvalidObjectKey)
+        );
+        assert_eq!(
+            derive_metadata(CIPHERTEXT, created_at(), "backups/../outside"),
+            Err(MetadataError::InvalidObjectKey)
+        );
+        assert_eq!(
+            derive_metadata(CIPHERTEXT, created_at(), "backups/./snapshot"),
             Err(MetadataError::InvalidObjectKey)
         );
 
