@@ -325,6 +325,44 @@ fn state_store_purges_expired_entries_past_the_replay_window() {
 }
 
 #[test]
+fn state_store_keeps_only_bounded_replay_tombstones() {
+    let mut store = InMemoryOAuthStateStore::default();
+    let expires_at = now_plus(10);
+    store
+        .reserve("consumed", "discard-after-consume", expires_at)
+        .expect("consumed fixture reservation");
+    store
+        .reserve("expired", "discard-after-expiry", NOW)
+        .expect("expired fixture reservation");
+
+    assert_eq!(
+        store.consume("consumed", now_plus(1)),
+        Ok("discard-after-consume".to_owned())
+    );
+    assert_eq!(
+        store.reserve("consumed", "replacement", expires_at),
+        Err(OAuthError::StateAlreadyUsed)
+    );
+    assert!(
+        format!("{store:?}").contains("entry_count: 2"),
+        "consumption should retain only the replay tombstone"
+    );
+
+    store.purge_expired(expires_at);
+    assert!(
+        format!("{store:?}").contains("entry_count: 0"),
+        "expired entries should not accumulate"
+    );
+    store
+        .reserve("consumed", "replacement", expires_at)
+        .expect("state can be reused after its replay window");
+    assert_eq!(
+        store.consume("consumed", now_plus(1)),
+        Ok("replacement".to_owned())
+    );
+}
+
+#[test]
 fn begin_failure_from_duplicate_state_does_not_replace_existing_verifier() {
     let config = config_with_id(OAuthProvider::Microsoft, "client-id");
     let random = DeterministicRandom::new([[0x61; 32], [0x62; 32], [0x61; 32], [0x62; 32]]);
