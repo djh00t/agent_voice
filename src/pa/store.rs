@@ -643,7 +643,7 @@ impl fmt::Debug for StoredTask {
     }
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 14;
+const CURRENT_SCHEMA_VERSION: i64 = 15;
 const BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 struct Migration {
@@ -705,8 +705,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: apply_schema_v13,
     },
     Migration {
-        version: CURRENT_SCHEMA_VERSION,
+        version: 14,
         apply: apply_schema_v14,
+    },
+    Migration {
+        version: CURRENT_SCHEMA_VERSION,
+        apply: apply_schema_v15,
     },
 ];
 
@@ -8074,6 +8078,36 @@ CREATE INDEX IF NOT EXISTS idx_http_idempotency_records_lease_until
     Ok(())
 }
 
+fn apply_schema_v15(transaction: &Transaction<'_>) -> StoreResult<()> {
+    transaction.execute_batch(
+        r#"
+CREATE TABLE backup_operation_attempts (
+    id INTEGER PRIMARY KEY,
+    attempt_key TEXT NOT NULL UNIQUE,
+    operation TEXT NOT NULL CHECK (
+      operation IN ('snapshot_create', 'upload', 'restore_verify', 'retention')
+    ),
+    state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    error_code TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    CHECK (
+      (state = 'running' AND completed_at IS NULL AND error_code IS NULL)
+      OR
+      (state = 'succeeded' AND completed_at IS NOT NULL AND error_code IS NULL)
+      OR
+      (state = 'failed' AND completed_at IS NOT NULL AND error_code IS NOT NULL)
+    )
+);
+CREATE INDEX idx_backup_operation_attempts_operation_started
+    ON backup_operation_attempts(operation, started_at DESC, id DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Fixed scope for HTTP idempotency records.
 pub const HTTP_IDEMPOTENCY_SCOPE: &str = "pa-http-v1";
 /// Maximum byte length accepted for an HTTP idempotency scope.
@@ -9101,6 +9135,502 @@ END;
     }
 
     #[test]
+    fn migration_v15_adds_backup_attempt_schema() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open v15 store");
+        let schema_version: i64 = store
+            .connection()
+            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("schema version");
+        assert_eq!(schema_version, 15);
+
+        let columns = store
+            .connection()
+            .prepare("PRAGMA table_info('backup_operation_attempts')")
+            .expect("backup attempts table info")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .expect("backup attempts columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("backup attempts column rows");
+        assert_eq!(
+            columns,
+            vec![
+                ("id".to_owned(), "INTEGER".to_owned(), 0, None, 1),
+                ("attempt_key".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("operation".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("state".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("started_at".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("completed_at".to_owned(), "TEXT".to_owned(), 0, None, 0),
+                ("error_code".to_owned(), "TEXT".to_owned(), 0, None, 0),
+                (
+                    "created_at".to_owned(),
+                    "TEXT".to_owned(),
+                    1,
+                    Some("strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_owned()),
+                    0
+                ),
+                (
+                    "updated_at".to_owned(),
+                    "TEXT".to_owned(),
+                    1,
+                    Some("strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_owned()),
+                    0
+                ),
+            ]
+        );
+
+        assert_named_index(
+            &store,
+            "idx_backup_operation_attempts_operation_started",
+            "backup_operation_attempts",
+            &["operation", "started_at", "id"],
+        );
+        let index_columns = store
+            .connection()
+            .prepare("PRAGMA index_xinfo('idx_backup_operation_attempts_operation_started')")
+            .expect("backup attempts index info")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, i64>(5)? != 0,
+                ))
+            })
+            .expect("backup attempts index columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("backup attempts index column rows")
+            .into_iter()
+            .filter_map(|(name, is_descending, is_key)| {
+                is_key.then(|| (name.expect("key index column name"), is_descending))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            index_columns,
+            vec![
+                ("operation".to_owned(), false),
+                ("started_at".to_owned(), true),
+                ("id".to_owned(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn backup_attempt_schema_defaults_are_canonical_utc() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open v15 store");
+        store
+            .connection()
+            .execute(
+                "INSERT INTO backup_operation_attempts (
+                     attempt_key, operation, state, started_at
+                 ) VALUES ('default-timestamps', 'upload', 'running',
+                           '2026-09-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert row using timestamp defaults");
+        let defaults: (String, String) = store
+            .connection()
+            .query_row(
+                "SELECT created_at, updated_at
+                 FROM backup_operation_attempts
+                 WHERE attempt_key = 'default-timestamps'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read timestamp defaults");
+        for value in [defaults.0, defaults.1] {
+            assert_eq!(value.len(), 20, "canonical timestamps use whole seconds");
+            assert!(value.ends_with('Z'), "canonical timestamps are UTC");
+            let parsed =
+                OffsetDateTime::parse(&value, &Rfc3339).expect("default timestamp is RFC3339");
+            assert_eq!(parsed.offset(), UtcOffset::UTC);
+            assert_eq!(parsed.nanosecond(), 0);
+            assert_eq!(
+                parsed.format(&Rfc3339).expect("format timestamp"),
+                value,
+                "default timestamp is strict canonical RFC3339"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_v15_preserves_v14_rows_and_reopens_once() {
+        let database = TempDatabase::new();
+        let v14_migrations = &MIGRATIONS[..MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 15)
+            .expect("v15 migration")];
+        let table_row_counts = |connection: &Connection| {
+            let table_names = connection
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                     ORDER BY name",
+                )
+                .expect("v14 table names query")
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("v14 table name rows")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("v14 table names");
+            table_names
+                .into_iter()
+                .map(|table| {
+                    let count: i64 = connection
+                        .query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |row| {
+                            row.get(0)
+                        })
+                        .expect("v14 table row count");
+                    (table, count)
+                })
+                .collect::<Vec<_>>()
+        };
+        let v14_snapshot = {
+            let mut connection = Connection::open(&database.path).expect("open v14 database");
+            apply_sqlcipher_key(&connection, DATABASE_KEY).expect("apply SQLCipher key");
+            verify_sqlcipher(&connection).expect("verify SQLCipher");
+            connection
+                .pragma_update(None, "foreign_keys", true)
+                .expect("enable foreign keys");
+            run_migrations_with(&mut connection, v14_migrations).expect("apply v14 schema");
+            connection
+                .execute(
+                    "UPDATE configuration SET owner_email = ?1 WHERE id = 1",
+                    ["owner-v14@example.test"],
+                )
+                .expect("seed v14 configuration");
+            connection
+                .execute(
+                    "INSERT INTO http_idempotency_records (
+                         scope, idempotency_key, fingerprint, state, lease_generation,
+                         lease_until
+                     ) VALUES (?1, ?2, ?3, 'in_progress', 1, ?4)",
+                    rusqlite::params![
+                        "scope-v14",
+                        "key-v14",
+                        VALID_HTTP_FINGERPRINT,
+                        1_700_000_000_i64
+                    ],
+                )
+                .expect("seed v14 idempotency row");
+            let configuration: (Option<String>, String) = connection
+                .query_row(
+                    "SELECT owner_email, email_triage_model FROM configuration WHERE id = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("v14 configuration snapshot");
+            let idempotency: (String, String, String, String, i64, i64) = connection
+                .query_row(
+                    "SELECT scope, idempotency_key, fingerprint, state,
+                            lease_generation, lease_until
+                     FROM http_idempotency_records",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .expect("v14 idempotency snapshot");
+            (table_row_counts(&connection), configuration, idempotency)
+        };
+        let assert_v14_table_counts = |connection: &Connection| {
+            let actual = table_row_counts(connection);
+            for (table, before_count) in &v14_snapshot.0 {
+                let expected = if table == "schema_migrations" {
+                    *before_count + 1
+                } else {
+                    *before_count
+                };
+                assert_eq!(
+                    actual
+                        .iter()
+                        .find(|(name, _)| name == table)
+                        .map(|(_, count)| *count),
+                    Some(expected),
+                    "{table} row count changed"
+                );
+            }
+            assert_eq!(
+                actual
+                    .iter()
+                    .find(|(name, _)| name == "backup_operation_attempts")
+                    .map(|(_, count)| *count),
+                Some(0),
+                "new backup-attempt table must start empty"
+            );
+        };
+
+        {
+            let store = PaStore::open(&database.path, DATABASE_KEY).expect("migrate v14 store");
+            assert_v14_table_counts(store.connection());
+            assert_eq!(
+                store
+                    .connection()
+                    .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("migrated schema version"),
+                15
+            );
+            assert_eq!(
+                store
+                    .connection()
+                    .query_row(
+                        "SELECT owner_email, email_triage_model
+                         FROM configuration WHERE id = 1",
+                        [],
+                        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .expect("preserved configuration"),
+                v14_snapshot.1
+            );
+            assert_eq!(
+                store
+                    .connection()
+                    .query_row(
+                        "SELECT scope, idempotency_key, fingerprint, state,
+                                lease_generation, lease_until
+                         FROM http_idempotency_records",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, i64>(5)?,
+                            ))
+                        },
+                    )
+                    .expect("preserved idempotency row"),
+                v14_snapshot.2
+            );
+            assert_eq!(
+                store
+                    .connection()
+                    .query_row(
+                        "SELECT count(*) FROM schema_migrations WHERE version = 15",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("v15 migration count"),
+                1
+            );
+        }
+
+        let reopened = PaStore::open(&database.path, DATABASE_KEY).expect("reopen v15 store");
+        assert_v14_table_counts(reopened.connection());
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("reopened migration count"),
+            15
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'backup_operation_attempts'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("backup attempts table count"),
+            1
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT owner_email, email_triage_model
+                     FROM configuration WHERE id = 1",
+                    [],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("reopened preserved configuration"),
+            v14_snapshot.1
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT scope, idempotency_key, fingerprint, state,
+                            lease_generation, lease_until
+                     FROM http_idempotency_records",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .expect("reopened preserved idempotency row"),
+            v14_snapshot.2
+        );
+    }
+
+    #[test]
+    fn backup_attempt_schema_rejects_invalid_state_rows() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open v15 store");
+        let insert = |attempt_key: &str,
+                      operation: &str,
+                      state: &str,
+                      completed_at: Option<&str>,
+                      error_code: Option<&str>| {
+            store.connection().execute(
+                "INSERT INTO backup_operation_attempts (
+                     attempt_key, operation, state, started_at, completed_at, error_code
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    attempt_key,
+                    operation,
+                    state,
+                    "2026-09-01T00:00:00Z",
+                    completed_at,
+                    error_code
+                ],
+            )
+        };
+
+        for (index, operation) in ["snapshot_create", "upload", "restore_verify", "retention"]
+            .into_iter()
+            .enumerate()
+        {
+            insert(
+                &format!("valid-running-{index}"),
+                operation,
+                "running",
+                None,
+                None,
+            )
+            .expect("valid running row");
+            insert(
+                &format!("valid-succeeded-{index}"),
+                operation,
+                "succeeded",
+                Some("2026-09-01T00:01:00Z"),
+                None,
+            )
+            .expect("valid succeeded row");
+            insert(
+                &format!("valid-failed-{index}"),
+                operation,
+                "failed",
+                Some("2026-09-01T00:02:00Z"),
+                Some("provider_error"),
+            )
+            .expect("valid failed row");
+        }
+
+        for (attempt_key, operation, state, completed_at, error_code) in [
+            ("invalid-operation", "unknown", "running", None, None),
+            ("invalid-state", "upload", "paused", None, None),
+            (
+                "running-completed",
+                "upload",
+                "running",
+                Some("2026-09-01T00:01:00Z"),
+                None,
+            ),
+            (
+                "running-error",
+                "upload",
+                "running",
+                None,
+                Some("provider_error"),
+            ),
+            ("succeeded-incomplete", "upload", "succeeded", None, None),
+            (
+                "succeeded-error",
+                "upload",
+                "succeeded",
+                Some("2026-09-01T00:01:00Z"),
+                Some("provider_error"),
+            ),
+            (
+                "failed-incomplete",
+                "upload",
+                "failed",
+                None,
+                Some("provider_error"),
+            ),
+            (
+                "failed-without-error",
+                "upload",
+                "failed",
+                Some("2026-09-01T00:01:00Z"),
+                None,
+            ),
+        ] {
+            assert!(
+                insert(attempt_key, operation, state, completed_at, error_code).is_err(),
+                "{attempt_key} must be rejected"
+            );
+        }
+        assert!(insert("duplicate-attempt-key", "upload", "running", None, None).is_ok());
+        assert!(insert("duplicate-attempt-key", "upload", "running", None, None).is_err());
+
+        assert_eq!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM backup_operation_attempts",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .expect("valid backup attempts remain"),
+            13
+        );
+    }
+
+    #[test]
+    fn migrations_record_every_version_once() {
+        let mut connection = keyed_connection_for_migration_test();
+        run_migrations_with(&mut connection, MIGRATIONS).expect("apply v15 schema");
+        run_migrations_with(&mut connection, MIGRATIONS).expect("reapply v15 schema");
+
+        let versions: Vec<i64> = connection
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .expect("migration versions query")
+            .query_map([], |row| row.get(0))
+            .expect("migration version rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("migration versions");
+        assert_eq!(versions, (1..=15).collect::<Vec<_>>());
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("migration count"),
+            15
+        );
+    }
+
+    #[test]
     fn http_idempotency_v14_migration_creates_schema() {
         let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
         let schema_version: i64 = store
@@ -9109,7 +9639,7 @@ END;
                 row.get(0)
             })
             .expect("schema version");
-        assert_eq!(schema_version, 14);
+        assert_eq!(schema_version, CURRENT_SCHEMA_VERSION);
 
         let table_sql: String = store
             .connection()
@@ -10167,11 +10697,11 @@ END;
             snapshots.push(snapshot(&store));
         }
 
-        assert_eq!(snapshots[0].0, v13_table_count + 1);
+        assert_eq!(snapshots[0].0, v13_table_count + 2);
         assert_eq!(snapshots[0].2, 1);
         assert_eq!(snapshots[0].3, 1);
         assert_eq!(snapshots[0].4, 1);
-        assert_eq!(snapshots[0].5, 14);
+        assert_eq!(snapshots[0].5, CURRENT_SCHEMA_VERSION);
         assert_eq!(snapshots[0], snapshots[1]);
         assert_eq!(snapshots[1], snapshots[2]);
     }
@@ -10227,14 +10757,14 @@ END;
                 row.get(0)
             })
             .expect("schema version");
-        assert_eq!(schema_version, 14);
+        assert_eq!(schema_version, CURRENT_SCHEMA_VERSION);
         let migration_count: i64 = store
             .connection()
             .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
                 row.get(0)
             })
             .expect("migration count");
-        assert_eq!(migration_count, 14);
+        assert_eq!(migration_count, CURRENT_SCHEMA_VERSION);
         let version: i64 = store
             .connection()
             .query_row(
@@ -13132,6 +13662,7 @@ END;
                 "appointment_quote_slots",
                 "appointment_quotes",
                 "audit_events",
+                "backup_operation_attempts",
                 "configuration",
                 "event_mappings",
                 "http_idempotency_records",
