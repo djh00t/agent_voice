@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use chrono_tz::Tz;
 use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior, params, types::Value};
-use serde::de::Error as DeError;
+use serde::de::{Error as DeError, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use time::{Time, format_description::FormatItem, macros::format_description};
 
@@ -17,7 +17,7 @@ const MODEL_MAX_BYTES: usize = 128;
 const HH_MM: &[FormatItem<'static>] = format_description!("[hour]:[minute]");
 
 /// The closed weekday values accepted by the admin configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkingDay {
     #[default]
@@ -28,6 +28,33 @@ pub enum WorkingDay {
     Friday,
     Saturday,
     Sunday,
+}
+
+impl<'de> Deserialize<'de> for WorkingDay {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct WorkingDayVisitor;
+
+        impl<'de> Visitor<'de> for WorkingDayVisitor {
+            type Value = WorkingDay;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a supported lowercase working day")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                WorkingDay::parse_storage(value)
+                    .ok_or_else(|| E::custom("working_days contains an unsupported value"))
+            }
+        }
+
+        deserializer.deserialize_str(WorkingDayVisitor)
+    }
 }
 
 impl WorkingDay {
