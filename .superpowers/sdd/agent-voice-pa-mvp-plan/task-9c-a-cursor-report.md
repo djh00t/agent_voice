@@ -180,12 +180,13 @@ Review repair added provider-compatible cursor coverage and separate
 machine-safe stream validation in `1b2f76d`/`52e0831`/`f0765a7`/`498eff8`,
 with the exact selectors and full local gate rerun above. The atomicity finding
 was checked against the per-commit file lists and the malformed report message
-was reworded during the interactive rebase. PR #311 must receive a fresh
-independent review after these commits are pushed; no unresolved review result
-is claimed here.
+was reworded during the interactive rebase. Fresh review of `91d4cbe` found
+one stale rollback sentence about #306; this docs-only repair removes it, and
+PR #311 must receive a fresh independent review after the repair is pushed.
+No unresolved implementation finding is claimed here.
 
 Rollback is a reviewed reverse-order revert of the report, implementation, and
 test commits. It does not remove the existing encrypted schema or durable data,
-alter provider contracts, or change the coordination parent. Because PR #306
-is still open, rebase this branch and refresh the source/revision evidence after
-#306 merges before handoff for merge.
+alter provider contracts, or change the coordination parent. PR #306 is already
+merged in the final base; no additional prerequisite rebase remains for this
+package.
