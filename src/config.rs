@@ -78,14 +78,14 @@ impl AppConfig {
                 }
             }
 
-            if indent == 0 && trimmed.starts_with("backup:") {
+            if indent == 0 {
+                let Some(value) = Self::backup_yaml_top_level_value(trimmed) else {
+                    continue;
+                };
                 backup_indent = Some(indent);
-                let flow_value = trimmed
-                    .strip_prefix("backup:")
-                    .map(str::trim)
-                    .map(|value| Self::strip_yaml_comment(value).trim());
+                let flow_value = Self::strip_yaml_comment(value).trim();
                 if let Some(entries) = flow_value
-                    .and_then(|value| value.strip_prefix('{'))
+                    .strip_prefix('{')
                     .and_then(|value| value.strip_suffix('}'))
                 {
                     for entry in entries.split(',') {
@@ -99,6 +99,17 @@ impl AppConfig {
         }
 
         Ok(())
+    }
+
+    fn backup_yaml_top_level_value(line: &str) -> Option<&str> {
+        let key_end = if let Some(rest) = line.strip_prefix("backup") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("'backup'") {
+            rest
+        } else {
+            line.strip_prefix("\"backup\"")?
+        };
+        key_end.trim_start().strip_prefix(':').map(str::trim)
     }
 
     fn backup_yaml_policy_lexeme(line: &str) -> Option<(&str, &str)> {
@@ -158,7 +169,9 @@ impl AppConfig {
                 Some(_) => unreachable!("only YAML quote bytes are tracked"),
                 None => match byte {
                     b'"' | b'\'' => quote = Some(byte),
-                    b'#' => return &value[..index],
+                    b'#' if index == 0 || bytes[index - 1].is_ascii_whitespace() => {
+                        return &value[..index];
+                    }
                     _ => {}
                 },
             }
@@ -4111,6 +4124,53 @@ agent_api:
             "+30",
             "flow-quoted-hash-comment",
         );
+    }
+
+    #[test]
+    fn app_config_load_rejects_flow_policy_literal_after_unseparated_plain_hash() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml = replace_backup_yaml_mapping(
+            &base_yaml,
+            "backup: { temp_dir: backup#tmp, retention_days: +30 } # policy",
+        );
+
+        assert_backup_policy_load_error(
+            yaml,
+            "backup.retention_days: invalid_retention",
+            "+30",
+            "flow-unseparated-plain-hash",
+        );
+    }
+
+    #[test]
+    fn app_config_load_rejects_flow_policy_literal_after_quoted_top_level_backup_key() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+
+        for (quote, mapping_kind) in [
+            ("'", "single-quoted-top-level"),
+            ("\"", "double-quoted-top-level"),
+        ] {
+            let yaml = replace_backup_yaml_mapping(
+                &base_yaml,
+                &format!("{quote}backup{quote}: {{ retention_days: +30 }} # policy"),
+            );
+            assert_backup_policy_load_error(
+                yaml,
+                "backup.retention_days: invalid_retention",
+                "+30",
+                mapping_kind,
+            );
+        }
     }
 
     #[test]
