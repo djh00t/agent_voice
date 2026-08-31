@@ -840,7 +840,12 @@ fn validate_backup_endpoint(endpoint: Option<&str>, allow_loopback_http: bool) -
         .host_str()
         .filter(|host| !host.is_empty())
         .ok_or_else(|| backup_error("endpoint", "invalid_endpoint"))?;
-    if !url.username().is_empty()
+    let authority_has_userinfo = endpoint
+        .split_once("://")
+        .and_then(|(_, remainder)| remainder.split('/').next())
+        .is_some_and(|authority| authority.contains('@'));
+    if authority_has_userinfo
+        || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
@@ -3520,6 +3525,56 @@ agent_api:
                 .to_string();
             assert_eq!(error, "backup: secret_field_rejected");
             assert!(!error.contains("do-not-log-this"));
+        }
+    }
+
+    #[test]
+    fn backup_config_rejects_empty_endpoint_userinfo() {
+        let mut backup = BackupConfig {
+            enabled: true,
+            bucket: "agent-voice-test".to_string(),
+            prefix: "snapshots/pa".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("https://@s3.example.test/".to_string()),
+            retention_days: 30,
+            temp_dir: PathBuf::from("./backup-tmp"),
+            max_age_hours: 24,
+        };
+
+        let error = backup.normalize_and_validate().unwrap_err().to_string();
+        assert_eq!(error, "backup.endpoint: invalid_endpoint");
+    }
+
+    #[test]
+    fn backup_config_rejects_required_negative_fixtures() {
+        let mut backup = BackupConfig {
+            enabled: true,
+            bucket: "agent-voice-test".to_string(),
+            prefix: "snapshots/\0pa".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("https://s3.example.test/".to_string()),
+            retention_days: 30,
+            temp_dir: PathBuf::from("./backup-tmp"),
+            max_age_hours: 24,
+        };
+        let error = backup.normalize_and_validate().unwrap_err().to_string();
+        assert_eq!(error, "backup.prefix: invalid_prefix");
+        assert!(!error.contains('\0'));
+
+        backup.prefix = "snapshots/pa".to_string();
+        backup.endpoint = Some("https://s3.example.test/?query=sentinel".to_string());
+        let error = backup.normalize_and_validate().unwrap_err().to_string();
+        assert_eq!(error, "backup.endpoint: invalid_endpoint");
+        assert!(!error.contains("sentinel"));
+
+        for value in ["0", "4294967296"] {
+            let env = HashMap::from([("BACKUP_MAX_AGE_HOURS".to_string(), value.to_string())]);
+            let error = backup
+                .apply_env_overrides_from_map(&env)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "backup.max_age_hours: invalid_max_age");
+            assert!(!error.contains(value));
         }
     }
 
