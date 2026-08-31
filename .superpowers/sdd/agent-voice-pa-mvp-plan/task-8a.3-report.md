@@ -6,7 +6,7 @@
 - **Worktree:** `/Users/djh/.codex/worktrees/agent_voice-08a3`
 - **Branch:** `codex/agent-voice-pa-08a3-oauth-config`
 - **Base:** `9daaefec70666f1bd4e35396bd4385136ab45992` (`origin/main`)
-- **Implementation commits:** `88f9fd4`, `09b3be4`
+- **Implementation commits:** `88f9fd4`, `09b3be4`, `1e10a34`
 
 ## Scope and ownership
 
@@ -15,7 +15,9 @@ application configuration boundary:
 
 - `src/config.rs` adds the defaulted `agent_api.oauth` field, applies exactly
   four credential environment overrides, normalizes and validates OAuth once
-  after all environment overrides, and contains the three focused tests.
+  after all environment overrides, isolates that validation from unrelated
+  config fields for security-analysis precision, and contains the three
+  focused tests.
 - `config/agent_voice.example.yaml` documents the exact Microsoft and Google
   provider defaults with four credential placeholders.
 - `.superpowers/sdd/agent-voice-pa-mvp-plan/task-8a.3-report.md` records this
@@ -82,10 +84,30 @@ cargo test: 1 passed, 532 filtered out (1 suite, 0.00s)
 | `rtk git diff --check` | PASS |
 | `rtk make check` | PASS — full Rust suite ran 533 tests, Rust docs built, lint passed, and the website build completed with exit 0 |
 | `rtk cargo fmt --all -- --check` | BLOCKED by pre-existing formatting drift in untouched `src/pa/fakes/mail.rs` and `src/service.rs`; owned `src/config.rs` passes the scoped check above |
+| PR #293 CI at head `1e10a34` | PASS — Quality Gates, Compose Config, JavaScript CodeQL, Rust CodeQL, and aggregate CodeQL all passed |
 
 The fresh worktree had no `website/node_modules`, so `rtk npm ci` was required
 for `make check`; it completed without changing either package manifest or
 lockfile. npm reported its existing audit/deprecation notices during setup.
+
+## CI and review follow-up
+
+The initial PR head `a9c5c72` produced CodeQL alert [#47](https://github.com/djh00t/agent_voice/security/code-scanning/47),
+`rust/cleartext-transmission`, at untouched `src/accounting.rs:219`. The
+reported source was the required OAuth validation call at
+`src/config.rs:48`; the analyzer conflated the mutable `AppConfig` receiver's
+OAuth fields with the independent accounting pricing URL. The PR diff never
+changed `src/accounting.rs`, and no OAuth credential or URL was transmitted.
+
+The bounded fix in `1e10a34` validates a cloned OAuth value and assigns it back
+only after success. Focused tests, clippy, scoped rustfmt, and the committed
+range diff check remained green. The rerun on head `1e10a34` cleared alert #47;
+all five PR checks passed and GitHub reported `mergeStateStatus: CLEAN`.
+
+The automated review's P1 comment incorrectly claimed the three files were in
+one commit. The remote commit list confirmed one file per commit (`88f9fd4`,
+`09b3be4`, `a9c5c72`, and `1e10a34`), so I replied with the evidence and
+resolved that false-positive thread. No code change was made for that review.
 
 ## Acceptance mapping
 
@@ -99,12 +121,13 @@ lockfile. npm reported its existing audit/deprecation notices during setup.
 
 ## Non-claims and handoff
 
-- **CI:** pending the delivering review-ready PR; no CI result is claimed here.
+- **CI:** [PR #293](https://github.com/djh00t/agent_voice/pull/293) reports all
+  five checks green at head `1e10a34`; mergeability is clean.
 - **LIVE:** no OAuth credentials, provider, HTTP, SIP, deployment, or UAT action
   was run.
 - **Side effects:** configuration normalization is in-memory only; no OAuth
   state, socket, client, token, or partial publication is created on failure.
-- **Delivery:** the two implementation commits are intentionally separate
+- **Delivery:** the three implementation commits are intentionally separate
   one-file commits; this report is delivered as its own one-file commit.
 
 ## Package status
