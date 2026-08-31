@@ -20,6 +20,8 @@ use oauth_callback::OAuthCallback;
 use oauth_start::{InMemoryOAuthStateStore, OAuthError, OAuthResult, OAuthStateStore};
 
 const NOW: DateTime<Utc> = DateTime::from_timestamp(1_725_000_000, 0).unwrap();
+const EXPECTED_CODE: &str = "authorization-code with spaces";
+const CALLBACK_SENTINEL: &str = "authorization-code-secret";
 
 fn callback(code: &str, state: &str) -> OAuthCallback {
     OAuthCallback {
@@ -52,19 +54,19 @@ fn valid_callback_returns_exact_code_and_consumes_state_once() {
     let mut store = reserved_store();
     let result = oauth_callback::validate_callback(
         &mut store,
-        callback("authorization-code with spaces", "reserved-state"),
+        callback(EXPECTED_CODE, "reserved-state"),
         NOW,
     );
     let authorization_code = result.expect("valid callback");
     assert!(
-        authorization_code.as_str() == "authorization-code with spaces",
+        authorization_code.as_str() == EXPECTED_CODE,
         "authorization code was not preserved"
     );
 
     assert_oauth_error(
         oauth_callback::validate_callback(
             &mut store,
-            callback("authorization-code with spaces", "reserved-state"),
+            callback(EXPECTED_CODE, "reserved-state"),
             NOW,
         ),
         OAuthError::StateAlreadyUsed,
@@ -145,7 +147,7 @@ fn callback_propagates_store_failure_without_exposing_callback_values() {
     };
     let result = oauth_callback::validate_callback(
         &mut store,
-        callback("authorization-code-secret", "reserved-state"),
+        callback(CALLBACK_SENTINEL, "reserved-state"),
         NOW,
     );
     assert_oauth_error(result, OAuthError::StateStoreFailure);
@@ -157,21 +159,55 @@ fn authorization_code_debug_and_display_are_fixed_and_redacted() {
     let mut store = reserved_store();
     let authorization_code = oauth_callback::validate_callback(
         &mut store,
-        callback("authorization-code-secret", "reserved-state"),
+        callback(CALLBACK_SENTINEL, "reserved-state"),
         NOW,
     )
     .expect("valid callback");
 
+    let debug = format!("{authorization_code:?}");
+    let display = format!("{authorization_code}");
     assert!(
-        format!("{authorization_code:?}") == "AuthorizationCode(<redacted>)",
+        debug == "AuthorizationCode(<redacted>)",
         "authorization-code debug output changed"
     );
     assert!(
-        format!("{authorization_code}") == "<redacted>",
+        display == "<redacted>",
         "authorization-code display output changed"
     );
-    assert!(!format!("{authorization_code:?}").contains("authorization-code-secret"));
-    assert!(!format!("{authorization_code}").contains("authorization-code-secret"));
+    assert!(
+        !debug.contains(CALLBACK_SENTINEL),
+        "debug output leaked the code"
+    );
+    assert!(
+        !display.contains(CALLBACK_SENTINEL),
+        "display output leaked the code"
+    );
+
+    let callback_value = callback(CALLBACK_SENTINEL, "state-secret");
+    let callback_debug = format!("{callback_value:?}");
+    let callback_display = format!("{callback_value}");
+    assert!(
+        callback_debug == "OAuthCallback { code: \"<redacted>\", state: \"<redacted>\" }",
+        "callback debug output changed"
+    );
+    assert!(
+        callback_display == "<redacted>",
+        "callback display output changed"
+    );
+    assert!(
+        !callback_debug.contains(CALLBACK_SENTINEL),
+        "callback debug output leaked a value"
+    );
+    assert!(
+        !callback_display.contains(CALLBACK_SENTINEL),
+        "callback display output leaked a value"
+    );
+
+    let error = OAuthError::InvalidState;
+    assert!(
+        format!("{error:?} {error}") == "InvalidState invalid OAuth state",
+        "OAuth error output changed"
+    );
 }
 
 struct CountingStore {
