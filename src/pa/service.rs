@@ -17,7 +17,7 @@ use super::domain::{
 };
 use super::providers::{
     CalendarAttendee, CalendarEvent, GoogleCalendarProvider, GoogleProposalDraft, MailAddress,
-    OutlookCalendarProvider, ProviderError, ProviderSession, TimeRange,
+    OutlookCalendarProvider, OwnerEventDraft, ProviderError, ProviderSession, TimeRange,
 };
 use super::store::{
     AuditEntityType, AuditEventType, MAX_APPOINTMENT_QUOTE_SLOTS, MessageProvider, MessageSummary,
@@ -322,6 +322,46 @@ impl PreparedOwnerTask {
 impl fmt::Debug for PreparedOwnerTask {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PreparedOwnerTask(<redacted>)")
+    }
+}
+
+/// The durable, redacted result of submitting one direct owner task.
+///
+/// The provider event identity is retained privately so exact retries return
+/// the same result without making that identity part of the public or debug
+/// surface.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SubmittedOwnerTask {
+    owner_task_draft_id: i64,
+    provider_event_id: String,
+    state: &'static str,
+}
+
+impl SubmittedOwnerTask {
+    /// Returns the durable owner-task draft identity.
+    pub const fn owner_task_draft_id(&self) -> i64 {
+        self.owner_task_draft_id
+    }
+
+    /// Returns the closed durable submission state.
+    pub const fn state(&self) -> &'static str {
+        self.state
+    }
+
+    /// Returns whether the owner task has a submitted Outlook event.
+    pub fn is_submitted(&self) -> bool {
+        self.state == "submitted"
+    }
+}
+
+impl fmt::Debug for SubmittedOwnerTask {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubmittedOwnerTask")
+            .field("owner_task_draft_id", &"<redacted>")
+            .field("provider_event_id", &"<redacted>")
+            .field("state", &self.state)
+            .finish()
     }
 }
 
@@ -842,6 +882,156 @@ impl<'a> PaService<'a> {
             ends_at: placement.ends_at(),
             timezone: placement.timezone().to_owned(),
             operation_key: placement.operation_key().to_owned(),
+        })
+    }
+
+    /// Submits one verified owner task as an owner-only Outlook event.
+    ///
+    /// Durable draft and placement rows are reloaded and compared before any
+    /// provider call. Availability is checked over the exact stored interval,
+    /// then an operation-key lookup is preferred over one create. A failed
+    /// create is recovered only through one final read-only lookup; no create
+    /// is retried blindly. Mapping and the details-free audit tail are both
+    /// independently idempotent, so retries repair local partial state without
+    /// repeating provider mutations.
+    pub async fn submit_owner_task(
+        &self,
+        prepared: &PreparedOwnerTask,
+        verified: &OwnerVerified,
+        caller_number: impl AsRef<str>,
+        now: OffsetDateTime,
+    ) -> ServiceResult<SubmittedOwnerTask> {
+        verified.validate_at(caller_number.as_ref(), now)?;
+
+        let stored_draft = self
+            .store
+            .load_owner_task_draft_by_id(prepared.owner_task_draft_id)
+            .map_err(ServiceError::Store)?;
+        let placement = self
+            .store
+            .load_owner_task_placement(prepared.owner_task_draft_id)
+            .map_err(ServiceError::Store)?;
+        validate_owner_task_submission(prepared, &stored_draft, &placement, verified)?;
+
+        let time_range = TimeRange::new(
+            to_chrono_utc(placement.starts_at())?,
+            to_chrono_utc(placement.ends_at())?,
+        )
+        .map_err(|_| ServiceError::InvalidInput {
+            field: "time_range",
+        })?;
+        let event_draft = OwnerEventDraft::new(
+            placement.operation_key(),
+            stored_draft.draft().title(),
+            time_range,
+            placement.timezone(),
+        )
+        .map_err(ServiceError::OutlookCalendar)?;
+        let audit_key = owner_task_submission_audit_key(prepared.owner_task_draft_id);
+
+        if let Some(provider_event_id) = placement.provider_event_id() {
+            ensure_owner_task_submission_audit(
+                self.store,
+                audit_key,
+                prepared.owner_task_draft_id,
+                now,
+            )?;
+            return Ok(SubmittedOwnerTask {
+                owner_task_draft_id: prepared.owner_task_draft_id,
+                provider_event_id: provider_event_id.to_owned(),
+                state: "submitted",
+            });
+        }
+
+        let outlook_busy = self
+            .outlook
+            .list_busy(self.outlook_session, event_draft.time_range())
+            .await
+            .map_err(ServiceError::OutlookCalendar)?;
+        let google_busy = self
+            .google
+            .list_busy(self.google_session, event_draft.time_range())
+            .await
+            .map_err(ServiceError::GoogleCalendar)?;
+        if busy_overlaps(&outlook_busy, placement.starts_at(), placement.ends_at())
+            || busy_overlaps(&google_busy, placement.starts_at(), placement.ends_at())
+        {
+            return Err(ServiceError::NoAvailability);
+        }
+
+        let event = match self
+            .outlook
+            .find_owner_event(self.outlook_session, &event_draft)
+            .await
+        {
+            Ok(event) => {
+                validate_owner_event(&event, &event_draft)?;
+                event
+            }
+            Err(ProviderError::NotFound) => {
+                match self
+                    .outlook
+                    .create_owner_event(self.outlook_session, &event_draft)
+                    .await
+                {
+                    Ok(event) => {
+                        validate_owner_event(&event, &event_draft)?;
+                        event
+                    }
+                    Err(create_error) => {
+                        // Provider errors do not distinguish a rejected
+                        // request from a timeout after remote persistence.
+                        // One final read-only lookup safely covers both cases.
+                        match self
+                            .outlook
+                            .find_owner_event(self.outlook_session, &event_draft)
+                            .await
+                        {
+                            Ok(event) => {
+                                validate_owner_event(&event, &event_draft)?;
+                                event
+                            }
+                            Err(ProviderError::NotFound) => {
+                                return Err(ServiceError::OutlookCalendar(create_error));
+                            }
+                            Err(recovery_error) => {
+                                return Err(ServiceError::OutlookCalendar(recovery_error));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => return Err(ServiceError::OutlookCalendar(error)),
+        };
+
+        let submitted = self
+            .store
+            .submit_owner_task_placement(prepared.owner_task_draft_id, event.provider_event_id())
+            .map_err(ServiceError::Store)?;
+        let provider_event_id = submitted.provider_event_id().ok_or(ServiceError::Store(
+            StoreError::StoredRecordInvalid {
+                resource: "owner task placement",
+            },
+        ))?;
+        if provider_event_id != event.provider_event_id()
+            || submitted.owner_task_draft_id() != prepared.owner_task_draft_id
+            || !submitted.is_submitted()
+        {
+            return Err(ServiceError::Store(StoreError::Conflict {
+                resource: "owner task submission",
+            }));
+        }
+        ensure_owner_task_submission_audit(
+            self.store,
+            audit_key,
+            prepared.owner_task_draft_id,
+            now,
+        )?;
+
+        Ok(SubmittedOwnerTask {
+            owner_task_draft_id: prepared.owner_task_draft_id,
+            provider_event_id: provider_event_id.to_owned(),
+            state: "submitted",
         })
     }
 
@@ -1424,6 +1614,82 @@ fn validate_pending_google_event(
     }
 }
 
+fn validate_owner_task_submission(
+    prepared: &PreparedOwnerTask,
+    stored_draft: &super::store::StoredOwnerTaskDraft,
+    placement: &super::store::StoredOwnerTaskPlacement,
+    verified: &OwnerVerified,
+) -> ServiceResult<()> {
+    let expected_ends_at = placement
+        .starts_at()
+        .checked_add(stored_draft.draft().duration().as_duration())
+        .ok_or(ServiceError::InvalidInput { field: "ends_at" })?;
+    if prepared.owner_task_draft_id != stored_draft.id()
+        || placement.owner_task_draft_id() != stored_draft.id()
+        || prepared.starts_at != placement.starts_at()
+        || prepared.ends_at != placement.ends_at()
+        || prepared.timezone != placement.timezone()
+        || prepared.operation_key != placement.operation_key()
+        || placement.owner_fingerprint() != verified.fingerprint()
+        || placement.starts_at().offset() != UtcOffset::UTC
+        || placement.ends_at().offset() != UtcOffset::UTC
+        || placement.ends_at() != expected_ends_at
+    {
+        return Err(ServiceError::Store(StoreError::Conflict {
+            resource: "owner task submission",
+        }));
+    }
+    Ok(())
+}
+
+fn validate_owner_event(event: &CalendarEvent, draft: &OwnerEventDraft) -> ServiceResult<()> {
+    if event.operation_key() == draft.operation_key()
+        && event.title() == draft.title()
+        && event.time_range() == draft.time_range()
+        && event.timezone() == draft.timezone()
+        && event.attendees().is_empty()
+    {
+        Ok(())
+    } else {
+        Err(ServiceError::OutlookCalendar(ProviderError::Conflict))
+    }
+}
+
+fn owner_task_submission_audit_key(owner_task_draft_id: i64) -> String {
+    format!("pa-owner-task-submitted-{owner_task_draft_id}")
+}
+
+fn ensure_owner_task_submission_audit(
+    store: &PaStore,
+    key: String,
+    owner_task_draft_id: i64,
+    occurred_at: OffsetDateTime,
+) -> ServiceResult<()> {
+    let entity_id = owner_task_draft_id.to_string();
+    let audit = match store.append_audit_event(
+        key.clone(),
+        AuditEventType::OwnerTaskSubmitted,
+        AuditEntityType::OwnerTask,
+        &entity_id,
+        occurred_at,
+    ) {
+        Ok(audit) => audit,
+        Err(StoreError::Conflict { .. }) => store
+            .load_audit_event_by_idempotency_key(key)
+            .map_err(ServiceError::Store)?,
+        Err(error) => return Err(ServiceError::Store(error)),
+    };
+    if audit.event_type() != AuditEventType::OwnerTaskSubmitted
+        || audit.entity_type() != AuditEntityType::OwnerTask
+        || audit.entity_id() != entity_id
+    {
+        return Err(ServiceError::Store(StoreError::Conflict {
+            resource: "owner task audit",
+        }));
+    }
+    Ok(())
+}
+
 fn busy_overlaps(
     intervals: &[super::availability::BusyInterval],
     starts_at: OffsetDateTime,
@@ -1701,6 +1967,390 @@ mod tests {
                 verified_at.to_offset(UtcOffset::from_hms(10, 0, 0).expect("offset")),
             )
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_owner_task_creates_one_owner_only_event_and_audit() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+        );
+        let verified = owner_verified(now);
+        let prepared = service
+            .prepare_owner_task(
+                owner_task_draft("owner-submit-basic"),
+                Some("voice:owner-submit-basic"),
+                now + Duration::hours(1),
+                "UTC",
+                "owner-submit-operation",
+                &verified,
+                "+61415850000",
+                now,
+            )
+            .expect("prepare");
+
+        let submitted = service
+            .submit_owner_task(&prepared, &verified, "+61415850000", now)
+            .await
+            .expect("submit");
+
+        assert_eq!(
+            submitted.owner_task_draft_id(),
+            prepared.owner_task_draft_id()
+        );
+        assert_eq!(submitted.state(), "submitted");
+        let placement = store
+            .load_owner_task_placement(prepared.owner_task_draft_id())
+            .expect("placement");
+        assert!(placement.is_submitted());
+        let audit = store
+            .load_audit_event_by_idempotency_key(format!(
+                "pa-owner-task-submitted-{}",
+                prepared.owner_task_draft_id()
+            ))
+            .expect("audit");
+        assert_eq!(audit.event_type(), AuditEventType::OwnerTaskSubmitted);
+        assert_eq!(audit.entity_type(), AuditEntityType::OwnerTask);
+        assert_eq!(
+            audit.entity_id(),
+            prepared.owner_task_draft_id().to_string()
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count"),
+            1
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerFind)
+                .expect("outlook find count"),
+            1
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerCreate)
+                .expect("outlook create count"),
+            1
+        );
+        let debug = format!("{submitted:?}");
+        assert!(!debug.contains("owner-submit-operation"));
+        assert!(!debug.contains("fake-outlook-owner-event"));
+    }
+
+    #[tokio::test]
+    async fn owner_task_ambiguous_create_recovers_without_second_create() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+        );
+        let verified = owner_verified(now);
+        let prepared = service
+            .prepare_owner_task(
+                owner_task_draft("owner-submit-ambiguous"),
+                Some("voice:owner-submit-ambiguous"),
+                now + Duration::hours(1),
+                "UTC",
+                "owner-submit-ambiguous-operation",
+                &verified,
+                "+61415850000",
+                now,
+            )
+            .expect("prepare");
+        outlook
+            .queue_ambiguous_owner_create_failure(ProviderError::Unavailable)
+            .expect("ambiguous create");
+
+        let first = service
+            .submit_owner_task(&prepared, &verified, "+61415850000", now)
+            .await
+            .expect("recover ambiguous create");
+        assert!(first.is_submitted());
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerFind)
+                .expect("find count"),
+            2
+        );
+
+        let retry = service
+            .submit_owner_task(
+                &prepared,
+                &verified,
+                "+61415850000",
+                now + Duration::seconds(1),
+            )
+            .await
+            .expect("idempotent retry");
+        assert_eq!(retry, first);
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count"),
+            1
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerFind)
+                .expect("find count after retry"),
+            2
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerCreate)
+                .expect("create count after retry"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_owner_task_repairs_missing_audit_without_provider_calls() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+        );
+        let verified = owner_verified(now);
+        let prepared = service
+            .prepare_owner_task(
+                owner_task_draft("owner-submit-audit-repair"),
+                Some("voice:owner-submit-audit-repair"),
+                now + Duration::hours(1),
+                "UTC",
+                "owner-submit-audit-repair-operation",
+                &verified,
+                "+61415850000",
+                now,
+            )
+            .expect("prepare");
+        let first = service
+            .submit_owner_task(&prepared, &verified, "+61415850000", now)
+            .await
+            .expect("submit");
+        let audit_key = format!("pa-owner-task-submitted-{}", prepared.owner_task_draft_id());
+        store
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER audit_events_append_only_update;
+                 DROP TRIGGER audit_events_append_only_delete;",
+            )
+            .expect("disable audit append-only triggers");
+        store
+            .connection()
+            .execute(
+                "DELETE FROM audit_events WHERE idempotency_key = ?1",
+                [&audit_key],
+            )
+            .expect("delete audit tail");
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER audit_events_append_only_update
+                 BEFORE UPDATE ON audit_events
+                 BEGIN SELECT RAISE(ABORT, 'audit_events are append-only'); END;
+                 CREATE TRIGGER audit_events_append_only_delete
+                 BEFORE DELETE ON audit_events
+                 BEGIN SELECT RAISE(ABORT, 'audit_events are append-only'); END;",
+            )
+            .expect("restore audit append-only triggers");
+        outlook_control
+            .set_failure(FakeOperation::CalendarBusy, ProviderError::Unavailable)
+            .expect("outlook busy failure");
+        google_control
+            .set_failure(FakeOperation::CalendarBusy, ProviderError::Unavailable)
+            .expect("google busy failure");
+        outlook_control
+            .set_failure(FakeOperation::CalendarOwnerFind, ProviderError::Unavailable)
+            .expect("outlook find failure");
+        outlook_control
+            .set_failure(
+                FakeOperation::CalendarOwnerCreate,
+                ProviderError::Unavailable,
+            )
+            .expect("outlook create failure");
+
+        let repaired = service
+            .submit_owner_task(
+                &prepared,
+                &verified,
+                "+61415850000",
+                now + Duration::seconds(1),
+            )
+            .await
+            .expect("repair");
+        assert_eq!(repaired, first);
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count"),
+            1
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerFind)
+                .expect("find count"),
+            1
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerCreate)
+                .expect("create count"),
+            1
+        );
+        let audit = store
+            .load_audit_event_by_idempotency_key(audit_key)
+            .expect("repaired audit");
+        assert_eq!(audit.event_type(), AuditEventType::OwnerTaskSubmitted);
+        assert_eq!(audit.entity_type(), AuditEntityType::OwnerTask);
+    }
+
+    #[tokio::test]
+    async fn submit_owner_task_fails_closed_before_side_effects_for_busy_or_invalid_identity() {
+        let now = now();
+        let busy = BusyInterval::new(now + Duration::hours(1), now + Duration::hours(1))
+            .expect_err("empty busy interval");
+        assert!(matches!(
+            busy,
+            AvailabilityError::InvalidBusyInterval { .. }
+        ));
+        let busy = BusyInterval::new(
+            now + Duration::hours(1),
+            now + Duration::hours(1) + Duration::minutes(5),
+        )
+        .expect("busy interval");
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, vec![busy], Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+        );
+        let verified = owner_verified(now);
+        let prepared = service
+            .prepare_owner_task(
+                owner_task_draft("owner-submit-fail-closed"),
+                Some("voice:owner-submit-fail-closed"),
+                now + Duration::hours(1),
+                "UTC",
+                "owner-submit-fail-closed-operation",
+                &verified,
+                "+61415850000",
+                now,
+            )
+            .expect("prepare");
+        assert!(matches!(
+            service
+                .submit_owner_task(&prepared, &verified, "+61415850000", now)
+                .await,
+            Err(ServiceError::NoAvailability)
+        ));
+        assert!(matches!(
+            service
+                .submit_owner_task(&prepared, &verified, "+61415850001", now)
+                .await,
+            Err(ServiceError::InvalidInput {
+                field: "owner_binding"
+            })
+        ));
+        assert!(matches!(
+            service
+                .submit_owner_task(
+                    &prepared,
+                    &verified,
+                    "+61415850000",
+                    now + Duration::seconds(60)
+                )
+                .await,
+            Err(ServiceError::InvalidInput {
+                field: "owner_verification"
+            })
+        ));
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerFind)
+                .expect("find count"),
+            0
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerCreate)
+                .expect("create count"),
+            0
+        );
+        store
+            .connection()
+            .execute(
+                "UPDATE owner_task_placements SET owner_fingerprint = 'legacy' WHERE owner_task_draft_id = ?1",
+                [prepared.owner_task_draft_id()],
+            )
+            .expect("legacy fingerprint");
+        assert!(matches!(
+            service
+                .submit_owner_task(&prepared, &verified, "+61415850000", now)
+                .await,
+            Err(ServiceError::Store(StoreError::Conflict { .. }))
+        ));
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("busy count"),
+            1
         );
     }
 
