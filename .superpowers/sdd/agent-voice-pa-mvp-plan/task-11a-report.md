@@ -5,11 +5,11 @@
 - **Evidence date:** 2026-09-01 (Australia/Sydney)
 - **Base SHA:** `a20a28be3be37c84cbe5046415497b7053dd8906` (`origin/main` after
   `rtk git fetch origin main`)
-- **Implementation head SHA:** `d6e03cb8dc476f499e5cdb6d3aea5525be03c785`
+- **Implementation head SHA:** `c8ddc77f45931a02ad7b7f82ccb02488858034c5`
   (latest source/config implementation commit before this report-only change)
 - **PR:** [#314](https://github.com/djh00t/agent_voice/pull/314)
 - **Branch:** `codex/agent-voice-issue-85`
-- **Evidence worktree:** `/private/tmp/agent-voice-issue-85-retention` (removed after
+- **Evidence worktree:** `/private/tmp/agent-voice-issue-85-final-evidence` (removed after
   delivery)
 - **Prerequisite:** #218 is closed. Its `AgentApiConfig.oauth` field and
   post-environment OAuth normalization handoff were re-read from `origin/main`
@@ -59,7 +59,15 @@ compound variants—return `backup: secret_field_rejected` without echoing a key
 value. Ordinary unknown keys retain serde's generic unknown-field error.
 YAML policy values also use bounded intermediates so wrong-type and
 out-of-range `retention_days` and `max_age_hours` inputs map to their frozen
-field/code errors without echoing raw values.
+field/code errors without echoing raw values. The direct `BackupConfig` YAML
+deserializer receives semantic values: a lexical `+30` is normalized by
+`serde_yaml` to the same numeric value as `30`, so direct deserialization cannot
+enforce a lexical-sign rule. The production `AppConfig::load` file path adds a
+raw-lexeme guard before YAML deserialization for signed and oversized decimal
+policy literals. That guard intentionally covers standard block mappings and
+inline simple-flow mappings such as `backup: { retention_days: +30 }`; it is
+not a general YAML parser and does not claim coverage for complex flow,
+multiline, alias, tag, or equivalent non-file deserialization paths.
 
 Configured production endpoints are HTTPS origins with DNS hosts, no userinfo,
 query, fragment, or non-default port. HTTP loopback is accepted only through
@@ -136,6 +144,18 @@ Result: 0 passed, 1 failed, and 577 filtered out because retention_days: 0
         deserialized successfully instead of returning the frozen error class.
 ```
 
+### Remediation F lexical-load evidence
+
+The production file-load regression was added in
+`c8ddc77f45931a02ad7b7f82ccb02488858034c5`. It exercises signed and oversized
+retention and freshness literals through `AppConfig::load`, where the raw file
+contents are available before `serde_yaml` turns them into semantic values.
+The guard is deliberately bounded to standard block `backup:` mappings and
+inline simple-flow mappings; it is not a general YAML lexer/parser. Direct
+`serde_yaml::from_str::<BackupConfig>` remains unable to distinguish `+30` from
+`30` after semantic parsing, so the direct plus-sign case is documented as a
+limitation rather than claimed as covered by this production-load guard.
+
 ### Focused GREEN evidence
 
 At implementation head `8a4173bfc360c9cb8fd9a0a3cda81c9977743697`, each exact
@@ -200,7 +220,7 @@ The repository gate passed after installing the existing website lockfile
 dependencies in the disposable worktree:
 
 ```text
-Command: rtk npm ci (from website/)
+Command: rtk run 'cd website && rtk npm ci'
 Exit: 0
 Result: 1,276 packages installed; npm reported existing audit/deprecation
         notices and no manifest or lockfile changed.
@@ -234,6 +254,41 @@ Result: cargo test 578 passed, 0 failed; integration suites passed with
         cargo clippy, cargo doc, and Docusaurus build completed successfully.
 ```
 
+At implementation head `c8ddc77f45931a02ad7b7f82ccb02488858034c5`, the
+production file-load and existing scalar-redaction regressions passed:
+
+```text
+Command: rtk cargo test --lib config::tests::app_config_load_rejects_signed_and_oversized_backup_policy_literals -- --exact --nocapture
+Exit: 0
+Result: 1 passed, 580 filtered out; signed and oversized policy literals were
+        rejected through AppConfig::load without echoing the raw literal.
+
+Command: rtk cargo test --lib config::tests::backup_config_yaml_enabled_type_errors_are_frozen_and_redacted -- --exact --nocapture
+Exit: 0
+Result: 1 passed, 580 filtered out; malformed/non-boolean enabled values map to
+        backup.enabled: missing_required without the sentinel.
+
+Command: rtk cargo test --lib config::tests::backup_config_yaml_scalar_type_errors_are_frozen_and_redacted -- --exact --nocapture
+Exit: 0
+Result: 1 passed, 580 filtered out; analogous scalar conversion failures map to
+        frozen field/code errors without the sentinel.
+
+Command: rtk cargo test --lib config -- --nocapture
+Exit: 0
+Result: 49 passed, 532 filtered out (581 config-module tests available).
+
+Command: rtk run 'cd website && rtk npm ci'
+Exit: 0
+Result: 1,276 packages installed; npm reported existing audit/deprecation
+        notices and no manifest or lockfile changed.
+
+Command: rtk make check
+Exit: 0
+Result: cargo test 581 passed, 0 failed; integration suites passed with
+        6, 18, 233, 46, 3, 3, 3, 3, and 19 tests; doc-tests 3 passed;
+        cargo clippy, cargo doc, and Docusaurus build completed successfully.
+```
+
 Configuration normalization is clone-then-assign. Failed parsing or validation
 therefore publishes no partial config and performs no filesystem, clock,
 socket, network, provider, database, or token action. Re-loading identical
@@ -254,14 +309,14 @@ Exit: 0
 The implementation range through the current source head was inspected with:
 
 ```text
-Command: rtk git diff --name-status origin/main...d6e03cb8dc476f499e5cdb6d3aea5525be03c785
+Command: rtk git diff --name-status origin/main...c8ddc77f45931a02ad7b7f82ccb02488858034c5
 Exit: 0
 Result: exactly the three owned paths src/config.rs, config/agent_voice.example.yaml,
         and .superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md.
 ```
 
-The twelve delivery commits before this report are each one-file commits;
-`rtk git log --stat origin/main..d6e03cb8dc476f499e5cdb6d3aea5525be03c785`
+The fifteen delivery commits before this report are each one-file commits;
+`rtk git log --stat origin/main..c8ddc77f45931a02ad7b7f82ccb02488858034c5`
 returned the following path boundaries:
 
 | Commit | Path | Change |
@@ -278,6 +333,9 @@ returned the following path boundaries:
 | `b9cb959660312b9ea1fdec16726312c8948a507f` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Record current implementation, regression, review, and CI evidence. |
 | `ea4f0916ba9386ee34c25bf95c4baad6b1be8128` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Clarify historical provenance for the broadened secret-key regression. |
 | `d6e03cb8dc476f499e5cdb6d3aea5525be03c785` | `src/config.rs` | Freeze YAML policy errors and add wrong-type/overflow regressions. |
+| `e3fda1fe1810c2a9bef23f5515a8bfd67193ab52` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Record YAML policy-error repair evidence and provenance. |
+| `8f1ce09125f412623307dd8420bfb144f5b87e2e` | `src/config.rs` | Map malformed YAML scalar fields to frozen redacted errors and add adversarial regressions. |
+| `c8ddc77f45931a02ad7b7f82ccb02488858034c5` | `src/config.rs` | Reject signed and oversized policy literals on the production file-load path. |
 
 The repository-wide formatter remains a pre-existing, out-of-scope issue:
 
@@ -312,6 +370,17 @@ fresh CI run is partially complete:
 | Analyze (javascript-typescript) | PASS | [CodeQL job 99574696394](https://github.com/djh00t/agent_voice/actions/runs/33418456384/job/99574696394) |
 | Analyze (rust) | PENDING | [CodeQL job 99574696812](https://github.com/djh00t/agent_voice/actions/runs/33418456384/job/99574696812) |
 | CodeQL aggregate | NEUTRAL / SKIPPING | [aggregate run 99574940345](https://github.com/djh00t/agent_voice/runs/99574940345) |
+
+At the current implementation head `c8ddc77f45931a02ad7b7f82ccb02488858034c5`,
+all five checks are green:
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Quality Gates | PASS | [CI job 99591892288](https://github.com/djh00t/agent_voice/actions/runs/33423660836/job/99591892288) |
+| Compose Config | PASS | [CI job 99591892137](https://github.com/djh00t/agent_voice/actions/runs/33423660836/job/99591892137) |
+| Analyze (javascript-typescript) | PASS | [CodeQL job 99591894810](https://github.com/djh00t/agent_voice/actions/runs/33423660737/job/99591894810) |
+| Analyze (rust) | PASS | [CodeQL job 99591895091](https://github.com/djh00t/agent_voice/actions/runs/33423660737/job/99591895091) |
+| CodeQL aggregate | PASS | [aggregate run 99592192231](https://github.com/djh00t/agent_voice/runs/99592192231) |
 
 This report-only commit will create another PR workflow run; no status for that
 new report head is claimed until GitHub reports it. CI is repository evidence
@@ -358,7 +427,10 @@ resolved separately from this report commit. The common secret-field finding
 four review threads were resolved at that capture. The YAML policy-error
 finding (`3896592605`) was answered by `3896701634` against repair head
 `d6e03cb8dc476f499e5cdb6d3aea5525be03c785` and its thread was resolved; all
-five review threads were resolved at this capture.
+five review threads were resolved at that capture. The malformed-enabled
+finding (`3896778384`) was answered by `3896892063` against repair head
+`8f1ce09125f412623307dd8420bfb144f5b87e2e` and its thread was resolved; all
+six review threads were resolved at the c8 implementation-head capture.
 
 ## Acceptance mapping
 
@@ -366,15 +438,18 @@ five review threads were resolved at this capture.
 | --- | --- | --- |
 | `BackupConfig` exposes the frozen public fields and safe defaults | `backup_config_defaults_disabled_and_safe`; source review | PASS (LOCAL/STATIC) |
 | Exactly eight overrides win over YAML and reject blank/malformed values atomically | `backup_config_env_overrides_are_strict_and_normalized`; enabled negative selector | PASS (LOCAL) |
-| Stable error classes never echo raw values or secret-shaped fields | secret-field selectors, including common credential names; redaction assertions; source review | PASS (LOCAL/STATIC) |
+| Stable error classes never echo raw values or secret-shaped fields | secret-field selectors, YAML enabled/scalar selectors, redaction assertions, and source review | PASS (LOCAL/STATIC) |
 | Bucket, region, prefix, endpoint, policy, and scratch path fail closed | destination, required-negative, and YAML policy-error selectors | PASS (LOCAL) |
 | YAML wrong-type and out-of-range policy values map to frozen redacted errors | `backup_config_yaml_policy_errors_are_frozen_and_redacted` | PASS (LOCAL/STATIC) |
+| Production file loads reject signed and oversized policy literals before semantic YAML parsing | `app_config_load_rejects_signed_and_oversized_backup_policy_literals`; c8 raw-lexeme guard source review | PASS (LOCAL/STATIC; standard block/simple-flow scope) |
+| Direct `BackupConfig` parsing rejects lexical plus signs | `serde_yaml` semantic-number boundary | LIMITATION (documented; not claimed) |
 | Empty endpoint userinfo is rejected and non-default production ports remain disallowed | empty-userinfo selector; endpoint source review; frozen addendum | PASS (LOCAL/STATIC) |
 | Explicit test-only loopback HTTP is isolated from production validation | `backup_config_snapshot_and_runtime_handoffs` | PASS (LOCAL) |
 | Example mapping remains disabled-safe and exact | snapshot/runtime handoff selector | PASS (LOCAL) |
 
 **Package status:** implementation and evidence are ready for review; the live
-issue label remains `status:in-progress` at this capture. CI for the repair
-head `d6e03cb8dc476f499e5cdb6d3aea5525be03c785` is partially complete; this
-report-only commit's new CI run is pending until GitHub reports it. Live,
-deployment, merge, and approval evidence remain separate gates.
+issue label remains `status:in-progress` at this capture. CI for the current
+implementation head `c8ddc77f45931a02ad7b7f82ccb02488858034c5` is green in all
+five checks. This report-only commit will trigger a new PR workflow; its
+report-head status is not claimed until GitHub reports it. Live, deployment,
+merge, and approval evidence remain separate gates.
