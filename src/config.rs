@@ -88,7 +88,7 @@ impl AppConfig {
                     .strip_prefix('{')
                     .and_then(|value| value.strip_suffix('}'))
                 {
-                    for entry in entries.split(',') {
+                    for entry in Self::split_yaml_flow_entries(entries) {
                         if let Some((field, value)) = Self::backup_yaml_policy_lexeme(entry.trim())
                         {
                             Self::validate_backup_policy_yaml_lexeme(field, value)?;
@@ -99,6 +99,47 @@ impl AppConfig {
         }
 
         Ok(())
+    }
+
+    fn split_yaml_flow_entries(value: &str) -> Vec<&str> {
+        let mut entries = Vec::new();
+        let mut quote = None;
+        let mut escaped = false;
+        let mut start = 0;
+
+        for (index, byte) in value.bytes().enumerate() {
+            match quote {
+                Some(b'"') => {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        quote = None;
+                    }
+                }
+                Some(b'\'') => {
+                    if byte == b'\'' {
+                        if value.as_bytes().get(index + 1) == Some(&b'\'') {
+                            continue;
+                        }
+                        quote = None;
+                    }
+                }
+                Some(_) => unreachable!("only YAML quote bytes are tracked"),
+                None => match byte {
+                    b'"' | b'\'' => quote = Some(byte),
+                    b',' => {
+                        entries.push(&value[start..index]);
+                        start = index + 1;
+                    }
+                    _ => {}
+                },
+            }
+        }
+
+        entries.push(&value[start..]);
+        entries
     }
 
     fn backup_yaml_top_level_value(line: &str) -> Option<&str> {
@@ -4123,6 +4164,32 @@ agent_api:
             "backup.retention_days: invalid_retention",
             "+30",
             "flow-quoted-hash-comment",
+        );
+    }
+
+    #[test]
+    fn app_config_load_accepts_flow_comma_inside_quoted_scalar() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml = replace_backup_yaml_mapping(
+            &base_yaml,
+            "backup: { temp_dir: \"foo, retention_days: +30\", retention_days: 30 }",
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "agent-voice-backup-policy-quoted-comma-{}.yaml",
+            std::process::id()
+        ));
+        fs::write(&path, yaml).unwrap();
+        let result = AppConfig::load(Some(&path), false);
+        fs::remove_file(&path).unwrap();
+        assert!(
+            result.is_ok(),
+            "quoted comma should remain scalar data: {result:?}"
         );
     }
 
