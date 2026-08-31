@@ -113,6 +113,17 @@ impl From<WriterFault> for FaultStage {
     }
 }
 
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn renameat2(
+        old_directory: std::os::raw::c_int,
+        old_path: *const std::os::raw::c_char,
+        new_directory: std::os::raw::c_int,
+        new_path: *const std::os::raw::c_char,
+        flags: std::os::raw::c_uint,
+    ) -> std::os::raw::c_int;
+}
+
 fn write_inner(
     destination: &Path,
     encoded_snapshot: &[u8],
@@ -147,13 +158,66 @@ fn write_inner(
     if fault == FaultStage::Rename {
         return Err(WriterError::Rename);
     }
-    fs::rename(temporary.path(), destination).map_err(|_| WriterError::Rename)?;
+    match publish_without_replacement(temporary.path(), destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            return Err(WriterError::DestinationExists);
+        }
+        Err(_) => return Err(WriterError::Rename),
+    }
     temporary.disarm();
 
     if fault == FaultStage::DirectorySync {
         return Err(WriterError::DirectorySync);
     }
     sync_parent_directory(parent).map_err(|_| WriterError::DirectorySync)
+}
+
+fn publish_without_replacement(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        match rename_without_replacement_linux(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(error) if rename_noreplace_unavailable(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    fs::hard_link(source, destination)?;
+    fs::remove_file(source)
+}
+
+#[cfg(target_os = "linux")]
+fn rename_without_replacement_linux(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "destination path contains NUL"))?;
+    const AT_FDCWD: std::os::raw::c_int = -100;
+    const RENAME_NOREPLACE: std::os::raw::c_uint = 1;
+
+    let result = unsafe {
+        renameat2(
+            AT_FDCWD,
+            source.as_ptr(),
+            AT_FDCWD,
+            destination.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace_unavailable(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(22 | 38 | 95))
 }
 
 fn destination_parent(destination: &Path) -> Result<&Path, WriterError> {
@@ -483,6 +547,25 @@ mod tests {
         assert!(directory.temporary_entries().len() == 1);
         fs::remove_file(&collision).expect("remove test-owned collision");
         assert!(directory.temporary_entries().is_empty());
+    }
+
+    #[test]
+    fn no_replace_publication_preserves_an_existing_destination() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let source = directory.destination("source.tmp");
+        let destination = directory.destination("destination.bin");
+        fs::write(&source, SNAPSHOT).expect("source snapshot");
+        fs::write(&destination, b"prior destination bytes").expect("existing destination");
+
+        let error = super::publish_without_replacement(&source, &destination)
+            .expect_err("existing destination must reject publication");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&source).expect("source remains"), SNAPSHOT);
+        assert_eq!(
+            fs::read(&destination).expect("destination remains"),
+            b"prior destination bytes"
+        );
     }
 
     #[test]
