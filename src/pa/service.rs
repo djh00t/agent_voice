@@ -1318,6 +1318,16 @@ impl<'a> PaService<'a> {
                 };
                 (proposal, event)
             } else {
+                if existing_proposal.is_none() {
+                    let cutoff = validation_now
+                        .checked_add(self.policy.minimum_notice())
+                        .ok_or(ServiceError::Availability(
+                            AvailabilityError::DateTimeOverflow,
+                        ))?;
+                    if draft.starts_at() < cutoff {
+                        return Err(ServiceError::NoAvailability);
+                    }
+                }
                 if existing_proposal.is_some() {
                     let recheck_start = draft
                         .starts_at()
@@ -1820,6 +1830,7 @@ mod tests {
     };
     use crate::pa::store::{
         AuditEntityType, AuditEventType, MessageProvider, MessageSummary, PaStore, StoreError,
+        StoredAppointmentQuoteState,
     };
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use time::{
@@ -4504,6 +4515,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submission_recheck_enforces_minimum_notice_at_create_boundary() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::default(),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:minimum-notice",
+                IdempotencyKey::new("appointment:minimum-notice").expect("key"),
+                now,
+            )
+            .expect("prepare");
+
+        let error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now + Duration::minutes(4),
+            )
+            .await
+            .expect_err("four minutes inside the notice window must fail");
+        assert!(matches!(error, ServiceError::NoAvailability));
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            0
+        );
+        assert_eq!(
+            store
+                .load_appointment_quote_by_id(search.quote().id())
+                .expect("quote")
+                .state(),
+            StoredAppointmentQuoteState::Prepared
+        );
+        for table in [
+            "proposals",
+            "event_mappings",
+            "notification_outbox",
+            "audit_events",
+        ] {
+            assert_eq!(
+                store
+                    .connection()
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("side-effect count"),
+                0,
+                "{table} must remain unchanged"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_recheck_allows_exact_minimum_notice_at_create_boundary() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let policy = AvailabilityPolicy::for_timezone("UTC").expect("policy");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &policy,
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:minimum-notice-boundary",
+                IdempotencyKey::new("appointment:minimum-notice-boundary").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        assert_eq!(
+            prepared.starts_at(),
+            now.checked_add(policy.minimum_notice()).expect("cutoff")
+        );
+
+        let submitted = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect("exact minimum notice must be accepted");
+        assert!(submitted.is_pending());
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_recheck_minimum_notice_overflow_preserves_side_effects() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let policy = AvailabilityPolicy::new(
+            "UTC",
+            default_working_windows(),
+            Duration::MAX,
+            Duration::hours(2),
+            Duration::ZERO,
+        )
+        .expect("policy");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &policy,
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let starts_at = now + Duration::hours(1);
+        let ends_at = starts_at
+            .checked_add(AppointmentKind::Callback.duration())
+            .expect("callback end");
+        let quote = Quote::new(now);
+        store
+            .save_appointment_quote(
+                &quote,
+                AppointmentKind::Callback,
+                "UTC",
+                &[AppointmentSlot::new(starts_at, ends_at).expect("slot")],
+            )
+            .expect("quote");
+        let prepared = service
+            .prepare_request(
+                quote.id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:minimum-notice-overflow",
+                IdempotencyKey::new("appointment:minimum-notice-overflow").expect("key"),
+                now,
+            )
+            .expect("prepare");
+
+        let error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect_err("minimum notice overflow must fail");
+        assert!(matches!(
+            error,
+            ServiceError::Availability(AvailabilityError::DateTimeOverflow)
+        ));
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            0
+        );
+        assert_eq!(
+            store
+                .load_appointment_quote_by_id(quote.id())
+                .expect("quote")
+                .state(),
+            StoredAppointmentQuoteState::Prepared
+        );
+        for table in [
+            "proposals",
+            "event_mappings",
+            "notification_outbox",
+            "audit_events",
+        ] {
+            assert_eq!(
+                store
+                    .connection()
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("side-effect count"),
+                0,
+                "{table} must remain unchanged"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn submission_buffer_expansion_overflow_fails_before_provider_calls() {
         let now = now();
         let outlook_control = control(now);
@@ -5358,13 +5604,13 @@ mod tests {
             MailAddress::new("owner@example.test").expect("owner"),
         );
         let search = service
-            .search_slots(AppointmentKind::Callback, now, 1)
+            .search_slots(AppointmentKind::Callback, now, 2)
             .await
             .expect("search");
         let prepared = service
             .prepare_request(
                 search.quote().id(),
-                0,
+                1,
                 CallerIdentity::new(
                     "Ada Lovelace",
                     ConfirmedEmail::confirm("ada@example.test").expect("email"),
