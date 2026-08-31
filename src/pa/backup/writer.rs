@@ -192,6 +192,30 @@ fn wait_for_publication_race() {
     }
 }
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+#[repr(C, align(8))]
+struct RawStatStorage([u8; 256]);
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+unsafe extern "C" {
+    fn fstatat(
+        directory: std::os::raw::c_int,
+        path: *const std::os::raw::c_char,
+        stat: *mut RawStatStorage,
+        flags: std::os::raw::c_int,
+    ) -> std::os::raw::c_int;
+}
+
 #[cfg(all(test, unix))]
 fn set_parent_handoff_barrier(barrier: Option<Arc<Barrier>>) {
     *PARENT_HANDOFF_BARRIER
@@ -417,7 +441,7 @@ fn path_name(path: &Path) -> io::Result<CString> {
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "path contains NUL"))
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn open_at(parent: &File, name: &CStr) -> io::Result<File> {
     let flags = no_follow_open_flags()?;
     open_at_with_flags(parent, name, flags, 0)
@@ -437,7 +461,7 @@ fn open_at_with_flags(
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn no_follow_open_flags() -> io::Result<std::os::raw::c_int> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -517,22 +541,94 @@ fn path_matches_identity(path: &Path, identity: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
+fn metadata_identity(metadata: &fs::Metadata) -> (u64, u64, bool) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.file_type().is_symlink(),
+    )
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn entry_identity_at(parent: &File, name: &CStr) -> io::Result<(u64, u64, bool)> {
+    let mut stat = RawStatStorage([0; 256]);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const AT_SYMLINK_NOFOLLOW: std::os::raw::c_int = 0x0100;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const AT_SYMLINK_NOFOLLOW: std::os::raw::c_int = 0x0020;
+
+    let result = unsafe {
+        fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let device = {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            unsafe { std::ptr::read_unaligned(stat.0.as_ptr().cast::<u64>()) }
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            u64::from(unsafe { std::ptr::read_unaligned(stat.0.as_ptr().cast::<u32>()) })
+        }
+    };
+    let inode = unsafe { std::ptr::read_unaligned(stat.0.as_ptr().add(8).cast::<u64>()) };
+    let is_symlink = {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let mode = unsafe { std::ptr::read_unaligned(stat.0.as_ptr().add(24).cast::<u32>()) };
+            mode & 0o170000 == 0o120000
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let mode = unsafe { std::ptr::read_unaligned(stat.0.as_ptr().add(4).cast::<u16>()) };
+            u32::from(mode) & 0o170000 == 0o120000
+        }
+    };
+    Ok((device, inode, is_symlink))
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn entry_identity_at(_parent: &File, _name: &CStr) -> io::Result<(u64, u64, bool)> {
+    Err(io::Error::new(
+        ErrorKind::Unsupported,
+        "handle-relative metadata access is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
 fn path_matches_identity_at(parent: &File, name: &CStr, identity: &fs::Metadata) -> bool {
-    open_at(parent, name)
-        .and_then(|file| file.metadata())
-        .map(|current| same_file(identity, &current))
+    entry_identity_at(parent, name)
+        .map(|current| !current.2 && current == metadata_identity(identity))
         .unwrap_or(false)
 }
 
 #[cfg(unix)]
 fn remove_if_owned_at(parent: &File, name: &CStr, identity: &fs::Metadata) -> bool {
-    let Ok(file) = open_at(parent, name) else {
+    let Ok(current) = entry_identity_at(parent, name) else {
         return false;
     };
-    let Ok(current) = file.metadata() else {
-        return false;
-    };
-    if !same_file(identity, &current) {
+    if current != metadata_identity(identity) {
         return false;
     }
     unlink_at(parent, name).is_ok()
@@ -604,7 +700,7 @@ fn open_parent_directory(_parent: &Path) -> Result<File, WriterError> {
 #[cfg(unix)]
 fn ensure_destination_absent_at(parent: &File, destination: &Path) -> Result<(), WriterError> {
     let name = path_name(destination).map_err(|_| WriterError::InvalidDestination)?;
-    match open_at(parent, &name) {
+    match entry_identity_at(parent, &name) {
         Ok(_) => Err(WriterError::DestinationExists),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(_) => Err(WriterError::InvalidDestination),
@@ -685,15 +781,8 @@ impl Drop for CreatedTemporary {
                     return;
                 };
                 if let Some(identity) = self.identity.as_ref() {
-                    let Some(file) = self.file.as_ref() else {
-                        return;
-                    };
-                    let Ok(current) = file.metadata() else {
-                        return;
-                    };
-                    if !same_file(identity, &current) {
-                        return;
-                    }
+                    let _ = remove_if_owned_at(parent, &name, identity);
+                    return;
                 }
                 let _ = unlink_at(parent, &name);
             }
@@ -1064,6 +1153,83 @@ mod tests {
             fs::remove_file(&path).expect("remove leaked sibling after assertion");
         }
         assert!(!path_exists, "failed initialization removes unreadable sibling");
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn created_temporary_guard_preserves_unreadable_replacement() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let path = directory.destination("guarded.tmp");
+        let parent = fs::File::open(&directory.path).expect("test parent remains openable");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("created temporary sibling");
+        let identity = file.metadata().expect("created temporary identity");
+
+        let mut guard = super::CreatedTemporary::new(path.clone(), parent, file);
+        guard.identity = Some(identity);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
+            .expect("make original sibling unreadable");
+        let replacement_source = directory.destination("foreign.tmp");
+        fs::write(&replacement_source, b"foreign temporary bytes")
+            .expect("write replacement sibling");
+        fs::remove_file(&path).expect("replace original sibling");
+        fs::rename(&replacement_source, &path).expect("install replacement sibling");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
+            .expect("make replacement sibling unreadable");
+        drop(guard);
+
+        let replacement_exists = path.exists();
+        let replacement_bytes = if replacement_exists {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("restore replacement sibling permissions");
+            let bytes = fs::read(&path).expect("read replacement sibling");
+            fs::remove_file(&path).expect("remove replacement sibling after assertion");
+            bytes
+        } else {
+            Vec::new()
+        };
+        assert!(
+            replacement_exists,
+            "cleanup must not unlink an unreadable replacement"
+        );
+        assert_eq!(replacement_bytes, b"foreign temporary bytes");
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn existing_unreadable_and_dangling_destinations_report_destination_exists() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let unreadable = directory.destination("unreadable.bin");
+        fs::write(&unreadable, b"existing snapshot bytes").expect("existing destination");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("make destination unreadable");
+        let unreadable_result = AtomicSnapshotWriter::write(&unreadable, SNAPSHOT);
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600))
+            .expect("restore destination permissions");
+        fs::remove_file(&unreadable).expect("remove unreadable destination");
+        assert_eq!(unreadable_result, Err(WriterError::DestinationExists));
+
+        let dangling = directory.destination("dangling.bin");
+        symlink("missing-target", &dangling).expect("create dangling destination symlink");
+        let dangling_result = AtomicSnapshotWriter::write(&dangling, SNAPSHOT);
+        fs::remove_file(&dangling).expect("remove dangling destination");
+        assert_eq!(dangling_result, Err(WriterError::DestinationExists));
     }
 
     #[cfg(any(
