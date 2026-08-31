@@ -711,7 +711,12 @@ mod tests {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     use std::sync::{Arc, Barrier};
     use std::sync::{Mutex, OnceLock};
 
