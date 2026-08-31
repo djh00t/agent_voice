@@ -888,12 +888,13 @@ impl<'a> PaService<'a> {
     /// Submits one verified owner task as an owner-only Outlook event.
     ///
     /// Durable draft and placement rows are reloaded and compared before any
-    /// provider call. Availability is checked over the exact stored interval,
-    /// then an operation-key lookup is preferred over one create. A failed
-    /// create is recovered only through one final read-only lookup; no create
-    /// is retried blindly. Mapping and the details-free audit tail are both
-    /// independently idempotent, so retries repair local partial state without
-    /// repeating provider mutations.
+    /// provider call. An operation-key lookup is attempted before the exact
+    /// stored interval is rejected as busy, so a remotely persisted event can
+    /// be recovered after a local mapping failure. Availability is checked only
+    /// when no event is found. A failed create is recovered only through one
+    /// final read-only lookup; no create is retried blindly. Mapping and the
+    /// details-free audit tail are both independently idempotent, so retries
+    /// repair local partial state without repeating provider mutations.
     pub async fn submit_owner_task(
         &self,
         prepared: &PreparedOwnerTask,
@@ -943,22 +944,6 @@ impl<'a> PaService<'a> {
             });
         }
 
-        let outlook_busy = self
-            .outlook
-            .list_busy(self.outlook_session, event_draft.time_range())
-            .await
-            .map_err(ServiceError::OutlookCalendar)?;
-        let google_busy = self
-            .google
-            .list_busy(self.google_session, event_draft.time_range())
-            .await
-            .map_err(ServiceError::GoogleCalendar)?;
-        if busy_overlaps(&outlook_busy, placement.starts_at(), placement.ends_at())
-            || busy_overlaps(&google_busy, placement.starts_at(), placement.ends_at())
-        {
-            return Err(ServiceError::NoAvailability);
-        }
-
         let event = match self
             .outlook
             .find_owner_event(self.outlook_session, &event_draft)
@@ -969,6 +954,22 @@ impl<'a> PaService<'a> {
                 event
             }
             Err(ProviderError::NotFound) => {
+                let outlook_busy = self
+                    .outlook
+                    .list_busy(self.outlook_session, event_draft.time_range())
+                    .await
+                    .map_err(ServiceError::OutlookCalendar)?;
+                let google_busy = self
+                    .google
+                    .list_busy(self.google_session, event_draft.time_range())
+                    .await
+                    .map_err(ServiceError::GoogleCalendar)?;
+                if busy_overlaps(&outlook_busy, placement.starts_at(), placement.ends_at())
+                    || busy_overlaps(&google_busy, placement.starts_at(), placement.ends_at())
+                {
+                    return Err(ServiceError::NoAvailability);
+                }
+
                 match self
                     .outlook
                     .create_owner_event(self.outlook_session, &event_draft)
@@ -2141,6 +2142,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_task_retry_recovers_remote_event_before_busy_rejection() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+        );
+        let verified = owner_verified(now);
+        let prepared = service
+            .prepare_owner_task(
+                owner_task_draft("owner-submit-mapping-retry"),
+                Some("voice:owner-submit-mapping-retry"),
+                now + Duration::hours(1),
+                "UTC",
+                "owner-submit-mapping-retry-operation",
+                &verified,
+                "+61415850000",
+                now,
+            )
+            .expect("prepare");
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_owner_task_mapping
+                 BEFORE UPDATE OF state ON owner_task_placements
+                 WHEN NEW.state = 'submitted'
+                 BEGIN SELECT RAISE(ABORT, 'forced mapping failure'); END;",
+            )
+            .expect("install mapping failure");
+
+        assert!(matches!(
+            service
+                .submit_owner_task(&prepared, &verified, "+61415850000", now)
+                .await,
+            Err(ServiceError::Store(_))
+        ));
+        assert!(
+            !store
+                .load_owner_task_placement(prepared.owner_task_draft_id())
+                .expect("placement after failed mapping")
+                .is_submitted()
+        );
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_owner_task_mapping")
+            .expect("remove mapping failure");
+
+        let recovered = service
+            .submit_owner_task(
+                &prepared,
+                &verified,
+                "+61415850000",
+                now + Duration::seconds(1),
+            )
+            .await
+            .expect("recover persisted event");
+        assert!(recovered.is_submitted());
+        assert!(
+            store
+                .load_owner_task_placement(prepared.owner_task_draft_id())
+                .expect("recovered placement")
+                .is_submitted()
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerFind)
+                .expect("find count"),
+            2
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count"),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn submit_owner_task_repairs_missing_audit_without_provider_calls() {
         let now = now();
         let outlook_control = control(now);
@@ -2325,7 +2423,7 @@ mod tests {
             outlook_control
                 .invocation_count(FakeOperation::CalendarOwnerFind)
                 .expect("find count"),
-            0
+            1
         );
         assert_eq!(
             outlook_control
