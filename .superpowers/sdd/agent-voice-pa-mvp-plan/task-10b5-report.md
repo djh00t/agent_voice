@@ -130,8 +130,8 @@ transcript `transcript`; rejected errors remain fixed and redacted.
 | --- | --- |
 | `rtk rustfmt --edition 2021 --check src/realtime/server_audio_events.rs` | PASS |
 | `rtk cargo clippy --test realtime_server_audio_events_contract -- -D warnings` | PASS — no issues found |
-| `rtk git diff --check` | PASS |
-| `rtk make check` | PASS — 548 library tests, integration suites (6, 18, 230, 3, 3, 3, 19), 3 doc-tests, Clippy, rustdoc, and Docusaurus |
+| `rtk git diff --check origin/main...HEAD` | PASS |
+| `rtk make check` | PASS — 548 library tests, integration suites (6, 18, 230, 3, 3, 3, 3, 19), 3 doc-tests, Clippy, rustdoc, and Docusaurus |
 
 The first `rtk make check` attempt found the fresh-worktree environment had no
 Docusaurus executable. `rtk make docs-install` installed from the checked-in
@@ -140,9 +140,11 @@ passed. npm reported 24 existing audit advisories (7 moderate, 17 high); no
 remediation was performed.
 
 The required whole-tree `rtk cargo fmt --all -- --check` was also run. It exits
-1 only for pre-existing formatting differences in unrelated
-`src/pa/fakes/mail.rs` and `src/service.rs`; both owned paths pass the scoped
-formatter check and those unrelated files were not changed.
+1 for formatting differences in unrelated `src/pa/fakes/mail.rs` and
+`src/service.rs`, plus the recovered source as rendered through the
+test-only `tests/../src/realtime/server_audio_events.rs` include. The direct
+scoped formatter check for the owned source passes; the recovered source blob
+remains exact PR #304 content, and no formatter write was made.
 
 ## Scope, security, and residuals
 
