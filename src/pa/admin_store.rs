@@ -198,7 +198,7 @@ fn read_connections(
             .position(|value| value.provider == row.provider && !value.configured)
         {
             connections[position] = row;
-        } else {
+        } else if connections.len() < LIMIT as usize {
             connections.push(row);
         }
     }
@@ -207,7 +207,6 @@ fn read_connections(
             .cmp(&right.provider)
             .then(left.account_fingerprint.cmp(&right.account_fingerprint))
     });
-    connections.truncate(LIMIT as usize);
     Ok(connections)
 }
 
@@ -251,7 +250,7 @@ fn connection_from_row(
 }
 
 fn read_proposals(connection: &rusqlite::Connection) -> StoreResult<Vec<AdminProposal>> {
-    let mut statement = connection.prepare("SELECT p.id, p.state, a.kind, a.starts_at, a.ends_at, p.created_at, p.updated_at FROM proposals p LEFT JOIN appointment_drafts a ON a.id = p.appointment_draft_id ORDER BY p.id ASC LIMIT ?1").map_err(|_| invalid())?;
+    let mut statement = connection.prepare("SELECT p.id, p.state, a.kind, a.starts_at, a.ends_at, p.created_at, p.updated_at FROM proposals p LEFT JOIN appointment_drafts a ON a.id = p.appointment_draft_id WHERE p.owner_task_draft_id IS NULL ORDER BY p.id ASC LIMIT ?1").map_err(|_| invalid())?;
     statement
         .query_map([LIMIT], proposal_from_row)
         .map_err(|_| invalid())?
@@ -296,7 +295,7 @@ fn proposal_from_row(row: &Row<'_>) -> rusqlite::Result<AdminProposal> {
 
 fn read_failures(connection: &rusqlite::Connection) -> StoreResult<Vec<AdminFailure>> {
     let mut statement = connection
-        .prepare("SELECT id, event_type, occurred_at FROM audit_events ORDER BY id ASC LIMIT ?1")
+        .prepare("SELECT id, event_type, occurred_at FROM audit_events WHERE event_type = 'notification_retry_scheduled' ORDER BY occurred_at DESC, id DESC LIMIT ?1")
         .map_err(|_| invalid())?;
     let rows = statement
         .query_map([LIMIT], |row| {
