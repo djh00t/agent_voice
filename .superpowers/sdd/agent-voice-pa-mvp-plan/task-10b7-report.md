@@ -5,7 +5,7 @@
 - **Evidence date:** 2026-08-31 (Australia/Sydney)
 - **Worktree:** `/Users/djh/.codex/worktrees/agent_voice-224`
 - **Branch:** `codex/issue-224`
-- **Base:** `5799e89978e335783f8c05b14b2b04cf9292251c` (`origin/main`)
+- **Base:** `b1b83562b3f2f92b58445448a76ab770a977597f` (`origin/main`)
 
 ## Contract and readback
 
