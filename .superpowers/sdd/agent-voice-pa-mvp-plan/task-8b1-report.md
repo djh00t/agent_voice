@@ -5,9 +5,11 @@
 - **Base:** `f8319aceec157d974b52dca73e192b34653f25d1` (`origin/main`)
 - **Branch:** `codex/agent-voice-issue-249`
 - **Worktree:** `/private/tmp/agent-voice-issue-249`
-- **Final head:** `05a6bcd034f3b66b8bb13fd8930ae648ca565746`
-- **Implementation commits:** `7a3ea93df67a7467e86827fe504f2b026c704eb9`, `742cab06cde9878b3a5959976d73337e9322dddc`, `4c36a8260e3340eb8267b63023cf3475fe8671aa`, `1218148d536d8190612720cde3d3e5363cc41901`, `791acde3d26bba8c1b15d3522fde1c4e527bb88f`, `05a6bcd034f3b66b8bb13fd8930ae648ca565746`
-- **Report commit:** `65cb6f7360938b63f461a445861b3482512b2aa9`
+- **Final head:** `HEAD` (self-reference: this report is part of the current
+  tip; resolve the exact SHA with `rtk git rev-parse HEAD` after checkout)
+- **Pre-report head:** `752add3a836e32c63162331bda8fb8fad9492f48`
+- **Implementation commits:** `7a3ea93df67a7467e86827fe504f2b026c704eb9`, `742cab06cde9878b3a5959976d73337e9322dddc`, `4c36a8260e3340eb8267b63023cf3475fe8671aa`, `1218148d536d8190612720cde3d3e5363cc41901`, `791acde3d26bba8c1b15d3522fde1c4e527bb88f`, `05a6bcd034f3b66b8bb13fd8930ae648ca565746`, `2986edc4e242ffed708239e16001bbe1b7cb5ee3`
+- **Report lineage:** `65cb6f7360938b63f461a445861b3482512b2aa9` (initial), `752add3a836e32c63162331bda8fb8fad9492f48` (prior), and `THIS_REPORT_COMMIT` (self-reference; resolve with `rtk git rev-parse HEAD`)
 
 ## Scope
 
@@ -32,7 +34,7 @@ Each entry records the actual check without sensitive values or complete URLs.
     "expected": "nonzero missing-contract failure before implementation",
     "exit_code": 101,
     "observed": "failed because tests/../src/pa/oauth_start.rs was absent; no test was filtered to zero",
-    "commit": "2e33636aeba988513ce883b932f7815e1982deb5",
+    "commit": "7a3ea93df67a7467e86827fe504f2b026c704eb9",
     "timestamp_utc": "2026-08-31T11:24:00Z"
   },
   {
@@ -43,7 +45,7 @@ Each entry records the actual check without sensitive values or complete URLs.
     "expected": "the exact PKCE and provider URL selector passes",
     "exit_code": 0,
     "observed": "1 passed, 29 filtered out",
-    "commit": "4143fdcf6ef62a8c60666772448f32ac01c57ac7",
+    "commit": "742cab06cde9878b3a5959976d73337e9322dddc",
     "timestamp_utc": "2026-08-31T11:31:00Z"
   },
   {
@@ -54,7 +56,7 @@ Each entry records the actual check without sensitive values or complete URLs.
     "expected": "all direct-path OAuth-start contract tests pass",
     "exit_code": 0,
     "observed": "30 passed",
-    "commit": "4143fdcf6ef62a8c60666772448f32ac01c57ac7",
+    "commit": "742cab06cde9878b3a5959976d73337e9322dddc",
     "timestamp_utc": "2026-08-31T11:32:00Z"
   },
   {
@@ -65,7 +67,7 @@ Each entry records the actual check without sensitive values or complete URLs.
     "expected": "owned files pass scoped formatting",
     "exit_code": 0,
     "observed": "rustfmt check passed with no output",
-    "commit": "4143fdcf6ef62a8c60666772448f32ac01c57ac7",
+    "commit": "742cab06cde9878b3a5959976d73337e9322dddc",
     "timestamp_utc": "2026-08-31T11:39:00Z"
   },
   {
@@ -76,7 +78,7 @@ Each entry records the actual check without sensitive values or complete URLs.
     "expected": "no whitespace errors",
     "exit_code": 0,
     "observed": "diff check passed with no output",
-    "commit": "4143fdcf6ef62a8c60666772448f32ac01c57ac7",
+    "commit": "742cab06cde9878b3a5959976d73337e9322dddc",
     "timestamp_utc": "2026-08-31T11:39:00Z"
   },
   {
@@ -98,7 +100,7 @@ Each entry records the actual check without sensitive values or complete URLs.
     "expected": "Rust tests, strict Clippy, Rust docs, and Docusaurus build pass",
     "exit_code": 0,
     "observed": "548 library tests passed; lint, Rust docs, and Docusaurus build completed successfully",
-    "commit": "b01baa0325722d14a5feb21619f64b3356ac2102",
+    "commit": "4c36a8260e3340eb8267b63023cf3475fe8671aa",
     "timestamp_utc": "2026-08-31T11:44:00Z"
   },
   {
@@ -106,66 +108,66 @@ Each entry records the actual check without sensitive values or complete URLs.
     "kind": "GREEN",
     "selector_or_scope": "pkce_url_contract",
     "command_or_check": "rtk cargo test --test oauth_start_contract pkce_url_contract -- --exact",
-    "expected": "the exact PKCE and provider URL selector passes after state-store hardening",
+    "expected": "the exact PKCE and provider URL selector passes after state-store and diagnostics hardening",
     "exit_code": 0,
     "observed": "1 passed, 31 filtered out",
-    "commit": "05a6bcd034f3b66b8bb13fd8930ae648ca565746",
-    "timestamp_utc": "2026-08-31T11:59:00Z"
+    "commit": "2986edc4e242ffed708239e16001bbe1b7cb5ee3",
+    "timestamp_utc": "2026-08-31T12:31:00Z"
   },
   {
     "tier": "LOCAL",
     "kind": "GREEN",
     "selector_or_scope": "oauth_start_contract",
     "command_or_check": "rtk cargo test --test oauth_start_contract",
-    "expected": "all direct-path OAuth-start contract tests pass after lifecycle hardening",
+    "expected": "all direct-path OAuth-start contract tests pass after lifecycle and diagnostics hardening",
     "exit_code": 0,
     "observed": "32 passed",
-    "commit": "05a6bcd034f3b66b8bb13fd8930ae648ca565746",
-    "timestamp_utc": "2026-08-31T11:59:00Z"
+    "commit": "2986edc4e242ffed708239e16001bbe1b7cb5ee3",
+    "timestamp_utc": "2026-08-31T12:31:00Z"
   },
   {
     "tier": "LOCAL",
     "kind": "GREEN",
     "selector_or_scope": "src/pa/oauth_start.rs and tests/oauth_start_contract.rs",
     "command_or_check": "rtk rustfmt --edition 2024 --check src/pa/oauth_start.rs tests/oauth_start_contract.rs",
-    "expected": "owned files pass scoped formatting after lifecycle hardening",
+    "expected": "owned files pass scoped formatting after lifecycle and diagnostics hardening",
     "exit_code": 0,
     "observed": "rustfmt check passed with no output",
-    "commit": "05a6bcd034f3b66b8bb13fd8930ae648ca565746",
-    "timestamp_utc": "2026-08-31T11:59:00Z"
+    "commit": "2986edc4e242ffed708239e16001bbe1b7cb5ee3",
+    "timestamp_utc": "2026-08-31T12:31:00Z"
   },
   {
     "tier": "LOCAL",
     "kind": "GREEN",
     "selector_or_scope": "working tree and staged owned files",
     "command_or_check": "rtk git diff --check",
-    "expected": "no whitespace errors after lifecycle hardening",
+    "expected": "no whitespace errors after lifecycle and diagnostics hardening",
     "exit_code": 0,
     "observed": "diff check passed with no output",
-    "commit": "05a6bcd034f3b66b8bb13fd8930ae648ca565746",
-    "timestamp_utc": "2026-08-31T11:59:00Z"
+    "commit": "2986edc4e242ffed708239e16001bbe1b7cb5ee3",
+    "timestamp_utc": "2026-08-31T12:31:00Z"
   },
   {
     "tier": "LOCAL",
     "kind": "GREEN",
     "selector_or_scope": "repository validation gate",
     "command_or_check": "rtk make check",
-    "expected": "Rust tests, strict Clippy, Rust docs, and Docusaurus build pass after lifecycle hardening",
+    "expected": "Rust tests, strict Clippy, Rust docs, and Docusaurus build pass after lifecycle and diagnostics hardening",
     "exit_code": 0,
     "observed": "548 library tests passed; lint, Rust docs, and Docusaurus build completed successfully",
-    "commit": "05a6bcd034f3b66b8bb13fd8930ae648ca565746",
-    "timestamp_utc": "2026-08-31T11:59:00Z"
+    "commit": "2986edc4e242ffed708239e16001bbe1b7cb5ee3",
+    "timestamp_utc": "2026-08-31T12:36:00Z"
   },
   {
     "tier": "STATIC",
     "kind": "REVIEW",
     "selector_or_scope": "src/pa/oauth_start.rs, tests/oauth_start_contract.rs, and issue #249 ownership",
     "command_or_check": "manual contract review plus scoped immutable diff inspection",
-    "expected": "exact query/schema ownership, atomic failures, bounded state retention, redacted diagnostics, and no network/provider/persistence code",
+    "expected": "exact query/schema ownership, atomic failures, bounded state retention, redacted diagnostics including assertion failures, and no network/provider/persistence code",
     "exit_code": 0,
-    "observed": "reviewed against #249 and the P2 finding; consumed verifiers are dropped, expiry purge removes replay tombstones, only the three assigned paths changed, and no secret, token, or complete URL is recorded",
-    "commit": "05a6bcd034f3b66b8bb13fd8930ae648ca565746",
-    "timestamp_utc": "2026-08-31T12:00:00Z"
+    "observed": "reviewed against #249 and the P2 findings; consumed verifiers are dropped, expiry purge removes replay tombstones, Result<String> assertions use fixed messages, the redaction regression passes, only the three assigned paths changed, and no secret, token, or complete URL is recorded",
+    "commit": "2986edc4e242ffed708239e16001bbe1b7cb5ee3",
+    "timestamp_utc": "2026-08-31T12:36:00Z"
   },
   {
     "tier": "CI",
@@ -175,7 +177,7 @@ Each entry records the actual check without sensitive values or complete URLs.
     "expected": "independent CI evidence after PR creation",
     "exit_code": null,
     "observed": "pending remote PR workflow; local checks do not imply CI",
-    "commit": "4143fdcf6ef62a8c60666772448f32ac01c57ac7",
+    "commit": "742cab06cde9878b3a5959976d73337e9322dddc",
     "timestamp_utc": "2026-08-31T11:40:00Z"
   },
   {
@@ -186,7 +188,7 @@ Each entry records the actual check without sensitive values or complete URLs.
     "expected": "no live-provider action",
     "exit_code": null,
     "observed": "explicitly excluded; no credentials, consent, HTTP, token, or provider operation performed",
-    "commit": "4143fdcf6ef62a8c60666772448f32ac01c57ac7",
+    "commit": "742cab06cde9878b3a5959976d73337e9322dddc",
     "timestamp_utc": "2026-08-31T11:40:00Z"
   }
 ]
@@ -200,6 +202,7 @@ Each entry records the actual check without sensitive values or complete URLs.
 - The focused suite proves redirect preservation, pre-query/fragment rejection
   before mutation, checked expiry, duplicate/expired/used state handling,
   bounded replay-tombstone retention, verifier release after consumption,
-  failure atomicity, and redacted start/error diagnostics.
+  failure atomicity, fixed-message verifier assertions, and redacted
+  start/error diagnostics.
 - The implementation reads only the normalized client ID, authorization URL,
   redirect URI, and scopes; it does not read `token_url` or `client_secret`.
