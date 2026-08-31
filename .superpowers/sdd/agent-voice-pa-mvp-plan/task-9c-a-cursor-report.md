@@ -5,7 +5,7 @@
 - **Evidence date:** 2026-08-31 (Australia/Sydney)
 - **Base revision:** `a20a28b` (`origin/main` after #305/#306/#307/#309)
 - **Implementation revision:** `498eff8`
-- **Readback timestamp:** `2026-08-31T13:38:00Z`
+- **Readback timestamp:** `2026-08-31T13:56:46Z`
 
 ## Contract and prerequisite readback
 
@@ -43,13 +43,17 @@ The implementation history is one-file and one-logical-change per commit:
 
 - `5fe68f6` — test-only cursor contract and exact selectors (`src/pa/store.rs`)
 - `c3bbf76` — cursor API and immediate CAS implementation (`src/pa/store.rs`)
-- `bdefbd7` — initial evidence report (this report only)
-- `5f468fc` — post-rebase evidence refresh (this report only)
+- `bdefbd7` — initial evidence report (`.superpowers/sdd/agent-voice-pa-mvp-plan/task-9c-a-cursor-report.md`)
+- `5f468fc` — post-rebase evidence refresh (`.superpowers/sdd/agent-voice-pa-mvp-plan/task-9c-a-cursor-report.md`)
 - `1b2f76d` — provider-compatible cursor alphabet regression (`src/pa/store.rs`)
 - `52e0831` — provider-compatible cursor validation (`src/pa/store.rs`)
 - `f0765a7` — stream machine-safe regression (`src/pa/store.rs`)
 - `498eff8` — separate stream and cursor validation (`src/pa/store.rs`)
-- report commit — this evidence file only
+- `a351eb6` — cursor review repair evidence (`.superpowers/sdd/agent-voice-pa-mvp-plan/task-9c-a-cursor-report.md`)
+- `91bb984` — evidence refresh after integrating current main (`.superpowers/sdd/agent-voice-pa-mvp-plan/task-9c-a-cursor-report.md`)
+- `91d4cbe` — final post-rebase selector and gate evidence (`.superpowers/sdd/agent-voice-pa-mvp-plan/task-9c-a-cursor-report.md`)
+- `2cd5f94` — remove the obsolete post-#306 rollback instruction (`.superpowers/sdd/agent-voice-pa-mvp-plan/task-9c-a-cursor-report.md`)
+- `HEAD` — this final report-only commit (self-reference intentionally has no literal SHA; `.superpowers/sdd/agent-voice-pa-mvp-plan/task-9c-a-cursor-report.md`)
 
 The final changed-path readback after the report commit must contain only
 `src/pa/store.rs` and this report relative to the original base.
@@ -166,7 +170,7 @@ changed.
 - `{tier: STATIC, kind: REVIEW, selector_or_scope: validation clarification, command_or_check: #290 binding clarification and #157 provider validator readback, expected: distinct stream/cursor alphabets, exit_code: 0, observed_redacted: cursor provider-compatible printable ASCII; stream machine-safe; no normalization, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
 - `{tier: STATIC, kind: REVIEW, selector_or_scope: CAS and redaction boundary, command_or_check: source symbol and diff scan, expected: one immediate parameterized CAS and fixed errors, exit_code: 0, observed_redacted: no legacy save/delete cursor API, no migration, and no raw fixture value in test output, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
 - `{tier: STATIC, kind: REVIEW, selector_or_scope: atomic commit history, command_or_check: git show --name-status for every delivery commit, expected: one file per commit, exit_code: 0, observed_redacted: each source/test commit touches src/pa/store.rs only and each report commit touches the report only, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
-- `{tier: CI, kind: NOT_RUN, selector_or_scope: linked workflow, command_or_check: GitHub check readback before push, expected: independently observed result, exit_code: UNEXECUTED, observed_redacted: local evidence only; CI rerun after push, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
+- `{tier: CI, kind: GREEN, selector_or_scope: linked workflow, command_or_check: GitHub check readback for PR #311, expected: all required checks pass, exit_code: 0, observed_redacted: 5 checks passed and 0 failed (Quality Gates, Compose Config, CodeQL JavaScript/TypeScript, CodeQL Rust, and CodeQL aggregate), source_revision: 2cd5f94, timestamp_utc: 2026-08-31T13:56:46Z}`
 - `{tier: LIVE, kind: NOT_RUN, selector_or_scope: provider and deployment boundary, command_or_check: live-provider/OAuth/network/deployment check, expected: not applicable to this local slice, exit_code: NOT_RUN, observed_redacted: no live operation or credential use, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
 
 ## Lifecycle, review, and rollback
@@ -179,11 +183,13 @@ close #290 or any parent/prerequisite issue.
 Review repair added provider-compatible cursor coverage and separate
 machine-safe stream validation in `1b2f76d`/`52e0831`/`f0765a7`/`498eff8`,
 with the exact selectors and full local gate rerun above. The atomicity finding
-was checked against the per-commit file lists and the malformed report message
-was reworded during the interactive rebase. Fresh review of `91d4cbe` found
-one stale rollback sentence about #306; this docs-only repair removes it, and
-PR #311 must receive a fresh independent review after the repair is pushed.
-No unresolved implementation finding is claimed here.
+was checked against the exhaustive per-commit file list, and the malformed
+report message was reworded during the interactive rebase. Fresh review of
+`91d4cbe` found one stale rollback sentence about #306; docs-only repairs
+`2cd5f94` and `HEAD` remove that sentence and complete the exact delivery
+history/readback. The final pushed head has five green CI checks; a fresh
+independent review remains the handoff verification step. No unresolved
+implementation finding is claimed here.
 
 Rollback is a reviewed reverse-order revert of the report, implementation, and
 test commits. It does not remove the existing encrypted schema or durable data,
