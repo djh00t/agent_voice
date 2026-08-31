@@ -5,11 +5,11 @@
 - **Evidence date:** 2026-09-01 (Australia/Sydney)
 - **Base SHA:** `a20a28be3be37c84cbe5046415497b7053dd8906` (`origin/main` after
   `rtk git fetch origin main`)
-- **Implementation head SHA:** `8a4173bfc360c9cb8fd9a0a3cda81c9977743697`
+- **Implementation head SHA:** `5503c19c3769adfdabe670846d8b178891bd59c3`
   (latest source/config implementation commit before this report-only change)
 - **PR:** [#314](https://github.com/djh00t/agent_voice/pull/314)
 - **Branch:** `codex/agent-voice-issue-85`
-- **Evidence worktree:** `/private/tmp/agent-voice-issue-85-report` (removed after
+- **Evidence worktree:** `/private/tmp/agent-voice-issue-85-e` (removed after
   delivery)
 - **Prerequisite:** #218 is closed. Its `AgentApiConfig.oauth` field and
   post-environment OAuth normalization handoff were re-read from `origin/main`
@@ -53,7 +53,10 @@ or malformed values fail atomically. Validation errors use only the frozen
 field/code classes `missing_required`, `invalid_bucket`, `invalid_region`,
 `invalid_prefix`, `invalid_endpoint`, `invalid_retention`, `invalid_max_age`,
 `invalid_temp_dir`, and `secret_field_rejected`. Unknown secret-shaped YAML
-fields return `backup: secret_field_rejected` without echoing a key value.
+fields—including `master_key`, `raw_secret`, `raw_key`, `secret`, `secret_key`,
+`secret_access_key`, `access_token`, and `credentials` plus separator-aware
+compound variants—return `backup: secret_field_rejected` without echoing a key
+value. Ordinary unknown keys retain serde's generic unknown-field error.
 
 Configured production endpoints are HTTPS origins with DNS hosts, no userinfo,
 query, fragment, or non-default port. HTTP loopback is accepted only through
@@ -97,6 +100,12 @@ Exit: 0
 Result: NUL prefix, endpoint query, max-age zero, and max-age overflow were
         already rejected; this test supplied regression coverage without a
         behavior change for those cases.
+
+Command: rtk cargo test --lib config::tests::backup_config_rejects_common_secret_shaped_unknown_yaml_fields -- --exact --nocapture
+Exit: 101
+Result: the new regression initially reported 0 passed, 1 failed, and 576
+        filtered out because the four common credential names fell through to
+        serde's generic unknown-field error.
 ```
 
 ### Focused GREEN evidence
@@ -125,6 +134,21 @@ Exit: 0
 Result: 44 passed, 532 filtered out (576 config tests available).
 ```
 
+At implementation head `5503c19c3769adfdabe670846d8b178891bd59c3`, the
+broadened secret-field regression and complete config module passed:
+
+```text
+Command: rtk cargo test --lib config::tests::backup_config_rejects_common_secret_shaped_unknown_yaml_fields -- --exact --nocapture
+Exit: 0
+Result: 1 passed, 576 filtered out; all four requested credential names return
+        backup: secret_field_rejected without the sentinel, while object_key
+        and monkey retain generic unknown-field errors.
+
+Command: rtk cargo test --lib config -- --nocapture
+Exit: 0
+Result: 45 passed, 532 filtered out (577 tests available).
+```
+
 The repository gate passed after installing the existing website lockfile
 dependencies in the disposable worktree:
 
@@ -138,6 +162,17 @@ Command: rtk make check
 Exit: 0
 Result: cargo test 576 passed, 0 failed; integration suites passed with
         6, 18, 233, 41, 3, 3, 3, 3, and 19 tests; doc-tests 3 passed;
+        cargo clippy, cargo doc, and Docusaurus build completed successfully.
+```
+
+At implementation head `5503c19c3769adfdabe670846d8b178891bd59c3`, the
+repository gate was repeated after the broadened regression:
+
+```text
+Command: rtk make check
+Exit: 0
+Result: cargo test 577 passed, 0 failed; integration suites passed with
+        6, 18, 233, 42, 3, 3, 3, 3, and 19 tests; doc-tests 3 passed;
         cargo clippy, cargo doc, and Docusaurus build completed successfully.
 ```
 
@@ -158,17 +193,17 @@ Command: rtk git diff --check
 Exit: 0
 ```
 
-The implementation range was inspected with:
+The implementation range through the current source head was inspected with:
 
 ```text
-Command: rtk git diff --name-status origin/main...8a4173bfc360c9cb8fd9a0a3cda81c9977743697
+Command: rtk git diff --name-status origin/main...5503c19c3769adfdabe670846d8b178891bd59c3
 Exit: 0
 Result: exactly the three owned paths src/config.rs, config/agent_voice.example.yaml,
         and .superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md.
 ```
 
-The seven implementation commits before this report are each one-file commits;
-`rtk git log --stat origin/main..8a4173bfc360c9cb8fd9a0a3cda81c9977743697`
+The nine delivery commits before this report are each one-file commits;
+`rtk git log --stat origin/main..5503c19c3769adfdabe670846d8b178891bd59c3`
 returned the following path boundaries:
 
 | Commit | Path | Change |
@@ -180,6 +215,8 @@ returned the following path boundaries:
 | `d746116312233b3ede61b9f0aff9c9b753c3b11d` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Record initial package evidence. |
 | `2adfb72bc65f3adcc5986897c1afaa4499776cec` | `src/config.rs` | Stabilize frozen rejection errors. |
 | `8a4173bfc360c9cb8fd9a0a3cda81c9977743697` | `src/config.rs` | Reject empty endpoint userinfo. |
+| `821e9f7900b0d44fb6be0e6c6e27800a08cda9c5` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Refresh full-SHA, LOCAL/STATIC/CI/LIVE evidence. |
+| `5503c19c3769adfdabe670846d8b178891bd59c3` | `src/config.rs` | Classify common secret-shaped keys and add focused regressions. |
 
 The repository-wide formatter remains a pre-existing, out-of-scope issue:
 
@@ -193,20 +230,20 @@ Result: drift only in untouched src/pa/fakes/mail.rs, src/service.rs, and
 
 ## CI
 
-At implementation head `8a4173bfc360c9cb8fd9a0a3cda81c9977743697`, PR #314
+At implementation head `5503c19c3769adfdabe670846d8b178891bd59c3`, PR #314
 reported all five checks green:
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| Quality Gates | PASS | [CI job 99546594271](https://github.com/djh00t/agent_voice/actions/runs/33409910568/job/99546594271) |
-| Compose Config | PASS | [CI job 99546594380](https://github.com/djh00t/agent_voice/actions/runs/33409910568/job/99546594380) |
-| Analyze (javascript-typescript) | PASS | [CodeQL job 99546595791](https://github.com/djh00t/agent_voice/actions/runs/33409910571/job/99546595791) |
-| Analyze (rust) | PASS | [CodeQL job 99546595539](https://github.com/djh00t/agent_voice/actions/runs/33409910571/job/99546595539) |
-| CodeQL aggregate | PASS | [aggregate run 99546832330](https://github.com/djh00t/agent_voice/runs/99546832330) |
+| Quality Gates | PASS | [CI job 99559816552](https://github.com/djh00t/agent_voice/actions/runs/33413883982/job/99559816552) |
+| Compose Config | PASS | [CI job 99559816242](https://github.com/djh00t/agent_voice/actions/runs/33413883982/job/99559816242) |
+| Analyze (javascript-typescript) | PASS | [CodeQL job 99559816370](https://github.com/djh00t/agent_voice/actions/runs/33413884007/job/99559816370) |
+| Analyze (rust) | PASS | [CodeQL job 99559816427](https://github.com/djh00t/agent_voice/actions/runs/33413884007/job/99559816427) |
+| CodeQL aggregate | PASS | [aggregate run 99560043383](https://github.com/djh00t/agent_voice/runs/99560043383) |
 
-This report-only commit will create a new PR workflow run. No status for that
-new head is claimed until GitHub reports it. CI is repository evidence only and
-does not substitute for live-provider or deployment evidence.
+This report-only commit will create a new PR workflow run; no status for that
+new report head is claimed until GitHub reports it. CI is repository evidence
+only and does not substitute for live-provider or deployment evidence.
 
 ## LIVE
 
@@ -243,7 +280,10 @@ The initial automated review also contained three stale threads. The current
 commit history proves the atomicity and multiline-template findings false, and
 the authoritative endpoint contract intentionally rejects production
 non-default ports. Those threads are reconciled inline with exact evidence and
-resolved separately from this report commit.
+resolved separately from this report commit. The common secret-field finding
+(`3896205037`) was answered by `3896329278` against implementation head
+`5503c19c3769adfdabe670846d8b178891bd59c3` and its thread was resolved; all
+four review threads were resolved at this capture.
 
 ## Acceptance mapping
 
@@ -251,13 +291,14 @@ resolved separately from this report commit.
 | --- | --- | --- |
 | `BackupConfig` exposes the frozen public fields and safe defaults | `backup_config_defaults_disabled_and_safe`; source review | PASS (LOCAL/STATIC) |
 | Exactly eight overrides win over YAML and reject blank/malformed values atomically | `backup_config_env_overrides_are_strict_and_normalized`; enabled negative selector | PASS (LOCAL) |
-| Stable error classes never echo raw values or secret-shaped fields | secret-field selector; redaction assertions; source review | PASS (LOCAL/STATIC) |
+| Stable error classes never echo raw values or secret-shaped fields | secret-field selectors, including common credential names; redaction assertions; source review | PASS (LOCAL/STATIC) |
 | Bucket, region, prefix, endpoint, policy, and scratch path fail closed | destination and required-negative selectors | PASS (LOCAL) |
 | Empty endpoint userinfo is rejected and non-default production ports remain disallowed | empty-userinfo selector; endpoint source review; frozen addendum | PASS (LOCAL/STATIC) |
 | Explicit test-only loopback HTTP is isolated from production validation | `backup_config_snapshot_and_runtime_handoffs` | PASS (LOCAL) |
 | Example mapping remains disabled-safe and exact | snapshot/runtime handoff selector | PASS (LOCAL) |
 
 **Package status:** implementation and evidence are ready for review; the live
-issue label remains `status:in-progress` at this capture. CI at the
-implementation head is green; live, deployment, merge, and approval evidence
-remain separate gates.
+issue label remains `status:in-progress` at this capture. CI at implementation
+head `5503c19c3769adfdabe670846d8b178891bd59c3` is green; this report-only
+commit's new CI run is pending until GitHub reports it. Live, deployment,
+merge, and approval evidence remain separate gates.
