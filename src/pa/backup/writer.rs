@@ -3,6 +3,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
 const TEMP_FILE_PREFIX: &str = ".agent-voice-snapshot-";
 const TEMP_COLLISION_LIMIT: usize = 32;
@@ -124,6 +126,30 @@ unsafe extern "C" {
     ) -> std::os::raw::c_int;
 }
 
+#[cfg(test)]
+static PUBLICATION_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
+
+#[cfg(test)]
+fn set_publication_barrier(barrier: Option<Arc<Barrier>>) {
+    *PUBLICATION_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("publication barrier is not poisoned") = barrier;
+}
+
+#[cfg(test)]
+fn wait_for_publication_race() {
+    let barrier = PUBLICATION_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("publication barrier is not poisoned")
+        .clone();
+    if let Some(barrier) = barrier {
+        barrier.wait();
+        barrier.wait();
+    }
+}
+
 fn write_inner(
     destination: &Path,
     encoded_snapshot: &[u8],
@@ -155,6 +181,8 @@ fn write_inner(
     temporary.close_file();
 
     ensure_destination_absent(destination)?;
+    #[cfg(test)]
+    wait_for_publication_race();
     if fault == FaultStage::Rename {
         return Err(WriterError::Rename);
     }
@@ -331,7 +359,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
     use super::{AtomicSnapshotWriter, WriterError, WriterFault, write_with_fault};
 
@@ -566,6 +594,32 @@ mod tests {
             fs::read(&destination).expect("destination remains"),
             b"prior destination bytes"
         );
+    }
+
+    #[test]
+    fn concurrent_destination_creation_is_not_replaced() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let destination = directory.destination("destination.bin");
+        let barrier = Arc::new(Barrier::new(2));
+        super::set_publication_barrier(Some(Arc::clone(&barrier)));
+
+        let writer_destination = destination.clone();
+        let writer =
+            std::thread::spawn(move || AtomicSnapshotWriter::write(&writer_destination, SNAPSHOT));
+        barrier.wait();
+        fs::write(&destination, b"concurrent destination bytes")
+            .expect("concurrent writer creates destination");
+        barrier.wait();
+
+        let result = writer.join().expect("writer thread completes");
+        super::set_publication_barrier(None);
+        assert_eq!(result, Err(WriterError::DestinationExists));
+        assert_eq!(
+            fs::read(&destination).expect("concurrent destination remains"),
+            b"concurrent destination bytes"
+        );
+        assert!(directory.temporary_entries().is_empty());
     }
 
     #[test]
