@@ -205,6 +205,39 @@ fn unknown_non_failure_audit_event_fails_closed() {
 }
 
 #[test]
+fn audit_validation_is_bounded_to_recent_events() {
+    let store = in_memory_store();
+    store
+        .connection()
+        .execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .expect("relax audit event fixture constraint");
+    store
+        .connection()
+        .execute(
+            "INSERT INTO audit_events(idempotency_key, event_type, entity_type, entity_id, occurred_at) VALUES ('old-unknown-audit-event', 'unknown', 'message', 'message-1', '2026-08-30T00:00:00Z')",
+            [],
+        )
+        .expect("seed old unknown audit event");
+    store
+        .connection()
+        .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+        .expect("restore audit event constraint");
+    for id in 0..100 {
+        store
+            .connection()
+            .execute(
+                "INSERT INTO audit_events(idempotency_key, event_type, entity_type, entity_id, occurred_at) VALUES (?1, 'message_recorded', 'message', ?1, '2026-08-31T00:00:00Z')",
+                [format!("recent-audit-{id}")],
+            )
+            .expect("seed recent audit event");
+    }
+
+    PaAdminStore::new(store)
+        .read_snapshot_at(time::macros::datetime!(2026-08-31 00:00 UTC))
+        .expect("read bounded audit projection");
+}
+
+#[test]
 fn failure_projection_orders_by_ascending_audit_id() {
     let store = in_memory_store();
     for (idempotency_key, occurred_at) in [
