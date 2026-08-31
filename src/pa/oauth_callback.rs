@@ -1,0 +1,69 @@
+//! OAuth callback validation and single-use state consumption.
+
+use std::fmt;
+
+use chrono::{DateTime, Utc};
+
+use crate::pa::oauth_start::OAuthError;
+
+/// Untrusted values received from an OAuth provider callback.
+pub struct OAuthCallback {
+    pub code: String,
+    pub state: String,
+}
+
+impl fmt::Debug for OAuthCallback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthCallback")
+            .field("code", &"<redacted>")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for OAuthCallback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+/// Opaque authorization code accepted by the token-exchange boundary.
+pub struct AuthorizationCode {
+    code: String,
+}
+
+impl AuthorizationCode {
+    /// Returns the exact authorization code for the token-exchange boundary.
+    pub fn as_str(&self) -> &str {
+        &self.code
+    }
+}
+
+impl fmt::Debug for AuthorizationCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthorizationCode(<redacted>)")
+    }
+}
+
+impl fmt::Display for AuthorizationCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+/// Validates callback input and consumes its reserved state exactly once.
+pub fn validate_callback(
+    state_store: &mut dyn crate::pa::oauth_start::OAuthStateStore,
+    callback: OAuthCallback,
+    now: DateTime<Utc>,
+) -> crate::pa::oauth_start::OAuthResult<AuthorizationCode> {
+    if callback.code.trim().is_empty() {
+        return Err(OAuthError::InvalidCode);
+    }
+
+    let _ = state_store.consume(&callback.state, now)?;
+    Ok(AuthorizationCode {
+        code: callback.code,
+    })
+}
