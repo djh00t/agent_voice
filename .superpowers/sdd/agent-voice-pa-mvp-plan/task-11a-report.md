@@ -5,11 +5,11 @@
 - **Evidence date:** 2026-09-01 (Australia/Sydney)
 - **Base SHA:** `a20a28be3be37c84cbe5046415497b7053dd8906` (`origin/main` after
   `rtk git fetch origin main`)
-- **Implementation head SHA:** `726392c40ed4b22cfcecf8d91871337c5b893f94`
+- **Implementation head SHA:** `1491c1316f2195323af3ffc5c9455894fe654662`
   (latest source/config implementation commit before this report-only change)
 - **PR:** [#314](https://github.com/djh00t/agent_voice/pull/314)
 - **Branch:** `codex/agent-voice-issue-85`
-- **Evidence worktree:** `/private/tmp/agent-voice-issue-85-single-quoted` (removed after
+- **Evidence worktree:** `/private/tmp/agent-voice-issue-85-report` (removed after
   delivery)
 - **Prerequisite:** #218 is closed. Its `AgentApiConfig.oauth` field and
   post-environment OAuth normalization handoff were re-read from `origin/main`
@@ -163,6 +163,15 @@ extends the same bounded guard to single-quoted policy keys and whitespace
 around quoted keys and colons. Both standard-block and inline simple-flow
 `AppConfig::load` regressions cover signed and oversized values without raw
 value echo.
+
+### Follow-up H trailing-comment flow evidence
+
+The follow-up implementation at `1491c1316f2195323af3ffc5c9455894fe654662`
+strips a trailing YAML comment before extracting the outer simple-flow mapping.
+This closes the remaining production-load gap for
+`backup: { retention_days: +30 } # policy` without broadening the bounded
+lexical scanner. The regression asserts the frozen redacted
+`backup.retention_days: invalid_retention` error and does not echo `+30`.
 
 ### Focused GREEN evidence
 
@@ -327,6 +336,27 @@ Result: cargo test 583 passed, 0 failed; integration suites passed with
         cargo clippy, cargo doc, and Docusaurus build completed successfully.
 ```
 
+At implementation head `1491c1316f2195323af3ffc5c9455894fe654662`, the
+trailing-comment flow regression and full local gate passed:
+
+```text
+Command: rtk run 'cargo test --lib config::tests::app_config_load_rejects_flow_policy_literal_followed_by_comment -- --exact --nocapture'
+Exit: 0
+Result: 1 passed, 583 filtered out; the signed flow-mapping literal with a
+       trailing YAML comment returns the frozen error without echoing `+30`.
+
+Command: rtk run 'cargo test --lib config::tests -- --nocapture'
+Exit: 0
+Result: 46 passed, 0 failed; the config and adjacent admin-configuration
+       tests passed.
+
+Command: rtk make check
+Exit: 0
+Result: cargo test 584 passed, 0 failed; integration suites passed with
+        6, 18, 233, 48, 3, 3, 3, 3, and 19 tests; doc-tests 3 passed;
+        cargo clippy, cargo doc, and Docusaurus build completed successfully.
+```
+
 Configuration normalization is clone-then-assign. Failed parsing or validation
 therefore publishes no partial config and performs no filesystem, clock,
 socket, network, provider, database, or token action. Re-loading identical
@@ -344,17 +374,18 @@ Command: rtk git diff --check
 Exit: 0
 ```
 
-The implementation range through the current source head was inspected with:
+The implementation range through source head
+`1491c1316f2195323af3ffc5c9455894fe654662` was inspected with:
 
 ```text
-Command: rtk git diff --name-status origin/main...726392c40ed4b22cfcecf8d91871337c5b893f94
+Command: rtk git diff --name-status origin/main...1491c1316f2195323af3ffc5c9455894fe654662
 Exit: 0
 Result: exactly the three owned paths src/config.rs, config/agent_voice.example.yaml,
         and .superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md.
 ```
 
-The sixteen delivery commits before this report are each one-file commits;
-`rtk git log --stat origin/main..726392c40ed4b22cfcecf8d91871337c5b893f94`
+The nineteen delivery commits before this report are each one-file commits;
+`rtk git log --stat origin/main..1491c1316f2195323af3ffc5c9455894fe654662`
 returned the following path boundaries:
 
 | Commit | Path | Change |
@@ -374,7 +405,10 @@ returned the following path boundaries:
 | `e3fda1fe1810c2a9bef23f5515a8bfd67193ab52` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Record YAML policy-error repair evidence and provenance. |
 | `8f1ce09125f412623307dd8420bfb144f5b87e2e` | `src/config.rs` | Map malformed YAML scalar fields to frozen redacted errors and add adversarial regressions. |
 | `c8ddc77f45931a02ad7b7f82ccb02488858034c5` | `src/config.rs` | Reject signed and oversized policy literals on the production file-load path. |
+| `fbc245619cf998dd8d1ea5fa3ce0a3bfd2014b72` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Finalize backup evidence before the quoted-key repair. |
 | `726392c40ed4b22cfcecf8d91871337c5b893f94` | `src/config.rs` | Match single-quoted policy keys and add block/flow regressions. |
+| `cd7d4512999e53de41a15ede55d5bb5df43fcc69` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Record quoted policy-key repair evidence and review state. |
+| `1491c1316f2195323af3ffc5c9455894fe654662` | `src/config.rs` | Scan flow policy mappings before trailing comments and add the regression. |
 
 The repository-wide formatter remains a pre-existing, out-of-scope issue:
 
@@ -432,7 +466,20 @@ PR run was in progress at report capture:
 | Analyze (rust) | IN_PROGRESS | [CodeQL job 99601432840](https://github.com/djh00t/agent_voice/actions/runs/33426556101/job/99601432840) |
 | CodeQL aggregate | NOT REPORTED | not yet emitted while analysis jobs run |
 
-This report-only commit will create another PR workflow run; no status for that
+At implementation head `1491c1316f2195323af3ffc5c9455894fe654662`, the fresh
+PR run `33429310808` completed successfully. Its repository CI jobs were green;
+the paired CodeQL run had JavaScript analysis green and Rust analysis pending at
+report capture:
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Quality Gates | PASS | [CI job 99610499540](https://github.com/djh00t/agent_voice/actions/runs/33429310808/job/99610499540) |
+| Compose Config | PASS | [CI job 99610499743](https://github.com/djh00t/agent_voice/actions/runs/33429310808/job/99610499743) |
+| Analyze (javascript-typescript) | PASS | [CodeQL job 99610499550](https://github.com/djh00t/agent_voice/actions/runs/33429310805/job/99610499550) |
+| Analyze (rust) | PENDING | [CodeQL job 99610500087](https://github.com/djh00t/agent_voice/actions/runs/33429310805/job/99610500087) |
+| CodeQL aggregate | SKIPPING | [aggregate run 99610724526](https://github.com/djh00t/agent_voice/runs/99610724526) |
+
+This report-only commit will create another PR workflow run; no status for the
 new report head is claimed until GitHub reports it. CI is repository evidence
 only and does not substitute for live-provider or deployment evidence.
 
@@ -484,6 +531,9 @@ six review threads were resolved at the c8 implementation-head capture.
 The single-quoted-key finding (`3897240948`) was answered by `3897325896`
 against `726392c40ed4b22cfcecf8d91871337c5b893f94` and its thread was resolved;
 all seven review threads were resolved at this capture.
+The trailing-comment flow finding (`3897415385`) was answered by `3897560105`
+against `1491c1316f2195323af3ffc5c9455894fe654662` and its thread was resolved;
+all eight review threads were resolved at this capture.
 
 ## Acceptance mapping
 
@@ -494,7 +544,7 @@ all seven review threads were resolved at this capture.
 | Stable error classes never echo raw values or secret-shaped fields | secret-field selectors, YAML enabled/scalar selectors, redaction assertions, and source review | PASS (LOCAL/STATIC) |
 | Bucket, region, prefix, endpoint, policy, and scratch path fail closed | destination, required-negative, and YAML policy-error selectors | PASS (LOCAL) |
 | YAML wrong-type and out-of-range policy values map to frozen redacted errors | `backup_config_yaml_policy_errors_are_frozen_and_redacted` | PASS (LOCAL/STATIC) |
-| Production file loads reject signed and oversized policy literals before semantic YAML parsing | `app_config_load_rejects_signed_and_oversized_backup_policy_literals`, single-quoted block/flow selectors, and raw-lexeme guard source review | PASS (LOCAL/STATIC; standard block/simple-flow scope) |
+| Production file loads reject signed and oversized policy literals before semantic YAML parsing | `app_config_load_rejects_signed_and_oversized_backup_policy_literals`, single-quoted block/flow selectors, trailing-comment flow selector, and raw-lexeme guard source review | PASS (LOCAL/STATIC; standard block/simple-flow scope) |
 | Direct `BackupConfig` parsing rejects lexical plus signs | `serde_yaml` semantic-number boundary | LIMITATION (documented; not claimed) |
 | Empty endpoint userinfo is rejected and non-default production ports remain disallowed | empty-userinfo selector; endpoint source review; frozen addendum | PASS (LOCAL/STATIC) |
 | Explicit test-only loopback HTTP is isolated from production validation | `backup_config_snapshot_and_runtime_handoffs` | PASS (LOCAL) |
@@ -502,8 +552,8 @@ all seven review threads were resolved at this capture.
 
 **Package status:** implementation and evidence are ready for review; the live
 issue label remains `status:in-progress` at this capture. CI for implementation
-head `726392c40ed4b22cfcecf8d91871337c5b893f94` had Compose Config green while
-Quality Gates and both CodeQL analyses were in progress. This report-only commit
-will trigger a new PR workflow; its report-head status is not claimed until
-GitHub reports it. Live, deployment,
+head `1491c1316f2195323af3ffc5c9455894fe654662` has Quality Gates and Compose
+Config green, JavaScript CodeQL green, and Rust CodeQL pending at report capture.
+This report-only commit will trigger a new PR workflow; its report-head status is
+not claimed until GitHub reports it. Live, deployment,
 merge, and approval evidence remain separate gates.
