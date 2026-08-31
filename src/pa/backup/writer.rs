@@ -13,6 +13,8 @@ use rustix::{
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Write};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(windows)]
@@ -506,6 +508,52 @@ fn trusted_parent_stat(stat: &rustix_fs::Stat) -> bool {
         && parent_owner_matches_effective_uid(stat.st_uid, process::geteuid().as_raw())
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const ACL_TYPE_EXTENDED: std::ffi::c_int = 0x0000_0100;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe extern "C" {
+    fn acl_free(object: *mut std::ffi::c_void) -> std::ffi::c_int;
+    fn acl_get_fd_np(fd: std::ffi::c_int, acl_type: std::ffi::c_int) -> *mut std::ffi::c_void;
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+struct ExtendedAcl(*mut std::ffi::c_void);
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl ExtendedAcl {
+    fn from_directory(directory: &File) -> Result<Option<Self>, ()> {
+        let acl = unsafe { acl_get_fd_np(directory.as_raw_fd(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            return if io::Error::last_os_error().kind() == ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(())
+            };
+        }
+        Ok(Some(Self(acl)))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl Drop for ExtendedAcl {
+    fn drop(&mut self) {
+        unsafe {
+            acl_free(self.0);
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn trusted_parent_acl(directory: &File) -> bool {
+    matches!(ExtendedAcl::from_directory(directory), Ok(None))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn trusted_parent_acl(_directory: &File) -> bool {
+    true
+}
+
 #[cfg(unix)]
 fn destination_parent(destination: &Path) -> Result<&Path, WriterError> {
     if destination.file_name().is_none() {
@@ -539,6 +587,7 @@ fn open_parent_directory(parent: &Path) -> Result<File, WriterError> {
     if !handle_metadata.is_dir()
         || !same_file(&handle_metadata, &path_metadata)
         || !trusted_parent_stat(&stat)
+        || !trusted_parent_acl(&directory)
     {
         return Err(WriterError::InvalidDestination);
     }
@@ -1432,6 +1481,54 @@ mod tests {
             .expect("restore private test parent");
         assert_eq!(result, Err(WriterError::InvalidDestination));
         assert!(!destination.exists());
+        assert!(directory.temporary_entries().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extended_acl_parent_is_rejected_before_temporary_creation() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let destination = directory.destination("destination.bin");
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow write,delete"])
+            .arg(&directory.path)
+            .status()
+            .expect("install extended ACL on private test parent");
+        assert!(
+            status.success(),
+            "install extended ACL on private test parent"
+        );
+
+        let result = AtomicSnapshotWriter::write(&destination, SNAPSHOT);
+
+        let status = std::process::Command::new("chmod")
+            .args(["-N"])
+            .arg(&directory.path)
+            .status()
+            .expect("remove extended ACL from private test parent");
+        assert!(
+            status.success(),
+            "remove extended ACL from private test parent"
+        );
+        assert_eq!(result, Err(WriterError::InvalidDestination));
+        assert!(!destination.exists());
+        assert!(directory.temporary_entries().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_parent_without_extended_acl_is_accepted() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let destination = directory.destination("destination.bin");
+
+        published_or_directory_sync(AtomicSnapshotWriter::write(&destination, SNAPSHOT));
+
+        assert_eq!(
+            fs::read(&destination).expect("published snapshot"),
+            SNAPSHOT
+        );
         assert!(directory.temporary_entries().is_empty());
     }
 
