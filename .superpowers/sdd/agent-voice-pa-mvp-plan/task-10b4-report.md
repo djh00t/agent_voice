@@ -5,7 +5,7 @@
 - **Issue:** [#221](https://github.com/djh00t/agent_voice/issues/221)
 - **Evidence date:** 2026-08-31 20:38 AEST
 - **Branch:** `codex/agent-voice-pa-10b4-realtime-events`
-- **Base:** `5799e89978e335783f8c05b14b2b04cf9292251c` (`origin/main`)
+- **Base:** `b1b83562b3f2f92b58445448a76ab770a977597f` (`origin/main`)
 - **Merged prerequisites:** PR #233 for #217 merged at
   `57643df4410b217743e8e582fa844cea8864b7fb`; PR #245 for #219 merged at
   `a160254804c2d3e78631057af29530b5f96c17dd`; transitive #215 is closed.
@@ -130,10 +130,10 @@ deployment, or authenticated-UAT evidence is claimed here.
 
 Implementation commits are atomic and one-file scoped:
 
-- `b925255` — focused test in `src/realtime/server_session_events.rs`.
-- `31950d9` — integration harness in
+- `3f23631` — focused test in `src/realtime/server_session_events.rs`.
+- `0fb5bd9` — integration harness in
   `tests/realtime_server_session_events_contract.rs`.
-- `6865514` — event values and implementation in
+- `2685afb` — event values and implementation in
   `src/realtime/server_session_events.rs`.
 - The report updates are separate report-only commits and do not alter the
   implementation or integration harness.
