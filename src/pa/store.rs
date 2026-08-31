@@ -13733,6 +13733,16 @@ END;
             .expect("invalid stream row count");
         assert!(count == 0);
 
+        let printable_stream = "microsoft.mail:account-a printable";
+        let printable_cursor = "page=abc/def+ 1";
+        store
+            .advance_provider_cursor(printable_stream, None, printable_cursor)
+            .expect("provider-compatible cursor must persist");
+        assert!(matches!(
+            store.load_provider_cursor(printable_stream),
+            Ok(Some(value)) if value == printable_cursor
+        ));
+
         store
             .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
             .expect("seed cursor");
