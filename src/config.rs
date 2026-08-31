@@ -100,12 +100,20 @@ impl AppConfig {
     }
 
     fn backup_yaml_policy_lexeme(line: &str) -> Option<(&str, &str)> {
+        let line = line.trim_start();
         for field in ["retention_days", "max_age_hours"] {
-            let value = line.strip_prefix(field).or_else(|| {
-                line.strip_prefix('"')
-                    .and_then(|line| line.strip_prefix(field))
-                    .and_then(|line| line.strip_prefix('"'))
-            });
+            let value = line
+                .strip_prefix(field)
+                .or_else(|| {
+                    line.strip_prefix('"')
+                        .and_then(|line| line.strip_prefix(field))
+                        .and_then(|line| line.strip_prefix('"'))
+                })
+                .or_else(|| {
+                    line.strip_prefix('\'')
+                        .and_then(|line| line.strip_prefix(field))
+                        .and_then(|line| line.strip_prefix('\''))
+                });
             if let Some(value) = value
                 .map(str::trim_start)
                 .and_then(|line| line.strip_prefix(':'))
@@ -3890,6 +3898,137 @@ agent_api:
 
             assert_eq!(error, expected);
             assert!(!error.contains(literal));
+        }
+    }
+
+    fn replace_backup_yaml_mapping(raw: &str, mapping: &str) -> String {
+        let mut result = String::new();
+        let mut skipping_backup = false;
+        let mut found_backup = false;
+        for line in raw.lines() {
+            if !skipping_backup && line == "backup:" {
+                result.push_str(mapping);
+                result.push('\n');
+                skipping_backup = true;
+                found_backup = true;
+                continue;
+            }
+            if skipping_backup && !line.starts_with([' ', '\t']) {
+                skipping_backup = false;
+            }
+            if !skipping_backup {
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+        assert!(
+            found_backup,
+            "serialized AppConfig must contain backup mapping"
+        );
+        result
+    }
+
+    fn assert_backup_policy_load_error(
+        yaml: String,
+        expected: &str,
+        literal: &str,
+        mapping_kind: &str,
+    ) {
+        let path = std::env::temp_dir().join(format!(
+            "agent-voice-backup-policy-single-quoted-{}-{}-{}.yaml",
+            std::process::id(),
+            mapping_kind,
+            literal.len()
+        ));
+        fs::write(&path, yaml).unwrap();
+        let result = AppConfig::load(Some(&path), false);
+        fs::remove_file(&path).unwrap();
+        let error = result.unwrap_err().to_string();
+        assert_eq!(error, expected);
+        assert!(!error.contains(literal));
+    }
+
+    #[test]
+    fn app_config_load_rejects_single_quoted_block_policy_literals() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+
+        for (field, default, literal, expected) in [
+            (
+                "retention_days",
+                30,
+                "+30",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                24,
+                "+24",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+            (
+                "retention_days",
+                30,
+                "18446744073709551616",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                24,
+                "340282366920938463463374607431768211456",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+        ] {
+            let yaml = base_yaml.replacen(
+                &format!("{field}: {default}"),
+                &format!("'{field}' : {literal}"),
+                1,
+            );
+            assert_ne!(yaml, base_yaml);
+            assert_backup_policy_load_error(yaml, expected, literal, "block");
+        }
+    }
+
+    #[test]
+    fn app_config_load_rejects_single_quoted_flow_policy_literals() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+
+        for (field, literal, expected) in [
+            (
+                "retention_days",
+                "+30",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                "+24",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+            (
+                "retention_days",
+                "18446744073709551616",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                "340282366920938463463374607431768211456",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+        ] {
+            let yaml = replace_backup_yaml_mapping(
+                &base_yaml,
+                &format!("backup: {{ '{field}' : {literal} }}"),
+            );
+            assert_backup_policy_load_error(yaml, expected, literal, "flow");
         }
     }
 
