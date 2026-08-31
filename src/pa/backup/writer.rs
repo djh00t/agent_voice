@@ -576,6 +576,77 @@ fn same_path(left: &Path, right: &Path) -> bool {
             .filter(|component| !matches!(component, Component::CurDir)))
 }
 
+struct CreatedTemporary {
+    path: PathBuf,
+    parent: Option<File>,
+    file: Option<File>,
+    identity: Option<fs::Metadata>,
+    armed: bool,
+}
+
+impl CreatedTemporary {
+    fn new(path: PathBuf, parent: File, file: File) -> Self {
+        Self {
+            path,
+            parent: Some(parent),
+            file: Some(file),
+            identity: None,
+            armed: true,
+        }
+    }
+
+    fn file(&self) -> &File {
+        self.file
+            .as_ref()
+            .expect("created temporary file remains open during initialization")
+    }
+
+    fn into_parts(mut self) -> (PathBuf, File, File, fs::Metadata) {
+        self.armed = false;
+        (
+            std::mem::take(&mut self.path),
+            self.parent
+                .take()
+                .expect("created temporary parent remains open during initialization"),
+            self.file
+                .take()
+                .expect("created temporary file remains open during initialization"),
+            self.identity
+                .take()
+                .expect("created temporary identity is recorded before publication"),
+        )
+    }
+}
+
+impl Drop for CreatedTemporary {
+    fn drop(&mut self) {
+        if self.armed {
+            #[cfg(unix)]
+            {
+                let Some(parent) = self.parent.as_ref() else {
+                    return;
+                };
+                let Ok(name) = path_name(&self.path) else {
+                    return;
+                };
+                if let Some(identity) = self.identity.as_ref() {
+                    let Ok(current) = fs::symlink_metadata(&self.path) else {
+                        return;
+                    };
+                    if !same_file(identity, &current) {
+                        return;
+                    }
+                }
+                let _ = unlink_at(parent, &name);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
 struct TemporaryFile {
     path: PathBuf,
     parent: File,
@@ -590,9 +661,6 @@ impl TemporaryFile {
         parent_directory: &File,
         destination: &Path,
     ) -> Result<Self, WriterError> {
-        let parent_handle = parent_directory
-            .try_clone()
-            .map_err(|_| WriterError::Write)?;
         for _ in 0..TEMP_COLLISION_LIMIT {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = temporary_path(parent, sequence);
@@ -607,25 +675,29 @@ impl TemporaryFile {
 
                 options.mode(0o600);
             }
+            let parent_handle = parent_directory
+                .try_clone()
+                .map_err(|_| WriterError::Write)?;
             match options.open(&path) {
                 Ok(file) => {
+                    let mut created = CreatedTemporary::new(path, parent_handle, file);
+                    let identity = match created.file().metadata() {
+                        Ok(identity) => identity,
+                        Err(_) => return Err(WriterError::Write),
+                    };
+                    created.identity = Some(identity);
                     #[cfg(unix)]
-                    if file
+                    if created
+                        .file()
                         .set_permissions(fs::Permissions::from_mode(0o600))
                         .is_err()
                     {
                         return Err(WriterError::Write);
                     }
-                    let identity = match file.metadata() {
-                        Ok(identity) => identity,
-                        Err(_) => {
-                            drop(file);
-                            return Err(WriterError::Write);
-                        }
-                    };
+                    let (path, parent, file, identity) = created.into_parts();
                     return Ok(Self {
                         path,
-                        parent: parent_handle,
+                        parent,
                         file: Some(file),
                         identity,
                         armed: true,
@@ -816,6 +888,26 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("writer test lock is not poisoned")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_temporary_guard_removes_unpublished_sibling() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let path = directory.destination("guarded.tmp");
+        let parent = fs::File::open(&directory.path).expect("test parent remains openable");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("created temporary sibling");
+
+        let guard = super::CreatedTemporary::new(path.clone(), parent, file);
+        drop(guard);
+
+        assert!(!path.exists(), "failed initialization removes sibling");
     }
 
     #[cfg(any(
