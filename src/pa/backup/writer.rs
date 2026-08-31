@@ -8,6 +8,7 @@ use rustix::fs::RenameFlags;
 #[cfg(unix)]
 use rustix::{
     fs::{self as rustix_fs, AtFlags, FileType, Mode, OFlags},
+    process,
 };
 use std::fmt;
 use std::fs::{self, File};
@@ -495,8 +496,14 @@ fn same_file(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
+fn parent_owner_matches_effective_uid(parent_uid: u32, effective_uid: u32) -> bool {
+    parent_uid == effective_uid
+}
+
+#[cfg(unix)]
 fn trusted_parent_stat(stat: &rustix_fs::Stat) -> bool {
     stat.st_mode & 0o022 == 0
+        && parent_owner_matches_effective_uid(stat.st_uid, process::geteuid().as_raw())
 }
 
 #[cfg(unix)]
@@ -1426,6 +1433,13 @@ mod tests {
         assert_eq!(result, Err(WriterError::InvalidDestination));
         assert!(!destination.exists());
         assert!(directory.temporary_entries().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_parent_owner_must_match_the_effective_writer_uid() {
+        assert!(super::parent_owner_matches_effective_uid(501, 501));
+        assert!(!super::parent_owner_matches_effective_uid(502, 501));
     }
 
     #[cfg(any(
