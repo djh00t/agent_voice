@@ -37,11 +37,12 @@ The final package owns exactly these three paths:
   path. It contains no copied production implementation or dispatcher.
 - `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`: this report.
 
-The final changed-path readback before the report commit was:
+The final changed-path readback after the report commit is:
 
 ```text
 src/realtime/server_response_events.rs
 tests/realtime_server_response_events_contract.rs
+.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md
 ```
 
 No registration, export, dispatcher, transport, provider, configuration,
@@ -165,13 +166,13 @@ authenticated UAT were not run or observed locally.
 
 ## Delivery readback
 
-Implementation commits are one-file atomic commits:
+Package commits are one-file atomic commits:
 
 - `a9be996` — harness only: `tests/realtime_server_response_events_contract.rs`
 - `90cc705` — implementation and inline test only:
   `src/realtime/server_response_events.rs`
-- The report will be committed separately as this one-file documentation
-  change.
+- `6687be0` — report only:
+  `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
 
 The delivering PR footer is exactly:
 
