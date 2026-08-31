@@ -5,11 +5,11 @@
 - **Evidence date:** 2026-09-01 (Australia/Sydney)
 - **Base SHA:** `a20a28be3be37c84cbe5046415497b7053dd8906` (`origin/main` after
   `rtk git fetch origin main`)
-- **Implementation head SHA:** `5503c19c3769adfdabe670846d8b178891bd59c3`
+- **Implementation head SHA:** `d6e03cb8dc476f499e5cdb6d3aea5525be03c785`
   (latest source/config implementation commit before this report-only change)
 - **PR:** [#314](https://github.com/djh00t/agent_voice/pull/314)
 - **Branch:** `codex/agent-voice-issue-85`
-- **Evidence worktree:** `/private/tmp/agent-voice-issue-85-e` (removed after
+- **Evidence worktree:** `/private/tmp/agent-voice-issue-85-retention` (removed after
   delivery)
 - **Prerequisite:** #218 is closed. Its `AgentApiConfig.oauth` field and
   post-environment OAuth normalization handoff were re-read from `origin/main`
@@ -57,6 +57,9 @@ fields—including `master_key`, `raw_secret`, `raw_key`, `secret`, `secret_key`
 `secret_access_key`, `access_token`, and `credentials` plus separator-aware
 compound variants—return `backup: secret_field_rejected` without echoing a key
 value. Ordinary unknown keys retain serde's generic unknown-field error.
+YAML policy values also use bounded intermediates so wrong-type and
+out-of-range `retention_days` and `max_age_hours` inputs map to their frozen
+field/code errors without echoing raw values.
 
 Configured production endpoints are HTTPS origins with DNS hosts, no userinfo,
 query, fragment, or non-default port. HTTP loopback is accepted only through
@@ -118,6 +121,21 @@ Result: 0 passed, 1 failed, and 576 filtered out because the four common
         credential names fell through to serde's generic unknown-field error.
 ```
 
+### Remediation E RED evidence
+
+The YAML policy-error regression was authored for the change delivered at
+implementation head `d6e03cb8dc476f499e5cdb6d3aea5525be03c785`; it did not
+exist at the preceding report head `ea4f0916ba9386ee34c25bf95c4baad6b1be8128`.
+The RED run occurred on that predecessor before the source and test change was
+committed:
+
+```text
+Command: rtk cargo test --lib config::tests::backup_config_yaml_policy_errors_are_frozen_and_redacted -- --exact --nocapture
+Exit: 101
+Result: 0 passed, 1 failed, and 577 filtered out because retention_days: 0
+        deserialized successfully instead of returning the frozen error class.
+```
+
 ### Focused GREEN evidence
 
 At implementation head `8a4173bfc360c9cb8fd9a0a3cda81c9977743697`, each exact
@@ -163,6 +181,21 @@ Exit: 0
 Result: 45 passed, 532 filtered out (577 tests available).
 ```
 
+At implementation head `d6e03cb8dc476f499e5cdb6d3aea5525be03c785`, the YAML
+policy-error regression was present and passed, alongside the complete config
+module:
+
+```text
+Command: rtk cargo test --lib config::tests::backup_config_yaml_policy_errors_are_frozen_and_redacted -- --exact --nocapture
+Exit: 0
+Result: 1 passed, 577 filtered out; wrong-type, zero, and overflow policy
+        values return the exact frozen errors without echoing raw values.
+
+Command: rtk cargo test --lib config -- --nocapture
+Exit: 0
+Result: 46 passed, 532 filtered out (578 tests available).
+```
+
 The repository gate passed after installing the existing website lockfile
 dependencies in the disposable worktree:
 
@@ -190,6 +223,17 @@ Result: cargo test 577 passed, 0 failed; integration suites passed with
         cargo clippy, cargo doc, and Docusaurus build completed successfully.
 ```
 
+At implementation head `d6e03cb8dc476f499e5cdb6d3aea5525be03c785`, the
+repository gate was repeated after the policy-error fix:
+
+```text
+Command: rtk make check
+Exit: 0
+Result: cargo test 578 passed, 0 failed; integration suites passed with
+        6, 18, 233, 43, 3, 3, 3, 3, and 19 tests; doc-tests 3 passed;
+        cargo clippy, cargo doc, and Docusaurus build completed successfully.
+```
+
 Configuration normalization is clone-then-assign. Failed parsing or validation
 therefore publishes no partial config and performs no filesystem, clock,
 socket, network, provider, database, or token action. Re-loading identical
@@ -210,14 +254,14 @@ Exit: 0
 The implementation range through the current source head was inspected with:
 
 ```text
-Command: rtk git diff --name-status origin/main...5503c19c3769adfdabe670846d8b178891bd59c3
+Command: rtk git diff --name-status origin/main...d6e03cb8dc476f499e5cdb6d3aea5525be03c785
 Exit: 0
 Result: exactly the three owned paths src/config.rs, config/agent_voice.example.yaml,
         and .superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md.
 ```
 
-The nine delivery commits before this report are each one-file commits;
-`rtk git log --stat origin/main..5503c19c3769adfdabe670846d8b178891bd59c3`
+The twelve delivery commits before this report are each one-file commits;
+`rtk git log --stat origin/main..d6e03cb8dc476f499e5cdb6d3aea5525be03c785`
 returned the following path boundaries:
 
 | Commit | Path | Change |
@@ -231,6 +275,9 @@ returned the following path boundaries:
 | `8a4173bfc360c9cb8fd9a0a3cda81c9977743697` | `src/config.rs` | Reject empty endpoint userinfo. |
 | `821e9f7900b0d44fb6be0e6c6e27800a08cda9c5` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Refresh full-SHA, LOCAL/STATIC/CI/LIVE evidence. |
 | `5503c19c3769adfdabe670846d8b178891bd59c3` | `src/config.rs` | Classify common secret-shaped keys and add focused regressions. |
+| `b9cb959660312b9ea1fdec16726312c8948a507f` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Record current implementation, regression, review, and CI evidence. |
+| `ea4f0916ba9386ee34c25bf95c4baad6b1be8128` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Clarify historical provenance for the broadened secret-key regression. |
+| `d6e03cb8dc476f499e5cdb6d3aea5525be03c785` | `src/config.rs` | Freeze YAML policy errors and add wrong-type/overflow regressions. |
 
 The repository-wide formatter remains a pre-existing, out-of-scope issue:
 
@@ -244,7 +291,7 @@ Result: drift only in untouched src/pa/fakes/mail.rs, src/service.rs, and
 
 ## CI
 
-At implementation head `5503c19c3769adfdabe670846d8b178891bd59c3`, PR #314
+The prior implementation head `5503c19c3769adfdabe670846d8b178891bd59c3`
 reported all five checks green:
 
 | Check | Result | Evidence |
@@ -255,7 +302,18 @@ reported all five checks green:
 | Analyze (rust) | PASS | [CodeQL job 99559816427](https://github.com/djh00t/agent_voice/actions/runs/33413884007/job/99559816427) |
 | CodeQL aggregate | PASS | [aggregate run 99560043383](https://github.com/djh00t/agent_voice/runs/99560043383) |
 
-This report-only commit will create a new PR workflow run; no status for that
+At the current repair head `d6e03cb8dc476f499e5cdb6d3aea5525be03c785`, the
+fresh CI run is partially complete:
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Quality Gates | PENDING | [CI job 99574695696](https://github.com/djh00t/agent_voice/actions/runs/33418456370/job/99574695696) |
+| Compose Config | PASS | [CI job 99574695445](https://github.com/djh00t/agent_voice/actions/runs/33418456370/job/99574695445) |
+| Analyze (javascript-typescript) | PASS | [CodeQL job 99574696394](https://github.com/djh00t/agent_voice/actions/runs/33418456384/job/99574696394) |
+| Analyze (rust) | PENDING | [CodeQL job 99574696812](https://github.com/djh00t/agent_voice/actions/runs/33418456384/job/99574696812) |
+| CodeQL aggregate | NEUTRAL / SKIPPING | [aggregate run 99574940345](https://github.com/djh00t/agent_voice/runs/99574940345) |
+
+This report-only commit will create another PR workflow run; no status for that
 new report head is claimed until GitHub reports it. CI is repository evidence
 only and does not substitute for live-provider or deployment evidence.
 
@@ -297,7 +355,10 @@ non-default ports. Those threads are reconciled inline with exact evidence and
 resolved separately from this report commit. The common secret-field finding
 (`3896205037`) was answered by `3896329278` against implementation head
 `5503c19c3769adfdabe670846d8b178891bd59c3` and its thread was resolved; all
-four review threads were resolved at this capture.
+four review threads were resolved at that capture. The YAML policy-error
+finding (`3896592605`) was answered by `3896701634` against repair head
+`d6e03cb8dc476f499e5cdb6d3aea5525be03c785` and its thread was resolved; all
+five review threads were resolved at this capture.
 
 ## Acceptance mapping
 
@@ -306,13 +367,14 @@ four review threads were resolved at this capture.
 | `BackupConfig` exposes the frozen public fields and safe defaults | `backup_config_defaults_disabled_and_safe`; source review | PASS (LOCAL/STATIC) |
 | Exactly eight overrides win over YAML and reject blank/malformed values atomically | `backup_config_env_overrides_are_strict_and_normalized`; enabled negative selector | PASS (LOCAL) |
 | Stable error classes never echo raw values or secret-shaped fields | secret-field selectors, including common credential names; redaction assertions; source review | PASS (LOCAL/STATIC) |
-| Bucket, region, prefix, endpoint, policy, and scratch path fail closed | destination and required-negative selectors | PASS (LOCAL) |
+| Bucket, region, prefix, endpoint, policy, and scratch path fail closed | destination, required-negative, and YAML policy-error selectors | PASS (LOCAL) |
+| YAML wrong-type and out-of-range policy values map to frozen redacted errors | `backup_config_yaml_policy_errors_are_frozen_and_redacted` | PASS (LOCAL/STATIC) |
 | Empty endpoint userinfo is rejected and non-default production ports remain disallowed | empty-userinfo selector; endpoint source review; frozen addendum | PASS (LOCAL/STATIC) |
 | Explicit test-only loopback HTTP is isolated from production validation | `backup_config_snapshot_and_runtime_handoffs` | PASS (LOCAL) |
 | Example mapping remains disabled-safe and exact | snapshot/runtime handoff selector | PASS (LOCAL) |
 
 **Package status:** implementation and evidence are ready for review; the live
-issue label remains `status:in-progress` at this capture. CI at implementation
-head `5503c19c3769adfdabe670846d8b178891bd59c3` is green; this report-only
-commit's new CI run is pending until GitHub reports it. Live, deployment,
-merge, and approval evidence remain separate gates.
+issue label remains `status:in-progress` at this capture. CI for the repair
+head `d6e03cb8dc476f499e5cdb6d3aea5525be03c785` is partially complete; this
+report-only commit's new CI run is pending until GitHub reports it. Live,
+deployment, merge, and approval evidence remain separate gates.
