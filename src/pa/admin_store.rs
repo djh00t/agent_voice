@@ -185,7 +185,7 @@ fn read_connections(
 ) -> StoreResult<Vec<AdminConnection>> {
     let mut statement = connection.prepare("SELECT id, provider, account_id, expires_at FROM oauth_credentials ORDER BY provider ASC, account_id ASC, id ASC LIMIT ?1").map_err(|_| invalid())?;
     let rows = statement
-        .query_map([LIMIT], |row| connection_from_row(row, observed_at))
+        .query_map([LIMIT + 2], |row| connection_from_row(row, observed_at))
         .map_err(|_| invalid())?;
     let mut connections = vec![
         missing(AdminProvider::Google),
@@ -250,7 +250,7 @@ fn connection_from_row(
 }
 
 fn read_proposals(connection: &rusqlite::Connection) -> StoreResult<Vec<AdminProposal>> {
-    let mut statement = connection.prepare("SELECT p.id, p.state, a.kind, a.starts_at, a.ends_at, p.created_at, p.updated_at FROM proposals p LEFT JOIN appointment_drafts a ON a.id = p.appointment_draft_id WHERE p.owner_task_draft_id IS NULL ORDER BY p.id ASC LIMIT ?1").map_err(|_| invalid())?;
+    let mut statement = connection.prepare("SELECT p.id, p.state, a.kind, a.starts_at, a.ends_at, p.created_at, p.updated_at FROM proposals p LEFT JOIN appointment_drafts a ON a.id = p.appointment_draft_id ORDER BY p.id ASC LIMIT ?1").map_err(|_| invalid())?;
     statement
         .query_map([LIMIT], proposal_from_row)
         .map_err(|_| invalid())?
@@ -294,40 +294,20 @@ fn proposal_from_row(row: &Row<'_>) -> rusqlite::Result<AdminProposal> {
 }
 
 fn read_failures(connection: &rusqlite::Connection) -> StoreResult<Vec<AdminFailure>> {
+    let mut validation = connection
+        .prepare("SELECT id, event_type, occurred_at FROM audit_events ORDER BY id ASC")
+        .map_err(|_| invalid())?;
+    for row in validation
+        .query_map([], audit_event_from_row)
+        .map_err(|_| invalid())?
+    {
+        row.map_err(|_| invalid())?;
+    }
     let mut statement = connection
-        .prepare("SELECT id, event_type, occurred_at FROM audit_events WHERE event_type = 'notification_retry_scheduled' ORDER BY occurred_at DESC, id DESC LIMIT ?1")
+        .prepare("SELECT id, event_type, occurred_at FROM audit_events WHERE event_type = 'notification_retry_scheduled' ORDER BY id ASC LIMIT ?1")
         .map_err(|_| invalid())?;
     let rows = statement
-        .query_map([LIMIT], |row| {
-            let id: i64 = row.get(0)?;
-            let event: String = row.get(1)?;
-            let occurred: String = row.get(2)?;
-            if id < 1 {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            let known = matches!(
-                event.as_str(),
-                "message_recorded"
-                    | "request_submitted"
-                    | "owner_task_submitted"
-                    | "proposal_created"
-                    | "proposal_accepted"
-                    | "proposal_declined"
-                    | "proposal_expired"
-                    | "proposal_promoted"
-                    | "notification_enqueued"
-                    | "notification_sent"
-                    | "notification_retry_scheduled"
-                    | "provider_cursor_advanced"
-            );
-            if !known {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            let occurred_at =
-                timestamp(parse_timestamp(&occurred).map_err(|_| rusqlite::Error::InvalidQuery)?)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
-            Ok((id, event, occurred_at))
-        })
+        .query_map([LIMIT], audit_event_from_row)
         .map_err(|_| invalid())?;
     let mut failures = Vec::new();
     for row in rows {
@@ -342,6 +322,35 @@ fn read_failures(connection: &rusqlite::Connection) -> StoreResult<Vec<AdminFail
         }
     }
     Ok(failures)
+}
+
+fn audit_event_from_row(row: &Row<'_>) -> rusqlite::Result<(i64, String, String)> {
+    let id: i64 = row.get(0)?;
+    let event: String = row.get(1)?;
+    let occurred: String = row.get(2)?;
+    if id < 1
+        || !matches!(
+            event.as_str(),
+            "message_recorded"
+                | "request_submitted"
+                | "owner_task_submitted"
+                | "proposal_created"
+                | "proposal_accepted"
+                | "proposal_declined"
+                | "proposal_expired"
+                | "proposal_promoted"
+                | "notification_enqueued"
+                | "notification_sent"
+                | "notification_retry_scheduled"
+                | "provider_cursor_advanced"
+        )
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let occurred_at =
+        timestamp(parse_timestamp(&occurred).map_err(|_| rusqlite::Error::InvalidQuery)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok((id, event, occurred_at))
 }
 
 fn missing(provider: AdminProvider) -> AdminConnection {
