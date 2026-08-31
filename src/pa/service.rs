@@ -1224,6 +1224,22 @@ impl<'a> PaService<'a> {
         let (proposal, mapping) = if let Some(mapping) = existing_mapping {
             (existing_proposal.expect("mapping has a proposal"), mapping)
         } else {
+            let time_range = TimeRange::new(
+                to_chrono_utc(draft.starts_at())?,
+                to_chrono_utc(draft.ends_at())?,
+            )
+            .map_err(|_| ServiceError::InvalidInput {
+                field: "time_range",
+            })?;
+            let proposal_draft = GoogleProposalDraft::from_owner(
+                proposal_operation_key(draft_id),
+                PENDING_PROPOSAL_TITLE,
+                time_range,
+                quote.timezone(),
+                CalendarAttendee::needs_action(owner.clone()),
+            )
+            .map_err(ServiceError::GoogleCalendar)?;
+            let mut found = None;
             if existing_proposal.is_none() {
                 let recheck_start = draft
                     .starts_at()
@@ -1255,36 +1271,35 @@ impl<'a> PaService<'a> {
                 if busy_overlaps(&outlook_busy, recheck_start, recheck_end)
                     || busy_overlaps(&google_busy, recheck_start, recheck_end)
                 {
-                    return Err(ServiceError::NoAvailability);
+                    found = match self
+                        .google
+                        .find_proposal(self.google_session, &proposal_draft)
+                        .await
+                    {
+                        Ok(event) => {
+                            validate_pending_google_event(&event, &proposal_draft, owner)?;
+                            Some(event)
+                        }
+                        Err(ProviderError::NotFound) => return Err(ServiceError::NoAvailability),
+                        Err(error) => return Err(ServiceError::GoogleCalendar(error)),
+                    };
                 }
             }
-            let time_range = TimeRange::new(
-                to_chrono_utc(draft.starts_at())?,
-                to_chrono_utc(draft.ends_at())?,
-            )
-            .map_err(|_| ServiceError::InvalidInput {
-                field: "time_range",
-            })?;
-            let proposal_draft = GoogleProposalDraft::from_owner(
-                proposal_operation_key(draft_id),
-                PENDING_PROPOSAL_TITLE,
-                time_range,
-                quote.timezone(),
-                CalendarAttendee::needs_action(owner.clone()),
-            )
-            .map_err(ServiceError::GoogleCalendar)?;
 
-            let found = match self
-                .google
-                .find_proposal(self.google_session, &proposal_draft)
-                .await
-            {
-                Ok(event) => {
-                    validate_pending_google_event(&event, &proposal_draft, owner)?;
-                    Some(event)
-                }
-                Err(ProviderError::NotFound) => None,
-                Err(error) => return Err(ServiceError::GoogleCalendar(error)),
+            let found = match found {
+                Some(event) => Some(event),
+                None => match self
+                    .google
+                    .find_proposal(self.google_session, &proposal_draft)
+                    .await
+                {
+                    Ok(event) => {
+                        validate_pending_google_event(&event, &proposal_draft, owner)?;
+                        Some(event)
+                    }
+                    Err(ProviderError::NotFound) => None,
+                    Err(error) => return Err(ServiceError::GoogleCalendar(error)),
+                },
             };
 
             let (proposal, event) = if let Some(event) = found {
@@ -4279,6 +4294,105 @@ mod tests {
                 .expect("create count"),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn matching_keyed_proposal_is_reconciled_before_busy_rejection() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let owner = MailAddress::new("owner@example.test").expect("owner");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            owner.clone(),
+        );
+        let search = service
+            .search_slots(AppointmentKind::Callback, now, 1)
+            .await
+            .expect("search");
+        let prepared = service
+            .prepare_request(
+                search.quote().id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Callback,
+                None,
+                "voice:matching-submit",
+                IdempotencyKey::new("appointment:matching-submit").expect("key"),
+                now,
+            )
+            .expect("prepare");
+        let range = TimeRange::new(
+            super::to_chrono_utc(prepared.starts_at()).expect("start"),
+            super::to_chrono_utc(prepared.ends_at()).expect("end"),
+        )
+        .expect("range");
+        let matching = GoogleProposalDraft::from_owner(
+            super::proposal_operation_key(prepared.draft_id()),
+            super::PENDING_PROPOSAL_TITLE,
+            range,
+            prepared.timezone(),
+            CalendarAttendee::needs_action(owner),
+        )
+        .expect("matching draft");
+        google
+            .create_proposal(&google_session, &matching)
+            .await
+            .expect("concurrent winner");
+
+        let result = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                now,
+            )
+            .await
+            .expect("matching proposal must reconcile");
+
+        assert!(result.is_pending());
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            1
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM proposals", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("proposal count"),
+            1
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT count(*) FROM event_mappings", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("mapping count"),
+            1
+        );
+        assert_eq!(store.list_pending_notifications().expect("outbox").len(), 1);
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 3);
     }
 
     #[tokio::test]
