@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use ring::digest;
-use rusqlite::Row;
+use rusqlite::{OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -183,24 +183,39 @@ fn read_connections(
     connection: &rusqlite::Connection,
     observed_at: OffsetDateTime,
 ) -> StoreResult<Vec<AdminConnection>> {
-    let mut statement = connection.prepare("SELECT id, provider, account_id, expires_at FROM oauth_credentials ORDER BY provider ASC, account_id ASC, id ASC LIMIT ?1").map_err(|_| invalid())?;
-    let rows = statement
-        .query_map([LIMIT + 2], |row| connection_from_row(row, observed_at))
-        .map_err(|_| invalid())?;
     let mut connections = vec![
         missing(AdminProvider::Google),
         missing(AdminProvider::Outlook),
     ];
-    for row in rows {
-        let row = row.map_err(|_| invalid())?;
-        if let Some(position) = connections
-            .iter()
-            .position(|value| value.provider == row.provider && !value.configured)
-        {
-            connections[position] = row;
-        } else if connections.len() < LIMIT as usize {
-            connections.push(row);
+    for provider in [AdminProvider::Google, AdminProvider::Outlook] {
+        let mut statement = connection.prepare("SELECT id, provider, account_id, expires_at FROM oauth_credentials WHERE provider = ?1 ORDER BY account_id ASC, id ASC LIMIT ?2").map_err(|_| invalid())?;
+        let rows = statement
+            .query_map(params![provider_name(provider), LIMIT / 2], |row| {
+                connection_from_row(row, observed_at)
+            })
+            .map_err(|_| invalid())?;
+        for row in rows {
+            let row = row.map_err(|_| invalid())?;
+            if let Some(position) = connections
+                .iter()
+                .position(|value| value.provider == row.provider && !value.configured)
+            {
+                connections[position] = row;
+            } else {
+                connections.push(row);
+            }
         }
+    }
+    let unknown = connection
+        .query_row(
+            "SELECT id FROM oauth_credentials WHERE provider NOT IN ('google', 'outlook') LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|_| invalid())?;
+    if unknown.is_some() {
+        return Err(invalid());
     }
     connections.sort_by(|left, right| {
         left.provider
@@ -250,7 +265,7 @@ fn connection_from_row(
 }
 
 fn read_proposals(connection: &rusqlite::Connection) -> StoreResult<Vec<AdminProposal>> {
-    let mut statement = connection.prepare("SELECT p.id, p.state, a.kind, a.starts_at, a.ends_at, p.created_at, p.updated_at FROM proposals p LEFT JOIN appointment_drafts a ON a.id = p.appointment_draft_id ORDER BY p.id ASC LIMIT ?1").map_err(|_| invalid())?;
+    let mut statement = connection.prepare("SELECT p.id, p.state, a.kind, a.starts_at, a.ends_at, p.created_at, p.updated_at, p.appointment_draft_id, p.owner_task_draft_id FROM proposals p LEFT JOIN appointment_drafts a ON a.id = p.appointment_draft_id ORDER BY p.id ASC LIMIT ?1").map_err(|_| invalid())?;
     statement
         .query_map([LIMIT], proposal_from_row)
         .map_err(|_| invalid())?
@@ -262,7 +277,9 @@ fn proposal_from_row(row: &Row<'_>) -> rusqlite::Result<AdminProposal> {
     let id: i64 = row.get(0)?;
     let state: String = row.get(1)?;
     let kind: Option<String> = row.get(2)?;
-    if id < 1 {
+    let appointment_draft_id: Option<i64> = row.get(7)?;
+    let owner_task_draft_id: Option<i64> = row.get(8)?;
+    if id < 1 || !matches!((appointment_draft_id, owner_task_draft_id), (Some(id), None) if id > 0) {
         return Err(rusqlite::Error::InvalidQuery);
     }
     let state = match state.as_str() {
@@ -294,14 +311,16 @@ fn proposal_from_row(row: &Row<'_>) -> rusqlite::Result<AdminProposal> {
 }
 
 fn read_failures(connection: &rusqlite::Connection) -> StoreResult<Vec<AdminFailure>> {
-    let mut validation = connection
-        .prepare("SELECT id, event_type, occurred_at FROM audit_events ORDER BY id ASC")
+    let unknown = connection
+        .query_row(
+            "SELECT id FROM audit_events WHERE event_type NOT IN ('message_recorded', 'request_submitted', 'owner_task_submitted', 'proposal_created', 'proposal_accepted', 'proposal_declined', 'proposal_expired', 'proposal_promoted', 'notification_enqueued', 'notification_sent', 'notification_retry_scheduled', 'provider_cursor_advanced') LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
         .map_err(|_| invalid())?;
-    for row in validation
-        .query_map([], audit_event_from_row)
-        .map_err(|_| invalid())?
-    {
-        row.map_err(|_| invalid())?;
+    if unknown.is_some() {
+        return Err(invalid());
     }
     let mut statement = connection
         .prepare("SELECT id, event_type, occurred_at FROM audit_events WHERE event_type = 'notification_retry_scheduled' ORDER BY id ASC LIMIT ?1")
