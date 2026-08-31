@@ -3,46 +3,107 @@
 - **Issue:** [#85](https://github.com/djh00t/agent_voice/issues/85)
 - **Feature:** [#62](https://github.com/djh00t/agent_voice/issues/62)
 - **Evidence date:** 2026-09-01 (Australia/Sydney)
-- **Worktree:** `/private/tmp/agent-voice-issue-85`
+- **Base SHA:** `a20a28be3be37c84cbe5046415497b7053dd8906` (`origin/main` after
+  `rtk git fetch origin main`)
+- **Implementation head SHA:** `8a4173bfc360c9cb8fd9a0a3cda81c9977743697`
+  (latest source/config implementation commit before this report-only change)
+- **PR:** [#314](https://github.com/djh00t/agent_voice/pull/314)
 - **Branch:** `codex/agent-voice-issue-85`
-- **Base:** `a20a28b` (`origin/main` after `rtk git fetch origin main`)
-- **Prerequisite:** #218 is closed; its `AgentApiConfig.oauth` field and
+- **Evidence worktree:** `/private/tmp/agent-voice-issue-85-report` (removed after
+  delivery)
+- **Prerequisite:** #218 is closed. Its `AgentApiConfig.oauth` field and
   post-environment OAuth normalization handoff were re-read from `origin/main`
-  before editing.
-- **Implementation commits:** `29afdf8`, `e9af9c1`, `4d78c40`, `7fa5c3c`
+  at the base SHA before implementation.
 
 ## Scope and ownership
 
-This package owns only the backup configuration seam:
+This package owns only the backup configuration seam and its evidence:
 
-- `src/config.rs`: public `BackupConfig`, safe defaults, `AppConfig.backup`,
-  strict `BACKUP_*` environment overrides, cloned final validation, endpoint
-  allowlisting, and focused `config::tests` selectors.
+- `src/config.rs`: public `BackupConfig`, safe defaults, strict `BACKUP_*`
+  environment overrides, cloned final validation, endpoint allowlisting,
+  stable error classes, and focused `config::tests` selectors.
 - `config/agent_voice.example.yaml`: the backup mapping with disabled-safe
   defaults.
-- `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md`: this evidence
-  report.
+- `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md`: this report.
 
 No snapshot production, SQLCipher envelope, S3 transport, retention execution,
 durable attempt history, health/alerts, restore, CLI, browser/admin surface,
 deployment, provider, or live-credential behavior was added.
 
-## RED evidence
+## Frozen configuration contract
 
-The required contract test was added before the production type and run from the
-fresh worktree:
+`AppConfig` owns a serde-defaulted `BackupConfig` with public fields
+`enabled`, `bucket`, `prefix`, `region`, `endpoint`, `retention_days`,
+`temp_dir`, and `max_age_hours`. The disabled-safe defaults are:
+
+| Field | Default |
+| --- | --- |
+| `enabled` | `false` |
+| `bucket` | empty |
+| `prefix` | `backups` |
+| `region` | empty |
+| `endpoint` | `None` |
+| `retention_days` | `30` |
+| `temp_dir` | `./backup-tmp` |
+| `max_age_hours` | `24` |
+
+Only the eight documented `BACKUP_*` environment keys are applied after YAML;
+outer whitespace and one matching quote pair are normalized, and present blank
+or malformed values fail atomically. Validation errors use only the frozen
+field/code classes `missing_required`, `invalid_bucket`, `invalid_region`,
+`invalid_prefix`, `invalid_endpoint`, `invalid_retention`, `invalid_max_age`,
+`invalid_temp_dir`, and `secret_field_rejected`. Unknown secret-shaped YAML
+fields return `backup: secret_field_rejected` without echoing a key value.
+
+Configured production endpoints are HTTPS origins with DNS hosts, no userinfo,
+query, fragment, or non-default port. HTTP loopback is accepted only through
+the explicit test-only validator. `BackupConfig` contains no key material,
+token, credential, or secret value, and its `Debug` output uses fixed presence
+markers for sensitive-shaped values.
+
+## LOCAL
+
+### TDD RED evidence
+
+The required missing-contract selector ran before the initial implementation:
 
 ```text
-rtk cargo test --lib config::tests::backup_config_contract -- --exact --nocapture
+Command: rtk cargo test --lib config::tests::backup_config_contract -- --exact --nocapture
+Exit: 101
+Result: 11 compile errors (0 warnings), including missing BackupConfig and
+        AppConfig.backup; this was a true missing-contract failure.
 ```
 
-It exited `101` with `11 errors, 0 warnings`, including the expected missing
-`BackupConfig` type and `AppConfig.backup` field. This was a true missing-contract
-failure, not a zero-test filtered result.
+The remediation tests also demonstrated the original defects before their
+source changes:
 
-## GREEN evidence
+```text
+Command: rtk cargo test --lib config::tests::backup_config_enabled_override_rejects_blank_and_malformed -- --exact --nocapture
+Exit: 101
+Result: blank/malformed BACKUP_ENABLED returned invalid_enabled instead of the
+        frozen backup.enabled: missing_required class.
 
-After the implementation, the five package selectors passed:
+Command: rtk cargo test --lib config::tests::backup_config_rejects_secret_shaped_unknown_yaml_fields -- --exact --nocapture
+Exit: 101
+Result: master_key produced serde's generic unknown-field error instead of
+        backup: secret_field_rejected.
+
+Command: rtk cargo test --lib config::tests::backup_config_rejects_empty_endpoint_userinfo -- --exact --nocapture
+Exit: 101
+Result: https://@s3.example.test/ was accepted and unwrap_err() received Ok(()).
+
+Command: rtk cargo test --lib config::tests::backup_config_rejects_required_negative_fixtures -- --exact --nocapture
+Exit: 0
+Result: NUL prefix, endpoint query, max-age zero, and max-age overflow were
+        already rejected; this test supplied regression coverage without a
+        behavior change for those cases.
+```
+
+### Focused GREEN evidence
+
+At implementation head `8a4173bfc360c9cb8fd9a0a3cda81c9977743697`, each exact
+selector below exited `0`, executed exactly one listed test, and reported
+`1 passed, 575 filtered out`:
 
 ```text
 rtk cargo test --lib config::tests::backup_config_contract -- --exact --nocapture
@@ -50,64 +111,153 @@ rtk cargo test --lib config::tests::backup_config_defaults_disabled_and_safe -- 
 rtk cargo test --lib config::tests::backup_config_env_overrides_are_strict_and_normalized -- --exact --nocapture
 rtk cargo test --lib config::tests::backup_config_rejects_destination_escape_and_secrets -- --exact --nocapture
 rtk cargo test --lib config::tests::backup_config_snapshot_and_runtime_handoffs -- --exact --nocapture
+rtk cargo test --lib config::tests::backup_config_enabled_override_rejects_blank_and_malformed -- --exact --nocapture
+rtk cargo test --lib config::tests::backup_config_rejects_secret_shaped_unknown_yaml_fields -- --exact --nocapture
+rtk cargo test --lib config::tests::backup_config_rejects_empty_endpoint_userinfo -- --exact --nocapture
+rtk cargo test --lib config::tests::backup_config_rejects_required_negative_fixtures -- --exact --nocapture
 ```
 
-Each selector executed one test and passed (`571 filtered out` in the final
-target listing). The complete config module also passed:
+The complete config module also passed:
 
 ```text
-rtk cargo test --lib config -- --nocapture
-cargo test: 40 passed, 532 filtered out
+Command: rtk cargo test --lib config -- --nocapture
+Exit: 0
+Result: 44 passed, 532 filtered out (576 config tests available).
 ```
 
-The selectors cover disabled defaults and deterministic equality, all eight
-documented overrides with quote/whitespace normalization and atomic rejection,
-bucket/region/prefix/endpoint/scratch-path escape checks, redacted diagnostics,
-unknown secret fields, production HTTPS versus explicit test-only loopback
-endpoint handling, YAML round-trip, and the exact example mapping.
+The repository gate passed after installing the existing website lockfile
+dependencies in the disposable worktree:
 
-## Validation evidence (LOCAL)
+```text
+Command: rtk npm ci (from website/)
+Exit: 0
+Result: 1,276 packages installed; npm reported existing audit/deprecation
+        notices and no manifest or lockfile changed.
 
-| Check | Result |
-| --- | --- |
-| `rtk rustfmt --edition 2024 src/config.rs` | PASS |
-| `rtk cargo clippy --all-targets --all-features -- -D warnings` | PASS — no issues found |
-| `rtk git diff --check` | PASS |
-| `rtk make check` | PASS — 572 Rust tests, clippy, Rust docs, and Docusaurus build completed successfully |
-| `rtk cargo fmt --all -- --check` | BLOCKED by pre-existing formatting drift in untouched `src/pa/fakes/mail.rs`, `src/service.rs`, and `tests/../src/realtime/server_audio_events.rs`; owned `src/config.rs` passed the scoped formatter check |
-| `rtk npm ci` in `website/` | PASS setup only; no manifest/lockfile changes; npm reported existing audit/deprecation notices |
+Command: rtk make check
+Exit: 0
+Result: cargo test 576 passed, 0 failed; integration suites passed with
+        6, 18, 233, 41, 3, 3, 3, 3, and 19 tests; doc-tests 3 passed;
+        cargo clippy, cargo doc, and Docusaurus build completed successfully.
+```
 
-The repository-wide formatter warning is not attributed to this package and no
-unowned file was changed to mask it.
+Configuration normalization is clone-then-assign. Failed parsing or validation
+therefore publishes no partial config and performs no filesystem, clock,
+socket, network, provider, database, or token action. Re-loading identical
+YAML/environment maps produces equal typed values.
 
-## Contract mapping
+## STATIC
+
+The owned source formatter and whitespace checks passed:
+
+```text
+Command: rtk rustfmt --edition 2024 --check src/config.rs
+Exit: 0
+
+Command: rtk git diff --check
+Exit: 0
+```
+
+The implementation range was inspected with:
+
+```text
+Command: rtk git diff --name-status origin/main...8a4173bfc360c9cb8fd9a0a3cda81c9977743697
+Exit: 0
+Result: exactly the three owned paths src/config.rs, config/agent_voice.example.yaml,
+        and .superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md.
+```
+
+The seven implementation commits before this report are each one-file commits;
+`rtk git log --stat origin/main..8a4173bfc360c9cb8fd9a0a3cda81c9977743697`
+returned the following path boundaries:
+
+| Commit | Path | Change |
+| --- | --- | --- |
+| `29afdf801b218c3f22649f7472a98437ae5bdd9e` | `src/config.rs` | Add validated backup settings. |
+| `e9af9c1a2ebd38057e4cff666386c05c47e78979` | `config/agent_voice.example.yaml` | Document backup defaults. |
+| `4d78c4021931a2fa9973f975ed53e3f44c063df5` | `src/config.rs` | Satisfy backup test lint. |
+| `7fa5c3c4950998977f4ebf36d39040ce8e8cc23f` | `src/config.rs` | Name backup policy errors precisely. |
+| `d746116312233b3ede61b9f0aff9c9b753c3b11d` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Record initial package evidence. |
+| `2adfb72bc65f3adcc5986897c1afaa4499776cec` | `src/config.rs` | Stabilize frozen rejection errors. |
+| `8a4173bfc360c9cb8fd9a0a3cda81c9977743697` | `src/config.rs` | Reject empty endpoint userinfo. |
+
+The repository-wide formatter remains a pre-existing, out-of-scope issue:
+
+```text
+Command: rtk cargo fmt --all -- --check
+Exit: 1
+Result: drift only in untouched src/pa/fakes/mail.rs, src/service.rs, and
+        tests/../src/realtime/server_audio_events.rs; owned src/config.rs
+        passes the scoped formatter check above.
+```
+
+## CI
+
+At implementation head `8a4173bfc360c9cb8fd9a0a3cda81c9977743697`, PR #314
+reported all five checks green:
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Quality Gates | PASS | [CI job 99546594271](https://github.com/djh00t/agent_voice/actions/runs/33409910568/job/99546594271) |
+| Compose Config | PASS | [CI job 99546594380](https://github.com/djh00t/agent_voice/actions/runs/33409910568/job/99546594380) |
+| Analyze (javascript-typescript) | PASS | [CodeQL job 99546595791](https://github.com/djh00t/agent_voice/actions/runs/33409910571/job/99546595791) |
+| Analyze (rust) | PASS | [CodeQL job 99546595539](https://github.com/djh00t/agent_voice/actions/runs/33409910571/job/99546595539) |
+| CodeQL aggregate | PASS | [aggregate run 99546832330](https://github.com/djh00t/agent_voice/runs/99546832330) |
+
+This report-only commit will create a new PR workflow run. No status for that
+new head is claimed until GitHub reports it. CI is repository evidence only and
+does not substitute for live-provider or deployment evidence.
+
+## LIVE
+
+The following are explicitly **NOT RUN** and **NOT CLAIMED** by this package:
+
+- S3-compatible provider credentials, network calls, uploads, listings, or
+  retention deletion.
+- SQLCipher snapshot production, envelope verification, restore, or target
+  installation.
+- Durable backup-attempt history, freshness evaluation, health metrics, alert
+  routing, or scheduled daily execution.
+- OAuth, SIP, OpenAI, Gmail, Outlook, Microsoft Graph, deployment, Kubernetes,
+  production filesystem, or production configuration behavior.
+- Browser/admin surface, authenticated UAT, live calls, email delivery, or
+  provider response handling.
+
+No local test, rendered configuration, health response, or green CI check is
+evidence for any of those live claims.
+
+## Review, lifecycle, and rollback
+
+Issue #85 was moved from `status:blocked` to `status:in-progress` after #218
+was confirmed closed; the pickup comment records the prerequisite/base/SHA and
+true RED evidence. The report-only delivery remains one file and one logical
+change with `Refs: issue: #85`.
+
+The delivering PR contains exactly `Closes #85` plus `Refs #62`, `Refs #218`,
+`Refs #107`, `Refs #109`, `Refs #110`, `Refs #111`, `Refs #112`, `Refs #113`,
+and `Refs #120`; it does not close the feature tracker, prerequisite, or any
+downstream handoff. Rollback is a code revert of the owned source/example/report
+commits; no remote object, database, token, or restore target is touched.
+
+The initial automated review also contained three stale threads. The current
+commit history proves the atomicity and multiline-template findings false, and
+the authoritative endpoint contract intentionally rejects production
+non-default ports. Those threads are reconciled inline with exact evidence and
+resolved separately from this report commit.
+
+## Acceptance mapping
 
 | Contract | Evidence | Status |
 | --- | --- | --- |
-| `BackupConfig` has the frozen public serde fields and defaults | `backup_config_defaults_disabled_and_safe`, source review | PASS |
-| Unknown backup keys are rejected | `backup_config_rejects_destination_escape_and_secrets` | PASS |
-| Overrides win over YAML, normalize once, and reject blank/malformed values | `backup_config_env_overrides_are_strict_and_normalized`; `AppConfig::load` handoff | PASS |
-| Enabled destinations fail closed on unsafe bucket, region, prefix, endpoint, policy, or scratch path | `backup_config_rejects_destination_escape_and_secrets` | PASS |
-| Production endpoint is HTTPS-only; loopback HTTP is test-only | `backup_config_snapshot_and_runtime_handoffs` | PASS |
-| Destination/path values never appear in `BackupConfig` Debug or validation errors | redaction assertions and stable field/code errors | PASS |
-| Example documents the exact disabled-safe mapping | `backup_config_snapshot_and_runtime_handoffs` | PASS |
+| `BackupConfig` exposes the frozen public fields and safe defaults | `backup_config_defaults_disabled_and_safe`; source review | PASS (LOCAL/STATIC) |
+| Exactly eight overrides win over YAML and reject blank/malformed values atomically | `backup_config_env_overrides_are_strict_and_normalized`; enabled negative selector | PASS (LOCAL) |
+| Stable error classes never echo raw values or secret-shaped fields | secret-field selector; redaction assertions; source review | PASS (LOCAL/STATIC) |
+| Bucket, region, prefix, endpoint, policy, and scratch path fail closed | destination and required-negative selectors | PASS (LOCAL) |
+| Empty endpoint userinfo is rejected and non-default production ports remain disallowed | empty-userinfo selector; endpoint source review; frozen addendum | PASS (LOCAL/STATIC) |
+| Explicit test-only loopback HTTP is isolated from production validation | `backup_config_snapshot_and_runtime_handoffs` | PASS (LOCAL) |
+| Example mapping remains disabled-safe and exact | snapshot/runtime handoff selector | PASS (LOCAL) |
 
-## Security, idempotency, and non-claims
-
-Validation is performed on a clone and assigned only after success. A failed
-environment parse or validation therefore publishes no partial `AppConfig` and
-performs no file, clock, socket, network, provider, database, or token action.
-`BackupConfig` has no key, token, credential, or master-key field; unknown
-secret-shaped mapping keys are rejected. Re-loading identical values produces
-equal typed values. The package does not claim S3, restore, retention deletion,
-freshness alert delivery, deployment, OAuth, UAT, or production readiness.
-
-## Lifecycle and delivery
-
-Issue #85 was moved from `status:blocked` to `status:in-progress` after #218 was
-confirmed closed, and the pickup comment records the exact base SHA, worktree,
-branch, and RED result. The delivering PR must contain exactly `Closes #85` and
-`Refs #62`, `Refs #218`, `Refs #107`, `Refs #109`, `Refs #110`, `Refs #111`,
-`Refs #112`, `Refs #113`, and `Refs #120`; it must not close any prerequisite,
-downstream handoff, or parent tracker. CI and review evidence are not claimed
-until a PR reports them.
+**Package status:** implementation and evidence are ready for review; the live
+issue label remains `status:in-progress` at this capture. CI at the
+implementation head is green; live, deployment, merge, and approval evidence
+remain separate gates.
