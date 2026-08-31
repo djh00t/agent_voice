@@ -74,6 +74,16 @@ agent_api:
         - "https://www.googleapis.com/auth/gmail.modify"
       redirect_uri: "http://127.0.0.1:8089/oauth/google/callback"
 
+backup:
+  enabled: false
+  bucket: ""
+  prefix: "backups"
+  region: ""
+  endpoint: null
+  retention_days: 30
+  temp_dir: "./backup-tmp"
+  max_age_hours: 24
+
 speech:
   stt_provider: "openai"
   tts_provider: "openai"
