@@ -743,15 +743,19 @@ mod tests {
                 match builder.create(&path) {
                     Ok(()) => {
                         #[cfg(unix)]
-                        assert_eq!(
-                            fs::symlink_metadata(&path)
-                                .expect("test directory metadata")
-                                .permissions()
-                                .mode()
-                                & 0o022,
-                            0,
-                            "test directory must not be group/world writable"
-                        );
+                        {
+                            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                                .expect("set private test directory permissions");
+                            assert_eq!(
+                                fs::symlink_metadata(&path)
+                                    .expect("test directory metadata")
+                                    .permissions()
+                                    .mode()
+                                    & 0o777,
+                                0o700,
+                                "test directory must be owner-only"
+                            );
+                        }
                         return Self { path };
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
