@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomPinned;
 use std::mem::MaybeUninit;
@@ -26,6 +28,11 @@ use unsafe_libyaml::{
 const INITIALIZATION_ERROR: &str = "config YAML event reader: initialization_failed";
 const PARSE_ERROR: &str = "config YAML event reader: parse_failed";
 
+#[cfg(test)]
+thread_local! {
+    static EVENT_DELETE_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
 pub(super) struct YamlEventReader<'input> {
     state: Pin<Box<ParserState<'input>>>,
     finished: bool,
@@ -47,6 +54,7 @@ impl Drop for ParserState<'_> {
     }
 }
 
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(super) enum YamlEvent {
     StreamStart,
     StreamEnd,
@@ -215,6 +223,8 @@ impl EventGuard {
 
 impl Drop for EventGuard {
     fn drop(&mut self) {
+        #[cfg(test)]
+        EVENT_DELETE_COUNT.with(|count| count.set(count.get() + 1));
         unsafe {
             // SAFETY: this guard exists only for a successfully initialized libyaml event.
             yaml_event_delete(self.event.as_mut_ptr())
@@ -294,6 +304,9 @@ fn parse_error() -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{YamlEvent, YamlEventReader, YamlScalarStyle};
+    use unsafe_libyaml::{
+        yaml_event_type_t::YAML_SCALAR_EVENT, yaml_scalar_style_t::YAML_ANY_SCALAR_STYLE,
+    };
 
     fn read(source: &str) -> Vec<YamlEvent> {
         let mut reader = YamlEventReader::new(source).expect("valid YAML reader");
@@ -302,19 +315,79 @@ mod tests {
             .expect("valid YAML events")
     }
 
+    fn scalar(value: &[u8], style: YamlScalarStyle) -> YamlEvent {
+        YamlEvent::Scalar {
+            value: value.to_vec().into_boxed_slice(),
+            style,
+            anchored: false,
+            tagged: false,
+        }
+    }
+
     #[test]
     fn event_reader_contract() {
-        let source = "\n  backup: { retention_days: '7', max_age_hours: \"24\" } # trailing\n";
+        let source =
+            "\"backup\": { 'retention_days': '7', \"max_age_hours\": \"24\" } # trailing\n";
         let events = read(source);
 
-        assert!(matches!(events.first(), Some(YamlEvent::StreamStart)));
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, YamlEvent::MappingStart { flow: true, .. }))
+        assert_eq!(
+            events,
+            vec![
+                YamlEvent::StreamStart,
+                YamlEvent::DocumentStart,
+                YamlEvent::MappingStart {
+                    flow: false,
+                    anchored: false,
+                    tagged: false,
+                },
+                scalar(b"backup", YamlScalarStyle::DoubleQuoted),
+                YamlEvent::MappingStart {
+                    flow: true,
+                    anchored: false,
+                    tagged: false,
+                },
+                scalar(b"retention_days", YamlScalarStyle::SingleQuoted),
+                scalar(b"7", YamlScalarStyle::SingleQuoted),
+                scalar(b"max_age_hours", YamlScalarStyle::DoubleQuoted),
+                scalar(b"24", YamlScalarStyle::DoubleQuoted),
+                YamlEvent::MappingEnd,
+                YamlEvent::MappingEnd,
+                YamlEvent::DocumentEnd,
+                YamlEvent::StreamEnd,
+            ]
         );
-        assert!(events.iter().any(|event| matches!(event, YamlEvent::Scalar { value, style: YamlScalarStyle::SingleQuoted, .. } if value.as_ref() == b"7")));
-        assert!(matches!(events.last(), Some(YamlEvent::StreamEnd)));
+    }
+
+    #[test]
+    fn emits_exact_events_for_indented_block_document() {
+        let events = read("  backup:\n    retention_days: '7'\n    max_age_hours: \"24\"\n");
+
+        assert_eq!(
+            events,
+            vec![
+                YamlEvent::StreamStart,
+                YamlEvent::DocumentStart,
+                YamlEvent::MappingStart {
+                    flow: false,
+                    anchored: false,
+                    tagged: false,
+                },
+                scalar(b"backup", YamlScalarStyle::Plain),
+                YamlEvent::MappingStart {
+                    flow: false,
+                    anchored: false,
+                    tagged: false,
+                },
+                scalar(b"retention_days", YamlScalarStyle::Plain),
+                scalar(b"7", YamlScalarStyle::SingleQuoted),
+                scalar(b"max_age_hours", YamlScalarStyle::Plain),
+                scalar(b"24", YamlScalarStyle::DoubleQuoted),
+                YamlEvent::MappingEnd,
+                YamlEvent::MappingEnd,
+                YamlEvent::DocumentEnd,
+                YamlEvent::StreamEnd,
+            ]
+        );
     }
 
     #[test]
@@ -388,6 +461,53 @@ mod tests {
         let error = super::validate_syntax("sentinel://secret: [").expect_err("malformed input");
         assert_eq!(error.to_string(), "config YAML event reader: parse_failed");
         assert!(!error.to_string().contains("sentinel"));
+    }
+
+    #[test]
+    fn unsupported_scalar_style_returns_only_the_fixed_redacted_error() {
+        let mut reader = YamlEventReader::new("sentinel://secret\n").expect("reader");
+        let parser = unsafe {
+            std::pin::Pin::as_mut(&mut reader.state)
+                .get_unchecked_mut()
+                .parser
+                .as_mut_ptr()
+        };
+        let stream_start = super::EventGuard::parse(parser).expect("stream start");
+        drop(stream_start);
+        let document_start = super::EventGuard::parse(parser).expect("document start");
+        drop(document_start);
+        super::EVENT_DELETE_COUNT.with(|count| count.set(0));
+        let mut scalar_guard = super::EventGuard::parse(parser).expect("scalar");
+        assert_eq!(scalar_guard.event().type_, YAML_SCALAR_EVENT);
+        unsafe {
+            (*scalar_guard.event.as_mut_ptr()).data.scalar.style = YAML_ANY_SCALAR_STYLE;
+        }
+
+        let error = super::convert_event(scalar_guard.event()).expect_err("unsupported style");
+        drop(scalar_guard);
+
+        assert_eq!(error.to_string(), "config YAML event reader: parse_failed");
+        assert!(!error.to_string().contains("sentinel://secret"));
+        assert_eq!(super::EVENT_DELETE_COUNT.with(|count| count.get()), 1);
+        drop(reader);
+    }
+
+    #[test]
+    fn reader_can_be_dropped_after_parse_failure_without_disclosing_input() {
+        let source = String::from("sentinel://secret: [");
+        let mut reader = YamlEventReader::new(&source).expect("reader");
+        let error = loop {
+            match reader.next() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("malformed input unexpectedly ended"),
+                Err(error) => break error,
+            }
+        };
+
+        assert_eq!(error.to_string(), "config YAML event reader: parse_failed");
+        assert!(!error.to_string().contains("sentinel://secret"));
+        drop(reader);
+        assert_eq!(source, "sentinel://secret: [");
     }
 
     #[test]
