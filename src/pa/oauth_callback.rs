@@ -28,15 +28,21 @@ impl fmt::Display for OAuthCallback {
     }
 }
 
-/// Opaque authorization code accepted by the token-exchange boundary.
+/// Opaque authorization code and consumed PKCE verifier for token exchange.
 pub struct AuthorizationCode {
     code: String,
+    verifier: String,
 }
 
 impl AuthorizationCode {
     /// Returns the exact authorization code for the token-exchange boundary.
     pub fn as_str(&self) -> &str {
         &self.code
+    }
+
+    /// Returns the consumed PKCE verifier to the in-crate token-exchange boundary.
+    pub(crate) fn verifier(&self) -> &str {
+        &self.verifier
     }
 }
 
@@ -62,8 +68,9 @@ pub fn validate_callback(
         return Err(OAuthError::InvalidCode);
     }
 
-    let _ = state_store.consume(&callback.state, now)?;
+    let verifier = state_store.consume(&callback.state, now)?;
     Ok(AuthorizationCode {
         code: callback.code,
+        verifier,
     })
 }
