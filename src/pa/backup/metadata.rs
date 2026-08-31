@@ -110,6 +110,11 @@ pub fn derive_metadata(
         return Err(MetadataError::EmptyCiphertext);
     }
 
+    let timestamp = created_at.to_rfc3339_opts(SecondsFormat::AutoSi, true);
+    if !valid_timestamp(&timestamp) {
+        return Err(MetadataError::InvalidTimestamp);
+    }
+
     let object_key = object_key.into();
     if !valid_object_key(&object_key) {
         return Err(MetadataError::InvalidObjectKey);
@@ -370,6 +375,15 @@ mod tests {
             Err(MetadataError::InvalidObjectKey)
         );
 
+        for object_key in ["/absolute", "backups/../outside", "backups/./snapshot"] {
+            let mut header = header();
+            header.object_key = object_key.to_owned();
+            assert_eq!(
+                verify_header(&header, CIPHERTEXT),
+                Err(MetadataError::InvalidObjectKey)
+            );
+        }
+
         let mut header = header();
         header.object_key = "bad\0key".to_owned();
         assert_eq!(
@@ -387,6 +401,14 @@ mod tests {
         assert_eq!(
             verify_header(&header(), &[]),
             Err(MetadataError::EmptyCiphertext)
+        );
+    }
+
+    #[test]
+    fn rejects_unrepresentable_timestamp() {
+        assert_eq!(
+            derive_metadata(CIPHERTEXT, chrono::DateTime::<Utc>::MIN_UTC, OBJECT_KEY),
+            Err(MetadataError::InvalidTimestamp)
         );
     }
 
