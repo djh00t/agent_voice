@@ -642,7 +642,7 @@ impl fmt::Debug for StoredTask {
     }
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 13;
+const CURRENT_SCHEMA_VERSION: i64 = 14;
 const BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 struct Migration {
@@ -700,8 +700,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: apply_schema_v12,
     },
     Migration {
-        version: CURRENT_SCHEMA_VERSION,
+        version: 13,
         apply: apply_schema_v13,
+    },
+    Migration {
+        version: CURRENT_SCHEMA_VERSION,
+        apply: apply_schema_v14,
     },
 ];
 
@@ -7807,6 +7811,98 @@ ALTER TABLE configuration ADD COLUMN version INTEGER NOT NULL DEFAULT 1
     Ok(())
 }
 
+fn apply_schema_v14(transaction: &Transaction<'_>) -> StoreResult<()> {
+    transaction.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS http_idempotency_records (
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('in_progress', 'completed')),
+    lease_generation INTEGER NOT NULL CHECK (lease_generation > 0),
+    lease_until INTEGER NOT NULL CHECK (
+        typeof(lease_until) = 'integer' AND lease_until >= 0
+    ),
+    response_status INTEGER,
+    response_content_type TEXT,
+    response_body BLOB,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) CHECK (
+        typeof(created_at) = 'text'
+        AND length(CAST(created_at AS BLOB)) = 20
+        AND instr(CAST(created_at AS BLOB), x'00') = 0
+        AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        AND substr(created_at, 6, 2) BETWEEN '01' AND '12'
+        AND substr(created_at, 9, 2) BETWEEN '01' AND '31'
+        AND substr(created_at, 12, 2) BETWEEN '00' AND '23'
+        AND substr(created_at, 15, 2) BETWEEN '00' AND '59'
+        AND substr(created_at, 18, 2) BETWEEN '00' AND '59'
+        AND created_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at)
+    ),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) CHECK (
+        typeof(updated_at) = 'text'
+        AND length(CAST(updated_at AS BLOB)) = 20
+        AND instr(CAST(updated_at AS BLOB), x'00') = 0
+        AND updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        AND substr(updated_at, 6, 2) BETWEEN '01' AND '12'
+        AND substr(updated_at, 9, 2) BETWEEN '01' AND '31'
+        AND substr(updated_at, 12, 2) BETWEEN '00' AND '23'
+        AND substr(updated_at, 15, 2) BETWEEN '00' AND '59'
+        AND substr(updated_at, 18, 2) BETWEEN '00' AND '59'
+        AND updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', updated_at)
+    ),
+    CHECK (
+      typeof(id) = 'integer'
+      AND typeof(scope) = 'text'
+      AND length(CAST(scope AS BLOB)) BETWEEN 1 AND 64
+      AND instr(CAST(scope AS BLOB), x'00') = 0
+      AND scope NOT GLOB '*[^A-Za-z0-9._:-]*'
+    ),
+    CHECK (
+      typeof(idempotency_key) = 'text'
+      AND length(CAST(idempotency_key AS BLOB)) BETWEEN 1 AND 128
+      AND instr(CAST(idempotency_key AS BLOB), x'00') = 0
+      AND idempotency_key NOT GLOB '*[^A-Za-z0-9._~-]*'
+    ),
+    CHECK (
+      typeof(fingerprint) = 'text'
+      AND length(CAST(fingerprint AS BLOB)) = 64
+      AND instr(CAST(fingerprint AS BLOB), x'00') = 0
+      AND fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    CHECK (typeof(state) = 'text'),
+    CHECK (typeof(lease_generation) = 'integer'),
+    CHECK (typeof(lease_until) = 'integer'),
+    CHECK (typeof(created_at) = 'text'),
+    CHECK (typeof(updated_at) = 'text'),
+    CHECK (
+      response_status IS NULL
+      OR (typeof(response_status) = 'integer' AND response_status BETWEEN 200 AND 599)
+    ),
+    CHECK (response_content_type IS NULL OR typeof(response_content_type) = 'text'),
+    CHECK (response_body IS NULL OR typeof(response_body) = 'blob'),
+    UNIQUE (scope, idempotency_key),
+    CHECK (
+      (state = 'in_progress'
+       AND response_status IS NULL
+       AND response_content_type IS NULL
+       AND response_body IS NULL)
+      OR
+      (state = 'completed'
+       AND response_status IS NOT NULL
+       AND response_status BETWEEN 200 AND 599
+       AND response_content_type IS NOT NULL
+       AND response_content_type = 'application/json'
+       AND response_body IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_http_idempotency_records_lease_until
+    ON http_idempotency_records(lease_until);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn normalize_legacy_audit_timestamp(value: &str) -> StoreResult<String> {
     let parsed = OffsetDateTime::parse(value, &Rfc3339)
         .map(|value| value.to_offset(time::UtcOffset::UTC))
@@ -7886,6 +7982,8 @@ mod tests {
     };
 
     const DATABASE_KEY: &[u8] = b"task-4a-test-key";
+    const VALID_HTTP_FINGERPRINT: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct TempDatabase {
@@ -8767,6 +8865,1082 @@ END;
     }
 
     #[test]
+    fn http_idempotency_v14_migration_creates_schema() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let schema_version: i64 = store
+            .connection()
+            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("schema version");
+        assert_eq!(schema_version, 14);
+
+        let table_sql: String = store
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'http_idempotency_records'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("idempotency table");
+        assert!(table_sql.contains("UNIQUE (scope, idempotency_key)"));
+        assert!(table_sql.contains("state IN ('in_progress', 'completed')"));
+        let columns = store
+            .connection()
+            .prepare("PRAGMA table_info('http_idempotency_records')")
+            .expect("idempotency table info")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .expect("idempotency columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("idempotency column rows");
+        assert_eq!(
+            columns,
+            vec![
+                ("id".to_owned(), "INTEGER".to_owned(), 0, None, 1),
+                ("scope".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("idempotency_key".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("fingerprint".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("state".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                (
+                    "lease_generation".to_owned(),
+                    "INTEGER".to_owned(),
+                    1,
+                    None,
+                    0
+                ),
+                ("lease_until".to_owned(), "INTEGER".to_owned(), 1, None, 0),
+                (
+                    "response_status".to_owned(),
+                    "INTEGER".to_owned(),
+                    0,
+                    None,
+                    0
+                ),
+                (
+                    "response_content_type".to_owned(),
+                    "TEXT".to_owned(),
+                    0,
+                    None,
+                    0
+                ),
+                ("response_body".to_owned(), "BLOB".to_owned(), 0, None, 0),
+                (
+                    "created_at".to_owned(),
+                    "TEXT".to_owned(),
+                    1,
+                    Some("strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_owned()),
+                    0
+                ),
+                (
+                    "updated_at".to_owned(),
+                    "TEXT".to_owned(),
+                    1,
+                    Some("strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_owned()),
+                    0
+                ),
+            ]
+        );
+        let indexes = store
+            .connection()
+            .prepare("PRAGMA index_list('http_idempotency_records')")
+            .expect("idempotency index list")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .expect("idempotency indexes")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("idempotency index rows");
+        let lease_index = indexes
+            .iter()
+            .find(|(name, _, _, _)| name == "idx_http_idempotency_records_lease_until")
+            .expect("lease index metadata");
+        assert_eq!(
+            lease_index,
+            &(
+                "idx_http_idempotency_records_lease_until".to_owned(),
+                0,
+                "c".to_owned(),
+                0
+            )
+        );
+        assert_named_index(
+            &store,
+            "idx_http_idempotency_records_lease_until",
+            "http_idempotency_records",
+            &["lease_until"],
+        );
+
+        store
+            .connection()
+            .execute(
+                "INSERT INTO http_idempotency_records (
+                     scope, idempotency_key, fingerprint, state, lease_generation,
+                     lease_until
+                 ) VALUES (?1, ?2, ?3, 'in_progress', 1, ?4)",
+                rusqlite::params![
+                    "scope",
+                    "default-timestamps",
+                    VALID_HTTP_FINGERPRINT,
+                    1700000000_i64
+                ],
+            )
+            .expect("insert row using timestamp defaults");
+        let defaults: (String, String) = store
+            .connection()
+            .query_row(
+                "SELECT created_at, updated_at
+                 FROM http_idempotency_records
+                 WHERE idempotency_key = 'default-timestamps'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read timestamp defaults");
+        for value in [defaults.0, defaults.1] {
+            assert_eq!(value.len(), 20, "canonical timestamps use whole seconds");
+            assert!(value.ends_with('Z'), "canonical timestamps are UTC");
+            let parsed =
+                OffsetDateTime::parse(&value, &Rfc3339).expect("default timestamp is RFC3339");
+            assert_eq!(parsed.offset(), UtcOffset::UTC);
+            assert_eq!(parsed.nanosecond(), 0);
+            assert_eq!(
+                parsed.format(&Rfc3339).expect("format timestamp"),
+                value,
+                "default timestamp is strict canonical RFC3339"
+            );
+        }
+
+        for (key, lease_until) in [
+            ("numeric-9", 9_i64),
+            ("numeric-10", 10),
+            ("numeric-large", 1_700_000_000),
+        ] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO http_idempotency_records (
+                         scope, idempotency_key, fingerprint, state, lease_generation,
+                         lease_until
+                     ) VALUES ('numeric', ?1, ?2, 'in_progress', 1, ?3)",
+                    rusqlite::params![key, VALID_HTTP_FINGERPRINT, lease_until],
+                )
+                .expect("numeric lease row");
+        }
+        let ordered: Vec<i64> = store
+            .connection()
+            .prepare(
+                "SELECT lease_until FROM http_idempotency_records
+                 WHERE scope = 'numeric' ORDER BY lease_until",
+            )
+            .expect("numeric lease order query")
+            .query_map([], |row| row.get(0))
+            .expect("numeric lease order rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("numeric lease order");
+        assert_eq!(ordered, vec![9, 10, 1_700_000_000]);
+        let query_plan: Vec<String> = store
+            .connection()
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM http_idempotency_records
+                 WHERE lease_until <= 10 ORDER BY lease_until",
+            )
+            .expect("lease query plan")
+            .query_map([], |row| row.get(3))
+            .expect("lease query plan rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("lease query plan");
+        assert!(
+            query_plan
+                .iter()
+                .any(|detail| { detail.contains("idx_http_idempotency_records_lease_until") })
+        );
+    }
+
+    #[test]
+    fn http_idempotency_v14_migration_is_idempotent() {
+        let mut connection = keyed_connection_for_migration_test();
+        run_migrations_with(&mut connection, MIGRATIONS).expect("apply v14 schema");
+        run_migrations_with(&mut connection, MIGRATIONS).expect("reapply v14 schema");
+
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM schema_migrations WHERE version = 14",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v14 migration count");
+        assert_eq!(migration_count, 1);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'http_idempotency_records'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("idempotency table count");
+        assert_eq!(table_count, 1);
+        let index_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_http_idempotency_records_lease_until'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("lease index count");
+        assert_eq!(index_count, 1);
+    }
+
+    #[test]
+    fn http_idempotency_v14_constraints_reject_invalid_rows() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let insert = |scope: Option<&str>,
+                      key: Option<&str>,
+                      fingerprint: Option<&str>,
+                      state: &str,
+                      lease_generation: i64,
+                      lease_until: Option<i64>,
+                      response_status: Option<i64>,
+                      response_content_type: Option<&str>,
+                      response_body: Option<&[u8]>| {
+            store.connection().execute(
+                "INSERT INTO http_idempotency_records (
+                     scope, idempotency_key, fingerprint, state, lease_generation,
+                     lease_until, response_status, response_content_type, response_body
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    scope,
+                    key,
+                    fingerprint,
+                    state,
+                    lease_generation,
+                    lease_until,
+                    response_status,
+                    response_content_type,
+                    response_body,
+                ],
+            )
+        };
+
+        insert(
+            Some("scope"),
+            Some("in-progress"),
+            Some(VALID_HTTP_FINGERPRINT),
+            "in_progress",
+            1,
+            Some(1_700_000_000_i64),
+            None,
+            None,
+            None,
+        )
+        .expect("valid in-progress row");
+        insert(
+            Some("scope"),
+            Some("completed"),
+            Some(VALID_HTTP_FINGERPRINT),
+            "completed",
+            1,
+            Some(1_700_000_000_i64),
+            Some(200),
+            Some("application/json"),
+            Some(b"{}"),
+        )
+        .expect("valid completed row");
+
+        assert!(
+            insert(
+                Some("scope"),
+                Some("bad-state"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "unknown",
+                1,
+                Some(1_700_000_000_i64),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("in-progress-status-only"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "in_progress",
+                1,
+                Some(1_700_000_000_i64),
+                Some(200),
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("in-progress-content-type-only"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "in_progress",
+                1,
+                Some(1_700_000_000_i64),
+                None,
+                Some("application/json"),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("in-progress-body-only"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "in_progress",
+                1,
+                Some(1_700_000_000_i64),
+                None,
+                None,
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("bad-generation"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "in_progress",
+                0,
+                Some(1_700_000_000_i64),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                None,
+                Some("missing-scope"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "in_progress",
+                1,
+                Some(1_700_000_000_i64),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                None,
+                Some(VALID_HTTP_FINGERPRINT),
+                "in_progress",
+                1,
+                Some(1_700_000_000_i64),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("missing-fingerprint"),
+                None,
+                "in_progress",
+                1,
+                Some(1_700_000_000_i64),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("missing-lease"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "in_progress",
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        for (label, scope, key, fingerprint) in [
+            (
+                "empty scope",
+                Some(""),
+                Some("empty-scope-key"),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "whitespace-only scope",
+                Some("   "),
+                Some("whitespace-scope-key"),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "empty idempotency key",
+                Some("scope"),
+                Some(""),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "whitespace-only idempotency key",
+                Some("scope"),
+                Some("   "),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "empty fingerprint",
+                Some("empty-fingerprint-scope"),
+                Some("empty-fingerprint-key"),
+                Some(""),
+            ),
+            (
+                "whitespace-only fingerprint",
+                Some("whitespace-fingerprint-scope"),
+                Some("whitespace-fingerprint-key"),
+                Some("   "),
+            ),
+            (
+                "tab-only scope",
+                Some("\t"),
+                Some("tab-scope-key"),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "newline-only scope",
+                Some("\n"),
+                Some("newline-scope-key"),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "non-breaking-space-only scope",
+                Some("\u{00a0}"),
+                Some("nbsp-scope-key"),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "tab-only idempotency key",
+                Some("scope"),
+                Some("\t"),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "newline-only idempotency key",
+                Some("scope"),
+                Some("\n"),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "non-breaking-space-only idempotency key",
+                Some("scope"),
+                Some("\u{00a0}"),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "tab-only fingerprint",
+                Some("tab-fingerprint-scope"),
+                Some("tab-fingerprint-key"),
+                Some("\t"),
+            ),
+            (
+                "newline-only fingerprint",
+                Some("newline-fingerprint-scope"),
+                Some("newline-fingerprint-key"),
+                Some("\n"),
+            ),
+            (
+                "non-breaking-space-only fingerprint",
+                Some("nbsp-fingerprint-scope"),
+                Some("nbsp-fingerprint-key"),
+                Some("\u{00a0}"),
+            ),
+        ] {
+            assert!(
+                insert(
+                    scope,
+                    key,
+                    fingerprint,
+                    "in_progress",
+                    1,
+                    Some(1_700_000_000_i64),
+                    None,
+                    None,
+                    None,
+                )
+                .is_err(),
+                "{label} was accepted"
+            );
+        }
+        assert!(
+            insert(
+                Some("scope"),
+                Some("in-progress-response"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "in_progress",
+                1,
+                Some(1_700_000_000_i64),
+                Some(200),
+                Some("application/json"),
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("completed-status-null"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "completed",
+                1,
+                Some(1_700_000_000_i64),
+                None,
+                Some("application/json"),
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("completed-type-null"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "completed",
+                1,
+                Some(1_700_000_000_i64),
+                Some(200),
+                None,
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("completed-body-null"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "completed",
+                1,
+                Some(1_700_000_000_i64),
+                Some(200),
+                Some("application/json"),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("completed-status-low"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "completed",
+                1,
+                Some(1_700_000_000_i64),
+                Some(199),
+                Some("application/json"),
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("completed-status-high"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "completed",
+                1,
+                Some(1_700_000_000_i64),
+                Some(600),
+                Some("application/json"),
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        assert!(
+            insert(
+                Some("scope"),
+                Some("completed-type-invalid"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "completed",
+                1,
+                Some(1_700_000_000_i64),
+                Some(200),
+                Some("text/plain"),
+                Some(b"{}"),
+            )
+            .is_err()
+        );
+        let nul_fingerprint = format!("{}\0!", "a".repeat(62));
+        assert_eq!(nul_fingerprint.len(), 64);
+        for (label, scope, key, fingerprint) in [
+            (
+                "embedded NUL in scope",
+                Some("ok\0!"),
+                Some("nul-scope-key"),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "embedded NUL in idempotency key",
+                Some("scope"),
+                Some("ok\0!"),
+                Some(VALID_HTTP_FINGERPRINT),
+            ),
+            (
+                "embedded NUL with invalid fingerprint suffix",
+                Some("nul-fingerprint-scope"),
+                Some("nul-fingerprint-key"),
+                Some(nul_fingerprint.as_str()),
+            ),
+        ] {
+            assert!(
+                insert(
+                    scope,
+                    key,
+                    fingerprint,
+                    "in_progress",
+                    1,
+                    Some(1_700_000_000_i64),
+                    None,
+                    None,
+                    None,
+                )
+                .is_err(),
+                "{label} was accepted"
+            );
+        }
+        assert!(
+            insert(
+                Some("scope"),
+                Some("in-progress"),
+                Some(VALID_HTTP_FINGERPRINT),
+                "in_progress",
+                1,
+                Some(1_700_000_000_i64),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+
+        let row_count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM http_idempotency_records", [], |row| {
+                row.get(0)
+            })
+            .expect("row count");
+        assert_eq!(row_count, 2);
+    }
+
+    #[test]
+    fn http_idempotency_v14_constraints_reject_wrong_storage_classes() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let insert = |values: [Value; 11]| {
+            store.connection().execute(
+                "INSERT INTO http_idempotency_records (
+                     scope, idempotency_key, fingerprint, state, lease_generation,
+                     lease_until, response_status, response_content_type, response_body,
+                     created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    values[0].clone(),
+                    values[1].clone(),
+                    values[2].clone(),
+                    values[3].clone(),
+                    values[4].clone(),
+                    values[5].clone(),
+                    values[6].clone(),
+                    values[7].clone(),
+                    values[8].clone(),
+                    values[9].clone(),
+                    values[10].clone(),
+                ],
+            )
+        };
+        let in_progress = || {
+            [
+                Value::Text("scope".to_owned()),
+                Value::Text("key".to_owned()),
+                Value::Text(VALID_HTTP_FINGERPRINT.to_owned()),
+                Value::Text("in_progress".to_owned()),
+                Value::Integer(1),
+                Value::Integer(1_700_000_000),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Text("2025-01-01T00:00:00Z".to_owned()),
+                Value::Text("2025-01-01T00:00:00Z".to_owned()),
+            ]
+        };
+        let completed = || {
+            [
+                Value::Text("scope".to_owned()),
+                Value::Text("key".to_owned()),
+                Value::Text(VALID_HTTP_FINGERPRINT.to_owned()),
+                Value::Text("completed".to_owned()),
+                Value::Integer(1),
+                Value::Integer(1_700_000_000),
+                Value::Integer(200),
+                Value::Text("application/json".to_owned()),
+                Value::Blob(b"{}".to_vec()),
+                Value::Text("2025-01-01T00:00:00Z".to_owned()),
+                Value::Text("2025-01-01T00:00:00Z".to_owned()),
+            ]
+        };
+
+        for (label, index, value) in [
+            ("scope", 0, Value::Blob(b"scope".to_vec())),
+            ("idempotency key", 1, Value::Blob(b"key".to_vec())),
+            (
+                "fingerprint",
+                2,
+                Value::Blob(VALID_HTTP_FINGERPRINT.as_bytes().to_vec()),
+            ),
+            ("state", 3, Value::Blob(b"in_progress".to_vec())),
+            ("lease generation", 4, Value::Text("abc".to_owned())),
+            ("lease until", 5, Value::Blob(b"1700000000".to_vec())),
+            (
+                "created at",
+                9,
+                Value::Blob(b"2025-01-01T00:00:00Z".to_vec()),
+            ),
+            (
+                "updated at",
+                10,
+                Value::Blob(b"2025-01-01T00:00:00Z".to_vec()),
+            ),
+        ] {
+            let mut values = in_progress();
+            values[index] = value;
+            assert!(insert(values).is_err(), "{label} accepted the wrong type");
+        }
+
+        for (label, index, value) in [
+            ("response status", 6, Value::Real(200.5)),
+            (
+                "response content type",
+                7,
+                Value::Blob(b"application/json".to_vec()),
+            ),
+            ("response body", 8, Value::Text("{}".to_owned())),
+        ] {
+            let mut values = completed();
+            values[index] = value;
+            assert!(insert(values).is_err(), "{label} accepted the wrong type");
+        }
+    }
+
+    #[test]
+    fn http_idempotency_v14_constraints_reject_noncanonical_timestamps() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let insert = |key: &str, created_at: &str, updated_at: &str| {
+            store.connection().execute(
+                "INSERT INTO http_idempotency_records (
+                     scope, idempotency_key, fingerprint, state, lease_generation,
+                     lease_until, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'in_progress', 1, ?4, ?5, ?6)",
+                rusqlite::params![
+                    "scope",
+                    key,
+                    VALID_HTTP_FINGERPRINT,
+                    1_700_000_000_i64,
+                    created_at,
+                    updated_at,
+                ],
+            )
+        };
+        let canonical = "2025-01-01T00:00:00Z";
+        for (index, (label, created_at, updated_at)) in [
+            ("legacy created_at", "2025-01-01 00:00:00", canonical),
+            (
+                "fractional created_at",
+                "2025-01-01T00:00:00.000Z",
+                canonical,
+            ),
+            ("legacy updated_at", canonical, "2025-01-01 00:00:00"),
+            ("offset updated_at", canonical, "2025-01-01T00:00:00+00:00"),
+            ("hour 24 created_at", "2025-01-01T24:00:00Z", canonical),
+            ("month zero created_at", "2025-00-01T00:00:00Z", canonical),
+            ("month 13 created_at", "2025-13-01T00:00:00Z", canonical),
+            ("day zero created_at", "2025-01-00T00:00:00Z", canonical),
+            ("day 32 created_at", "2025-01-32T00:00:00Z", canonical),
+            (
+                "day outside month created_at",
+                "2025-02-29T00:00:00Z",
+                canonical,
+            ),
+            ("minute 60 created_at", "2025-01-01T00:60:00Z", canonical),
+            ("second 60 created_at", "2025-01-01T00:00:60Z", canonical),
+            ("hour 24 updated_at", canonical, "2025-01-01T24:00:00Z"),
+            ("minute 60 updated_at", canonical, "2025-01-01T00:60:00Z"),
+            ("second 60 updated_at", canonical, "2025-01-01T00:00:60Z"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if label.contains("hour")
+                || label.contains("month")
+                || label.contains("day")
+                || label.contains("minute")
+                || label.contains("second")
+            {
+                let value = if created_at != canonical {
+                    created_at
+                } else {
+                    updated_at
+                };
+                assert!(
+                    OffsetDateTime::parse(value, &Rfc3339).is_err(),
+                    "{label} must be rejected by strict RFC3339 parsing"
+                );
+            }
+            let key = format!("timestamp-{index}");
+            assert!(
+                insert(&key, created_at, updated_at).is_err(),
+                "{label} was accepted"
+            );
+        }
+        let row_count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM http_idempotency_records", [], |row| {
+                row.get(0)
+            })
+            .expect("row count");
+        assert_eq!(row_count, 0);
+    }
+
+    #[test]
+    fn http_idempotency_v14_constraints_reject_invalid_lease_until() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let insert = |key: &str, lease_until: Value| {
+            store.connection().execute(
+                "INSERT INTO http_idempotency_records (
+                     scope, idempotency_key, fingerprint, state, lease_generation,
+                     lease_until
+                 ) VALUES ('scope', ?1, ?2, 'in_progress', 1, ?3)",
+                rusqlite::params![key, VALID_HTTP_FINGERPRINT, lease_until],
+            )
+        };
+
+        for (index, (label, lease_until)) in [
+            ("negative", Value::Integer(-1)),
+            ("real", Value::Real(1_700_000_000.5)),
+            ("non-numeric text", Value::Text("1700000000x".to_owned())),
+            ("blob", Value::Blob(b"1700000000".to_vec())),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                insert(&format!("invalid-lease-{index}"), lease_until).is_err(),
+                "{label} lease_until was accepted"
+            );
+        }
+
+        for (key, lease_until) in [
+            ("zero", 0_i64),
+            ("positive", 1_700_000_000),
+            ("maximum", i64::MAX),
+        ] {
+            insert(key, Value::Integer(lease_until)).expect("valid lease_until was rejected");
+        }
+
+        let stored: Vec<i64> = store
+            .connection()
+            .prepare(
+                "SELECT lease_until FROM http_idempotency_records
+                 ORDER BY idempotency_key",
+            )
+            .expect("lease values query")
+            .query_map([], |row| row.get(0))
+            .expect("lease values")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("lease values rows");
+        assert_eq!(stored, vec![i64::MAX, 1_700_000_000, 0]);
+    }
+
+    #[test]
+    fn http_idempotency_v14_reopen_preserves_rows() {
+        let database = TempDatabase::new();
+        let v13_migrations = &MIGRATIONS[..MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 14)
+            .expect("v14 migration")];
+        {
+            let mut connection = Connection::open(&database.path).expect("open v13 database");
+            apply_sqlcipher_key(&connection, DATABASE_KEY).expect("apply SQLCipher key");
+            verify_sqlcipher(&connection).expect("verify SQLCipher");
+            run_migrations_with(&mut connection, v13_migrations).expect("apply v13 schema");
+            connection
+                .execute(
+                    "UPDATE configuration SET owner_email = ?1 WHERE id = 1",
+                    ["owner@example.test"],
+                )
+                .expect("seed v13 configuration");
+            connection
+                .execute(
+                    "INSERT INTO replay_nonces (nonce, consumed_at, expires_at)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        "reopen-nonce",
+                        "2025-01-01T00:00:00Z",
+                        "2025-01-01T00:01:00Z"
+                    ],
+                )
+                .expect("seed v13 replay nonce");
+        }
+
+        let v13_table_count: i64 = {
+            let connection = Connection::open(&database.path).expect("open v13 snapshot");
+            apply_sqlcipher_key(&connection, DATABASE_KEY).expect("apply SQLCipher key");
+            verify_sqlcipher(&connection).expect("verify SQLCipher");
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("v13 table count")
+        };
+        let snapshot = |store: &PaStore| {
+            let table_count: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("table count");
+            let index_count: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type = 'index'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("index count");
+            let configuration_rows: i64 = store
+                .connection()
+                .query_row("SELECT count(*) FROM configuration", [], |row| row.get(0))
+                .expect("configuration row count");
+            let replay_rows: i64 = store
+                .connection()
+                .query_row("SELECT count(*) FROM replay_nonces", [], |row| row.get(0))
+                .expect("replay row count");
+            let idempotency_rows: i64 = store
+                .connection()
+                .query_row("SELECT count(*) FROM http_idempotency_records", [], |row| {
+                    row.get(0)
+                })
+                .expect("idempotency row count");
+            let migration_rows: i64 = store
+                .connection()
+                .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .expect("migration row count");
+            (
+                table_count,
+                index_count,
+                configuration_rows,
+                replay_rows,
+                idempotency_rows,
+                migration_rows,
+            )
+        };
+
+        let mut snapshots = Vec::new();
+        for reopen in 0..3 {
+            let store = PaStore::open(&database.path, DATABASE_KEY).expect("open v14 store");
+            let owner_email: String = store
+                .connection()
+                .query_row(
+                    "SELECT owner_email FROM configuration WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("preserved configuration");
+            assert_eq!(owner_email, "owner@example.test");
+            let nonce: String = store
+                .connection()
+                .query_row(
+                    "SELECT nonce FROM replay_nonces WHERE nonce = 'reopen-nonce'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("preserved replay nonce");
+            assert_eq!(nonce, "reopen-nonce");
+            if reopen == 0 {
+                store
+                    .connection()
+                    .execute(
+                        "INSERT INTO http_idempotency_records (
+                             scope, idempotency_key, fingerprint, state, lease_generation,
+                             lease_until
+                         ) VALUES (?1, ?2, ?3, 'in_progress', 1, ?4)",
+                        rusqlite::params![
+                            "scope",
+                            "key",
+                            VALID_HTTP_FINGERPRINT,
+                            1_700_000_000_i64
+                        ],
+                    )
+                    .expect("insert idempotency row");
+            }
+            let idempotency_row: (String, String, String) = store
+                .connection()
+                .query_row(
+                    "SELECT scope, idempotency_key, fingerprint
+                     FROM http_idempotency_records",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("preserved idempotency row");
+            assert_eq!(
+                idempotency_row,
+                (
+                    "scope".to_owned(),
+                    "key".to_owned(),
+                    VALID_HTTP_FINGERPRINT.to_owned()
+                )
+            );
+            snapshots.push(snapshot(&store));
+        }
+
+        assert_eq!(snapshots[0].0, v13_table_count + 1);
+        assert_eq!(snapshots[0].2, 1);
+        assert_eq!(snapshots[0].3, 1);
+        assert_eq!(snapshots[0].4, 1);
+        assert_eq!(snapshots[0].5, 14);
+        assert_eq!(snapshots[0], snapshots[1]);
+        assert_eq!(snapshots[1], snapshots[2]);
+    }
+
+    #[test]
     fn configuration_version_survives_file_reopen() {
         let database = TempDatabase::new();
         let v12_migrations = &MIGRATIONS[..MIGRATIONS
@@ -8817,14 +9991,14 @@ END;
                 row.get(0)
             })
             .expect("schema version");
-        assert_eq!(schema_version, 13);
+        assert_eq!(schema_version, 14);
         let migration_count: i64 = store
             .connection()
             .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
                 row.get(0)
             })
             .expect("migration count");
-        assert_eq!(migration_count, 13);
+        assert_eq!(migration_count, 14);
         let version: i64 = store
             .connection()
             .query_row(
@@ -11724,6 +12898,7 @@ END;
                 "audit_events",
                 "configuration",
                 "event_mappings",
+                "http_idempotency_records",
                 "messages",
                 "notification_outbox",
                 "oauth_credentials",
