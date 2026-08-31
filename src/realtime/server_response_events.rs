@@ -206,12 +206,70 @@ mod tests {
         for secret in ["event-1", "response-1", "provider_error", "E-42"] {
             assert!(!debug.contains(secret), "debug leaked payload: {debug}");
         }
+
+        let invalid_details = ResponseStatusDetails {
+            reason: Some(InterruptionReason::TurnDetected),
+            error: None,
+        };
+        assert_eq!(
+            ResponseSummary::new(
+                id("response-1"),
+                ResponseStatus::Completed,
+                Some(invalid_details.clone())
+            ),
+            Err(RealtimeValueError::InvalidInterruptionReason)
+        );
+
+        let invalid_summary = ResponseSummary {
+            id: id("response-1"),
+            status: ResponseStatus::Completed,
+            status_details: Some(invalid_details),
+        };
+        let serialization_error = serde_json::to_string(&invalid_summary)
+            .expect_err("invalid interruption state must not serialize")
+            .to_string();
+        assert_eq!(
+            serialization_error,
+            RealtimeValueError::InvalidInterruptionReason.to_string()
+        );
+        let invalid_event = RealtimeServerResponseEvent::ResponseDone {
+            event_id: id("event-1"),
+            response: invalid_summary,
+        };
+        assert_eq!(
+            serde_json::to_string(&invalid_event)
+                .expect_err("invalid response event must not serialize")
+                .to_string(),
+            RealtimeValueError::InvalidInterruptionReason.to_string()
+        );
+
+        let cancelled_summary = ResponseSummary::new(
+            id("response-1"),
+            ResponseStatus::Cancelled,
+            Some(ResponseStatusDetails {
+                reason: Some(InterruptionReason::ClientCancelled),
+                error: None,
+            }),
+        )
+        .expect("cancelled response may carry an interruption reason");
+        let cancelled_event = RealtimeServerResponseEvent::ResponseDone {
+            event_id: id("event-1"),
+            response: cancelled_summary,
+        };
+        assert_eq!(
+            serde_json::from_value::<RealtimeServerResponseEvent>(
+                serde_json::to_value(&cancelled_event).expect("serialize cancelled event")
+            )
+            .expect("cancelled event round trip"),
+            cancelled_event
+        );
     }
 }
 
 use std::fmt;
 
 use serde::de::Error as DeError;
+use serde::ser::Error as SerError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
@@ -379,7 +437,7 @@ impl fmt::Debug for ResponseStatusDetails {
 }
 
 /// The bounded response metadata carried by `response.done`.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResponseSummary {
     /// The required provider response identifier.
     pub id: OpaqueId,
@@ -392,6 +450,58 @@ pub struct ResponseSummary {
 impl fmt::Debug for ResponseSummary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ResponseSummary(<redacted>)")
+    }
+}
+
+impl ResponseSummary {
+    /// Constructs response metadata while enforcing cancellation-only reasons.
+    pub fn new(
+        id: OpaqueId,
+        status: ResponseStatus,
+        status_details: Option<ResponseStatusDetails>,
+    ) -> Result<Self, RealtimeValueError> {
+        let summary = Self {
+            id,
+            status,
+            status_details,
+        };
+        summary.validate()?;
+        Ok(summary)
+    }
+
+    fn validate(&self) -> Result<(), RealtimeValueError> {
+        if self.status != ResponseStatus::Cancelled
+            && self
+                .status_details
+                .as_ref()
+                .and_then(|details| details.reason)
+                .is_some()
+        {
+            return Err(RealtimeValueError::InvalidInterruptionReason);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct ResponseSummaryWire<'a> {
+    id: &'a OpaqueId,
+    status: ResponseStatus,
+    status_details: Option<&'a ResponseStatusDetails>,
+}
+
+impl Serialize for ResponseSummary {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(S::Error::custom)?;
+        ResponseSummaryWire {
+            id: &self.id,
+            status: self.status,
+            status_details: self.status_details.as_ref(),
+        }
+        .serialize(serializer)
     }
 }
 
@@ -516,19 +626,7 @@ fn parse_response_summary(value: Value) -> Result<ResponseSummary, RealtimeValue
         .map(parse_status_details)
         .transpose()?;
     finish(map)?;
-    if status != ResponseStatus::Cancelled
-        && status_details
-            .as_ref()
-            .and_then(|details| details.reason)
-            .is_some()
-    {
-        return Err(RealtimeValueError::InvalidInterruptionReason);
-    }
-    Ok(ResponseSummary {
-        id,
-        status,
-        status_details,
-    })
+    ResponseSummary::new(id, status, status_details)
 }
 
 fn parse_response_done_payload(value: Value) -> Result<ResponseDone, RealtimeValueError> {
