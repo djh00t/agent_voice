@@ -675,7 +675,7 @@ fn parse_backup_bool(value: &str) -> Result<bool> {
 }
 
 fn parse_backup_retention(value: &str) -> Result<u16> {
-    let parsed = parse_backup_number("retention", value)?;
+    let parsed = parse_backup_number("retention_days", "invalid_retention", value)?;
     if (1..=3650).contains(&parsed) {
         Ok(parsed)
     } else {
@@ -684,7 +684,7 @@ fn parse_backup_retention(value: &str) -> Result<u16> {
 }
 
 fn parse_backup_max_age(value: &str) -> Result<u32> {
-    let parsed = parse_backup_number("max_age", value)?;
+    let parsed = parse_backup_number("max_age_hours", "invalid_max_age", value)?;
     if (1..=168).contains(&parsed) {
         Ok(parsed)
     } else {
@@ -692,17 +692,17 @@ fn parse_backup_max_age(value: &str) -> Result<u32> {
     }
 }
 
-fn parse_backup_number<T>(field: &str, value: &str) -> Result<T>
+fn parse_backup_number<T>(field: &str, code: &str, value: &str) -> Result<T>
 where
     T: std::str::FromStr,
 {
     let normalized = normalize_env_value(value);
     if normalized.is_empty() || !normalized.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(backup_error(field, &format!("invalid_{field}")));
+        return Err(backup_error(field, code));
     }
     normalized
         .parse::<T>()
-        .map_err(|_| backup_error(field, &format!("invalid_{field}")))
+        .map_err(|_| backup_error(field, code))
 }
 
 fn validate_backup_bucket(bucket: &str) -> Result<()> {
