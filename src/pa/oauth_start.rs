@@ -59,6 +59,9 @@ pub trait OAuthStateStore {
     ) -> OAuthResult<()>;
 
     fn consume(&mut self, state: &str, now: DateTime<Utc>) -> OAuthResult<String>;
+
+    /// Removes entries whose replay window has ended.
+    fn purge_expired(&mut self, _now: DateTime<Utc>) {}
 }
 
 struct StateEntry {
@@ -122,7 +125,10 @@ impl OAuthStateStore for InMemoryOAuthStateStore {
             return Err(OAuthError::InvalidState);
         }
 
-        let entry = self.entries.get(state).ok_or(OAuthError::InvalidState)?;
+        let entry = self
+            .entries
+            .get_mut(state)
+            .ok_or(OAuthError::InvalidState)?;
         if entry.consumed {
             return Err(OAuthError::StateAlreadyUsed);
         }
@@ -130,12 +136,12 @@ impl OAuthStateStore for InMemoryOAuthStateStore {
             return Err(OAuthError::StateExpired);
         }
 
-        let verifier = entry.verifier.clone();
-        self.entries
-            .get_mut(state)
-            .expect("state entry remains present")
-            .consumed = true;
-        Ok(verifier)
+        entry.consumed = true;
+        Ok(std::mem::take(&mut entry.verifier))
+    }
+
+    fn purge_expired(&mut self, now: DateTime<Utc>) {
+        self.entries.retain(|_, entry| entry.expires_at > now);
     }
 }
 
@@ -194,6 +200,7 @@ pub fn begin(
     )?;
 
     state_store.reserve(&state, &code_verifier, expires_at)?;
+    state_store.purge_expired(now);
     Ok(OAuthStart {
         state,
         code_verifier,
