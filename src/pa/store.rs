@@ -8043,6 +8043,12 @@ mod tests {
     const DATABASE_KEY: &[u8] = b"task-4a-test-key";
     const VALID_HTTP_FINGERPRINT: &str =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const STREAM_A: &str = "microsoft.mail:account-a";
+    const STREAM_B: &str = "google.mail:account-a";
+    const FIRST_CURSOR: &str = "cursor-a-1";
+    const NEXT_CURSOR: &str = "cursor-a-2";
+    const STALE_CURSOR: &str = "cursor-a-0";
+    const REDACTION_SENTINEL: &str = "cursor-secret-sentinel-9c-a";
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct TempDatabase {
@@ -13376,7 +13382,7 @@ END;
             Err(StoreError::InvalidInput { .. })
         ));
         assert!(matches!(
-            store.save_provider_cursor("stream", None, " "),
+            store.advance_provider_cursor("stream", None, " "),
             Err(StoreError::InvalidInput { .. })
         ));
     }
@@ -13440,20 +13446,300 @@ END;
     }
 
     #[test]
-    fn provider_cursors_isolate_streams_upsert_and_delete() {
+    fn provider_cursor_cas_rejects_stale_and_equal_retry() {
         let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
         store
-            .save_provider_cursor("microsoft.mail:account-a", None, "cursor-1")
-            .expect("save cursor");
+            .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("first cursor");
         store
-            .save_provider_cursor("microsoft.mail:account-a", Some("cursor-1"), "cursor-1")
-            .expect("idempotent retry");
+            .advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), NEXT_CURSOR)
+            .expect("cursor advance");
+        let before_equal_count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM provider_cursors", [], |row| {
+                row.get(0)
+            })
+            .expect("cursor count before equal retry");
+        let before_equal_timestamp: String = store
+            .connection()
+            .query_row(
+                "SELECT updated_at FROM provider_cursors WHERE provider = ?1",
+                [STREAM_A],
+                |row| row.get(0),
+            )
+            .expect("timestamp before equal retry");
         store
-            .save_provider_cursor("microsoft.mail:account-a", Some("cursor-1"), "cursor-2")
-            .expect("cursor advances");
+            .advance_provider_cursor(STREAM_A, Some(NEXT_CURSOR), NEXT_CURSOR)
+            .expect("equal retry");
+        let after_equal_count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM provider_cursors", [], |row| {
+                row.get(0)
+            })
+            .expect("cursor count after equal retry");
+        let after_equal_timestamp: String = store
+            .connection()
+            .query_row(
+                "SELECT updated_at FROM provider_cursors WHERE provider = ?1",
+                [STREAM_A],
+                |row| row.get(0),
+            )
+            .expect("timestamp after equal retry");
+        assert!(before_equal_count == after_equal_count);
+        assert!(before_equal_timestamp == after_equal_timestamp);
+        assert!(matches!(
+            store.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == NEXT_CURSOR
+        ));
+        assert!(matches!(
+            store.advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), STALE_CURSOR),
+            Err(StoreError::CursorConflict {
+                resource: "provider cursor"
+            })
+        ));
+        assert!(matches!(
+            store.advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), NEXT_CURSOR),
+            Err(StoreError::CursorConflict {
+                resource: "provider cursor"
+            })
+        ));
+        assert!(matches!(
+            store.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == NEXT_CURSOR
+        ));
+    }
+
+    #[test]
+    fn provider_cursor_first_write_and_restart() {
+        let null_store = PaStore::open_in_memory(DATABASE_KEY).expect("open null store");
+        null_store
+            .connection()
+            .execute(
+                "INSERT INTO provider_cursors(provider, cursor) VALUES (?1, NULL)",
+                [STREAM_A],
+            )
+            .expect("insert nullable cursor row");
+        assert!(matches!(
+            null_store.load_provider_cursor(STREAM_A),
+            Ok(None)
+        ));
+        null_store
+            .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("replace nullable cursor");
+        assert!(matches!(
+            null_store.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == FIRST_CURSOR
+        ));
+
+        let database = TempDatabase::new();
+        let store = PaStore::open(&database.path, DATABASE_KEY).expect("open file store");
+        assert!(matches!(store.load_provider_cursor(STREAM_A), Ok(None)));
         store
-            .save_provider_cursor("google.mail:account-a", None, "other-cursor")
-            .expect("save isolated cursor");
+            .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("first file cursor");
+        assert!(matches!(
+            store.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == FIRST_CURSOR
+        ));
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM provider_cursors", [], |row| {
+                row.get(0)
+            })
+            .expect("cursor row count");
+        assert!(count == 1);
+        drop(store);
+
+        let reopened = PaStore::open(&database.path, DATABASE_KEY).expect("reopen file store");
+        assert!(matches!(
+            reopened.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == FIRST_CURSOR
+        ));
+        assert!(matches!(
+            reopened.advance_provider_cursor(STREAM_A, None, NEXT_CURSOR),
+            Err(StoreError::CursorConflict {
+                resource: "provider cursor"
+            })
+        ));
+        let reopened_count: i64 = reopened
+            .connection()
+            .query_row("SELECT count(*) FROM provider_cursors", [], |row| {
+                row.get(0)
+            })
+            .expect("reopened cursor row count");
+        assert!(reopened_count == 1);
+    }
+
+    #[test]
+    fn provider_cursor_two_handles_have_one_winner() {
+        let database = TempDatabase::new();
+        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("open seed store");
+        seed.advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("seed cursor");
+        drop(seed);
+
+        let first = PaStore::open(&database.path, DATABASE_KEY).expect("open first store");
+        let second = PaStore::open(&database.path, DATABASE_KEY).expect("open second store");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_barrier = std::sync::Arc::clone(&barrier);
+        let second_barrier = std::sync::Arc::clone(&barrier);
+        let first_handle = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), NEXT_CURSOR)
+        });
+        let second_handle = std::thread::spawn(move || {
+            second_barrier.wait();
+            second.advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), STALE_CURSOR)
+        });
+        let results = [
+            first_handle.join().expect("first cursor thread"),
+            second_handle.join().expect("second cursor thread"),
+        ];
+        assert!(results.iter().filter(|result| result.is_ok()).count() == 1);
+        assert!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(StoreError::CursorConflict {
+                        resource: "provider cursor"
+                    })
+                ))
+                .count()
+                == 1
+        );
+
+        let reopened = PaStore::open(&database.path, DATABASE_KEY).expect("reopen race store");
+        let current = reopened
+            .load_provider_cursor(STREAM_A)
+            .expect("load race winner");
+        assert!(matches!(
+            current.as_deref(),
+            Some(value) if value == NEXT_CURSOR || value == STALE_CURSOR
+        ));
+        assert!(matches!(
+            reopened.advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), NEXT_CURSOR),
+            Err(StoreError::CursorConflict {
+                resource: "provider cursor"
+            })
+        ));
+        let winner = current.as_deref().expect("race winner value");
+        assert!(
+            reopened
+                .advance_provider_cursor(STREAM_A, Some(winner), winner)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn provider_cursor_invalid_inputs_are_atomic_and_redacted() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let invalid_streams = vec![
+            String::new(),
+            " ".to_owned(),
+            "stream\tid".to_owned(),
+            "stream\nid".to_owned(),
+            "é".to_owned(),
+            "x".repeat(257),
+            format!("{REDACTION_SENTINEL}\n"),
+        ];
+        for stream in invalid_streams {
+            let error = store
+                .load_provider_cursor(&stream)
+                .expect_err("invalid stream must fail");
+            assert!(matches!(error, StoreError::InvalidInput { .. }));
+            assert!(!error.to_string().contains(REDACTION_SENTINEL));
+            assert!(!format!("{error:?}").contains(REDACTION_SENTINEL));
+        }
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM provider_cursors", [], |row| {
+                row.get(0)
+            })
+            .expect("invalid stream row count");
+        assert!(count == 0);
+
+        store
+            .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("seed cursor");
+        let invalid_expected = vec![
+            Some(String::new()),
+            Some(" ".to_owned()),
+            Some("stream\tid".to_owned()),
+            Some("stream\nid".to_owned()),
+            Some("é".to_owned()),
+            Some("x".repeat(257)),
+            Some(format!("{REDACTION_SENTINEL}\n")),
+        ];
+        for expected in invalid_expected {
+            let error = store
+                .advance_provider_cursor(STREAM_A, expected.as_deref(), NEXT_CURSOR)
+                .expect_err("invalid expected cursor must fail");
+            assert!(matches!(error, StoreError::InvalidInput { .. }));
+            assert!(!error.to_string().contains(REDACTION_SENTINEL));
+            assert!(!format!("{error:?}").contains(REDACTION_SENTINEL));
+            assert!(matches!(
+                store.load_provider_cursor(STREAM_A),
+                Ok(Some(value)) if value == FIRST_CURSOR
+            ));
+        }
+        let invalid_next = vec![
+            String::new(),
+            " ".to_owned(),
+            "stream\tid".to_owned(),
+            "stream\nid".to_owned(),
+            "é".to_owned(),
+            "x".repeat(257),
+            format!("{REDACTION_SENTINEL}\n"),
+        ];
+        for next in invalid_next {
+            let error = store
+                .advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), &next)
+                .expect_err("invalid next cursor must fail");
+            assert!(matches!(error, StoreError::InvalidInput { .. }));
+            assert!(!error.to_string().contains(REDACTION_SENTINEL));
+            assert!(!format!("{error:?}").contains(REDACTION_SENTINEL));
+        }
+        assert!(matches!(
+            store.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == FIRST_CURSOR
+        ));
+
+        let corrupt = PaStore::open_in_memory(DATABASE_KEY).expect("open corrupt store");
+        corrupt
+            .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("seed corrupt store");
+        corrupt
+            .connection()
+            .execute(
+                "UPDATE provider_cursors SET cursor = ?1 WHERE provider = ?2",
+                rusqlite::params![format!("{REDACTION_SENTINEL}\n"), STREAM_A],
+            )
+            .expect("corrupt cursor fixture");
+        let error = corrupt
+            .load_provider_cursor(STREAM_A)
+            .expect_err("corrupt cursor must fail closed");
+        assert!(matches!(
+            error,
+            StoreError::StoredRecordInvalid {
+                resource: "provider cursor"
+            }
+        ));
+        assert!(!error.to_string().contains(REDACTION_SENTINEL));
+        assert!(!format!("{error:?}").contains(REDACTION_SENTINEL));
+    }
+
+    #[test]
+    fn provider_cursor_streams_are_isolated() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        assert!(matches!(store.load_provider_cursor(STREAM_A), Ok(None)));
+        assert!(matches!(store.load_provider_cursor(STREAM_B), Ok(None)));
+        store
+            .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("stream A cursor");
+        store
+            .advance_provider_cursor(STREAM_B, None, FIRST_CURSOR)
+            .expect("stream B cursor");
 
         let count: i64 = store
             .connection()
@@ -13461,55 +13747,21 @@ END;
                 row.get(0)
             })
             .expect("cursor count");
-        assert_eq!(count, 2);
-        assert_eq!(
-            store
-                .load_provider_cursor("microsoft.mail:account-a")
-                .expect("load cursor"),
-            "cursor-2"
-        );
-        let before_retry: String = store
-            .connection()
-            .query_row(
-                "SELECT updated_at FROM provider_cursors WHERE provider = 'microsoft.mail:account-a'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("timestamp before retry");
-        store
-            .save_provider_cursor("microsoft.mail:account-a", Some("cursor-2"), "cursor-2")
-            .expect("identical retry");
-        let after_retry: String = store
-            .connection()
-            .query_row(
-                "SELECT updated_at FROM provider_cursors WHERE provider = 'microsoft.mail:account-a'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("timestamp after retry");
-        assert_eq!(before_retry, after_retry);
+        assert!(count == 2);
         assert!(matches!(
-            store.save_provider_cursor("microsoft.mail:account-a", Some("cursor-1"), "cursor-1",),
+            store.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == FIRST_CURSOR
+        ));
+        assert!(matches!(
+            store.load_provider_cursor(STREAM_B),
+            Ok(Some(value)) if value == FIRST_CURSOR
+        ));
+        assert!(matches!(
+            store.advance_provider_cursor(STREAM_A, None, NEXT_CURSOR),
             Err(StoreError::CursorConflict { .. })
         ));
-        assert_eq!(
-            store
-                .load_provider_cursor("microsoft.mail:account-a")
-                .expect("stale retry leaves newer cursor"),
-            "cursor-2"
-        );
-        store
-            .delete_provider_cursor("microsoft.mail:account-a")
-            .expect("delete cursor");
-        assert!(matches!(
-            store.load_provider_cursor("microsoft.mail:account-a"),
-            Err(StoreError::NotFound { .. })
-        ));
-        assert_eq!(
-            store
-                .load_provider_cursor("google.mail:account-a")
-                .expect("isolated cursor remains"),
-            "other-cursor"
+        assert!(
+            matches!(store.load_provider_cursor(STREAM_B), Ok(Some(value)) if value == FIRST_CURSOR)
         );
     }
 
@@ -13563,24 +13815,6 @@ END;
                 Err(StoreError::InvalidInput { .. })
             ));
         }
-    }
-
-    #[test]
-    fn provider_cursor_initial_compare_and_set_rejects_a_race() {
-        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
-        store
-            .save_provider_cursor("microsoft.mail:account-a", None, "cursor-1")
-            .expect("first insert");
-        assert!(matches!(
-            store.save_provider_cursor("microsoft.mail:account-a", None, "cursor-2"),
-            Err(StoreError::CursorConflict { .. })
-        ));
-        assert_eq!(
-            store
-                .load_provider_cursor("microsoft.mail:account-a")
-                .expect("cursor remains"),
-            "cursor-1"
-        );
     }
 
     fn draft_time() -> OffsetDateTime {
