@@ -16,7 +16,7 @@ mod oauth_callback;
 
 use chrono::{DateTime, Duration, Utc};
 
-use oauth_callback::OAuthCallback;
+use oauth_callback::{AuthorizationCode, OAuthCallback};
 use oauth_start::{InMemoryOAuthStateStore, OAuthError, OAuthResult, OAuthStateStore};
 
 const NOW: DateTime<Utc> = DateTime::from_timestamp(1_725_000_000, 0).unwrap();
@@ -35,6 +35,13 @@ fn assert_oauth_error<T>(result: OAuthResult<T>, expected: OAuthError) {
     assert!(
         matches!(result, Err(error) if error == expected),
         "unexpected OAuth error"
+    );
+}
+
+fn assert_verifier_matches(authorization_code: &AuthorizationCode, expected: &str) {
+    assert!(
+        authorization_code.verifier() == expected,
+        "consumed PKCE verifier was not preserved"
     );
 }
 
@@ -84,10 +91,33 @@ fn valid_callback_preserves_consumed_verifier_for_token_exchange() {
     )
     .expect("valid callback");
 
-    assert_eq!(
-        authorization_code.verifier(),
-        EXPECTED_VERIFIER,
-        "consumed PKCE verifier was not preserved"
+    assert_verifier_matches(&authorization_code, EXPECTED_VERIFIER);
+}
+
+#[test]
+fn verifier_mismatch_assertion_does_not_leak_expected_value() {
+    const SENTINEL: &str = "pkce-verifier-secret-sentinel";
+
+    let mut store = reserved_store();
+    let authorization_code = oauth_callback::validate_callback(
+        &mut store,
+        callback(EXPECTED_CODE, "reserved-state"),
+        NOW,
+    )
+    .expect("valid callback");
+
+    let panic = std::panic::catch_unwind(|| {
+        assert_verifier_matches(&authorization_code, SENTINEL);
+    })
+    .expect_err("mismatched verifier should fail the assertion");
+    let panic_message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(
+        !panic_message.contains(SENTINEL),
+        "verifier assertion diagnostics leaked the sentinel"
     );
 }
 
