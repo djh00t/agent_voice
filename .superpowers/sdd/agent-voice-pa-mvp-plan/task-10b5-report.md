@@ -5,10 +5,10 @@
 - **Evidence date:** 2026-08-31 (Australia/Sydney)
 - **Worktree:** `/private/tmp/agent-voice-issue-222-fix1`
 - **Branch:** `codex/agent-voice-issue-222` (PR #304 delivery ref)
-- **Base:** `b1b83562b3f2f92b58445448a76ab770a977597f` (`origin/main`)
-- **Implementation commit:** `554bbaa` (`feat(realtime): add closed output-audio server values`)
-- **Harness commit:** `c9b4e15` (`test(realtime): add output-audio contract harness`)
-- **Duplicate-member repair commit:** `48b71d0` (`fix(realtime): reject duplicate server event members`)
+- **Base:** `5469cad6862f69264cb55b159c4443038fa84864` (`origin/main`)
+- **Implementation commit:** `9be5c2f` (`feat(realtime): add closed output-audio server values`)
+- **Harness commit:** `982a3dc` (`test(realtime): add output-audio contract harness`)
+- **Duplicate-member repair commit:** `186307a` (`fix(realtime): reject duplicate server event members`)
 
 ## Contract and readback
 
@@ -102,7 +102,7 @@ exit 101
 fixture must be rejected: RealtimeServerAudioEvent(<redacted>)
 ```
 
-The same selector is GREEN after `48b71d0`:
+The same selector is GREEN after `186307a`:
 
 ```text
 rtk cargo test --test realtime_server_audio_events_contract server_audio_events::tests::output_audio_events -- --exact
@@ -122,7 +122,7 @@ transcript `transcript`; rejected errors remain fixed and redacted.
 | `rtk rustfmt --edition 2021 --check src/realtime/server_audio_events.rs` | PASS |
 | `rtk cargo clippy --test realtime_server_audio_events_contract -- -D warnings` | PASS — no issues found |
 | `rtk git diff --check` | PASS |
-| `rtk make check` | PASS — 548 library tests, integration suites (6, 18, 230, 3, 3, 19), 3 doc-tests, Clippy, rustdoc, and Docusaurus |
+| `rtk make check` | PASS — 548 library tests, integration suites (6, 18, 230, 3, 3, 3, 19), 3 doc-tests, Clippy, rustdoc, and Docusaurus |
 
 The first `rtk make check` attempt found the fresh-worktree environment had no
 Docusaurus executable. `rtk make docs-install` installed from the checked-in
