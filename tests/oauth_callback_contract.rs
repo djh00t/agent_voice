@@ -16,7 +16,7 @@ mod oauth_callback;
 
 use chrono::{DateTime, Duration, Utc};
 
-use oauth_callback::{AuthorizationCode, OAuthCallback};
+use oauth_callback::OAuthCallback;
 use oauth_start::{InMemoryOAuthStateStore, OAuthError, OAuthResult, OAuthStateStore};
 
 const NOW: DateTime<Utc> = DateTime::from_timestamp(1_725_000_000, 0).unwrap();
