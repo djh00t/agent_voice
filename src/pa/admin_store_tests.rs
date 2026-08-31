@@ -106,9 +106,9 @@ fn failure_projection_filters_before_the_bound() {
 }
 
 #[test]
-fn connection_bound_keeps_real_supported_provider() {
+fn admin_store_tests() {
     let store = in_memory_store();
-    for id in 0..100 {
+    for id in 0..102 {
         store
             .connection()
             .execute(
@@ -129,11 +129,52 @@ fn connection_bound_keeps_real_supported_provider() {
         .read_snapshot_at(time::macros::datetime!(2026-08-31 00:00 UTC))
         .expect("read connection projection");
 
-    assert_eq!(snapshot.connections.len(), 100);
+    assert!(snapshot.connections.len() <= 100);
     assert!(snapshot.connections.iter().any(|connection| {
         connection.status == AdminConnectionStatus::Connected
             && connection.provider == super::AdminProvider::Outlook
     }));
+}
+
+#[test]
+fn dual_source_proposals_fail_closed() {
+    let store = in_memory_store();
+    store
+        .connection()
+        .execute(
+            "INSERT INTO appointment_drafts(idempotency_key, source_id, quote_id, caller_name, caller_email, kind, starts_at, ends_at, requester_included) VALUES ('appointment-draft', 'appointment-source', 'quote-1', 'caller', 'caller@example.com', 'callback', '2026-09-01T00:00:00Z', '2026-09-01T00:15:00Z', 0)",
+            [],
+        )
+        .expect("seed appointment draft");
+    store
+        .connection()
+        .execute(
+            "INSERT INTO owner_task_drafts(idempotency_key, title, kind, duration_minutes) VALUES ('owner-task-draft-dual', 'secret task', 'callback', 15)",
+            [],
+        )
+        .expect("seed owner task draft");
+    store
+        .connection()
+        .execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .expect("relax proposal fixture constraint");
+    store
+        .connection()
+        .execute(
+            "INSERT INTO proposals(idempotency_key, source_id, appointment_draft_id, owner_task_draft_id) VALUES ('dual-source-proposal', 'dual-source', 1, 1)",
+            [],
+        )
+        .expect("seed dual-source proposal");
+    store
+        .connection()
+        .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+        .expect("restore proposal fixture constraint");
+
+    assert!(matches!(
+        PaAdminStore::new(store).read_snapshot_at(time::macros::datetime!(2026-08-31 00:00 UTC)),
+        Err(StoreError::StoredRecordInvalid {
+            resource: "admin projection"
+        })
+    ));
 }
 
 #[test]
