@@ -80,12 +80,10 @@ impl AppConfig {
 
             if indent == 0 && trimmed.starts_with("backup:") {
                 backup_indent = Some(indent);
-                let flow_value = trimmed.strip_prefix("backup:").map(str::trim).map(|value| {
-                    value
-                        .split_once('#')
-                        .map_or(value, |(value, _)| value)
-                        .trim()
-                });
+                let flow_value = trimmed
+                    .strip_prefix("backup:")
+                    .map(str::trim)
+                    .map(|value| Self::strip_yaml_comment(value).trim());
                 if let Some(entries) = flow_value
                     .and_then(|value| value.strip_prefix('{'))
                     .and_then(|value| value.strip_suffix('}'))
@@ -128,11 +126,50 @@ impl AppConfig {
         None
     }
 
+    fn strip_yaml_comment(value: &str) -> &str {
+        // This bounded scanner only distinguishes quoted scalars from comments;
+        // it is not intended to parse general YAML.
+        let mut quote = None;
+        let mut escaped = false;
+        let bytes = value.as_bytes();
+        let mut index = 0;
+
+        while index < bytes.len() {
+            let byte = bytes[index];
+            match quote {
+                Some(b'"') => {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        quote = None;
+                    }
+                }
+                Some(b'\'') => {
+                    if byte == b'\'' {
+                        if bytes.get(index + 1) == Some(&b'\'') {
+                            index += 1;
+                        } else {
+                            quote = None;
+                        }
+                    }
+                }
+                Some(_) => unreachable!("only YAML quote bytes are tracked"),
+                None => match byte {
+                    b'"' | b'\'' => quote = Some(byte),
+                    b'#' => return &value[..index],
+                    _ => {}
+                },
+            }
+            index += 1;
+        }
+
+        value
+    }
+
     fn validate_backup_policy_yaml_lexeme(field: &str, value: &str) -> Result<()> {
-        let value = value
-            .split_once('#')
-            .map_or(value, |(value, _)| value)
-            .trim();
+        let value = Self::strip_yaml_comment(value).trim();
         if value.starts_with(['+', '-']) {
             return Err(Self::backup_policy_yaml_error(field));
         }
@@ -4052,6 +4089,27 @@ agent_api:
             "backup.retention_days: invalid_retention",
             "+30",
             "flow-comment",
+        );
+    }
+
+    #[test]
+    fn app_config_load_rejects_flow_policy_literal_after_quoted_hash_and_comment() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml = replace_backup_yaml_mapping(
+            &base_yaml,
+            "backup: { temp_dir: \"backup#tmp\", retention_days: +30 } # policy",
+        );
+
+        assert_backup_policy_load_error(
+            yaml,
+            "backup.retention_days: invalid_retention",
+            "+30",
+            "flow-quoted-hash-comment",
         );
     }
 
