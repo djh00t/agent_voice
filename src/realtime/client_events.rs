@@ -380,11 +380,6 @@ impl TurnDetection {
             _ => Err(RealtimeValueError::InvalidJson),
         }
     }
-
-    /// Returns the exact validated wire value.
-    pub fn as_str(&self) -> &str {
-        &self.r#type
-    }
 }
 
 /// The sole function-call output item type accepted by the client boundary.
