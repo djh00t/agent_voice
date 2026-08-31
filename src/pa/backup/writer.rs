@@ -11,8 +11,10 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(all(test, unix))]
+use std::sync::{Arc, Barrier};
 #[cfg(test)]
-use std::sync::{Arc, Barrier, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 const TEMP_FILE_PREFIX: &str = ".agent-voice-snapshot-";
 const TEMP_COLLISION_LIMIT: usize = 32;
@@ -156,13 +158,13 @@ unsafe extern "C" {
     ) -> std::os::raw::c_int;
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 static PUBLICATION_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 static PARENT_HANDOFF_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_publication_barrier(barrier: Option<Arc<Barrier>>) {
     *PUBLICATION_BARRIER
         .get_or_init(|| Mutex::new(None))
@@ -170,7 +172,7 @@ fn set_publication_barrier(barrier: Option<Arc<Barrier>>) {
         .expect("publication barrier is not poisoned") = barrier;
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn wait_for_publication_race() {
     let barrier = PUBLICATION_BARRIER
         .get_or_init(|| Mutex::new(None))
@@ -183,7 +185,7 @@ fn wait_for_publication_race() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_parent_handoff_barrier(barrier: Option<Arc<Barrier>>) {
     *PARENT_HANDOFF_BARRIER
         .get_or_init(|| Mutex::new(None))
@@ -191,7 +193,7 @@ fn set_parent_handoff_barrier(barrier: Option<Arc<Barrier>>) {
         .expect("parent handoff barrier is not poisoned") = barrier;
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn wait_for_parent_handoff() {
     let barrier = PARENT_HANDOFF_BARRIER
         .get_or_init(|| Mutex::new(None))
@@ -238,10 +240,10 @@ fn write_inner(
     ensure_destination_absent(destination)?;
     ensure_destination_absent_at(&parent_directory, destination)?;
     temporary.ensure_owned()?;
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     wait_for_publication_race();
     temporary.ensure_owned()?;
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     wait_for_parent_handoff();
     if fault == FaultStage::Rename {
         return Err(WriterError::Rename);
@@ -266,6 +268,7 @@ fn write_inner(
     sync_parent_directory(&parent_directory).map_err(|_| WriterError::DirectorySync)
 }
 
+#[cfg(unix)]
 fn publish_without_replacement(source: &Path, destination: &Path) -> io::Result<()> {
     let source_identity = fs::symlink_metadata(source)?;
     let parent = source
@@ -667,7 +670,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier, Mutex, OnceLock};
+    #[cfg(unix)]
+    use std::sync::{Arc, Barrier};
+    use std::sync::{Mutex, OnceLock};
 
     use super::{AtomicSnapshotWriter, WriterError, WriterFault, write_with_fault};
 
@@ -741,13 +746,12 @@ mod tests {
             .expect("writer test lock is not poisoned")
     }
 
+    #[cfg(unix)]
     fn published_or_directory_sync(result: Result<(), WriterError>) {
-        #[cfg(unix)]
         assert_eq!(result, Ok(()));
-        #[cfg(not(unix))]
-        assert_eq!(result, Err(WriterError::DirectorySync));
     }
 
+    #[cfg(unix)]
     #[test]
     fn atomic_writer_contract() {
         let _lock = lock_tests();
@@ -800,6 +804,7 @@ mod tests {
         assert!(directory.temporary_entries().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn pre_rename_faults_remove_only_their_temporary_sibling() {
         let _lock = lock_tests();
@@ -826,6 +831,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn directory_sync_fault_leaves_complete_bytes_without_a_temporary_sibling() {
         let _lock = lock_tests();
@@ -847,6 +853,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_attempt_can_retry_the_same_bytes_at_a_new_destination() {
         let _lock = lock_tests();
@@ -869,6 +876,7 @@ mod tests {
         assert!(directory.temporary_entries().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn create_new_collision_preserves_the_foreign_sibling() {
         let _lock = lock_tests();
@@ -892,6 +900,7 @@ mod tests {
         assert!(directory.temporary_entries().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn no_replace_publication_preserves_an_existing_destination() {
         let _lock = lock_tests();
@@ -911,6 +920,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn concurrent_destination_creation_is_not_replaced() {
         let _lock = lock_tests();
@@ -937,6 +947,7 @@ mod tests {
         assert!(directory.temporary_entries().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_temporary_sibling_never_equals_the_destination() {
         let _lock = lock_tests();
@@ -984,6 +995,7 @@ mod tests {
         assert!(directory.temporary_entries().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn replaced_temporary_sibling_is_not_published_or_deleted() {
         let _lock = lock_tests();
@@ -1070,6 +1082,21 @@ mod tests {
         fs::remove_dir(&directory.path).expect("remove replacement parent");
         fs::remove_file(moved.join("destination.bin")).expect("remove published snapshot");
         fs::remove_dir(&moved).expect("remove moved parent");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn writer_fails_closed_before_temporary_creation_on_unsupported_platform() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let destination = directory.destination("destination.bin");
+
+        assert_eq!(
+            AtomicSnapshotWriter::write(&destination, SNAPSHOT),
+            Err(WriterError::InvalidDestination)
+        );
+        assert!(!destination.exists());
+        assert!(directory.temporary_entries().is_empty());
     }
 
     #[test]
