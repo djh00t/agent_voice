@@ -7903,6 +7903,65 @@ CREATE INDEX IF NOT EXISTS idx_http_idempotency_records_lease_until
     Ok(())
 }
 
+/// Fixed scope for HTTP idempotency records.
+pub const HTTP_IDEMPOTENCY_SCOPE: &str = "pa-http-v1";
+/// Maximum byte length accepted for an HTTP idempotency scope.
+pub const MAX_HTTP_IDEMPOTENCY_SCOPE_LENGTH: usize = 64;
+/// Maximum byte length accepted for an HTTP idempotency key.
+pub const MAX_HTTP_IDEMPOTENCY_KEY_LENGTH: usize = 128;
+/// Exact byte length required for an HTTP idempotency fingerprint.
+pub const MAX_HTTP_IDEMPOTENCY_FINGERPRINT_LENGTH: usize = 64;
+/// Lease duration for a newly reserved HTTP idempotency record.
+pub const HTTP_IDEMPOTENCY_RESERVATION_SECONDS: i64 = 300;
+/// Maximum cached response body size for an HTTP idempotency record.
+pub const MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Validates the bounded ASCII grammar used for an HTTP idempotency scope.
+#[allow(dead_code)]
+pub(crate) fn validate_http_idempotency_scope(value: &str) -> StoreResult<()> {
+    validate_http_idempotency_value(
+        value,
+        1..=MAX_HTTP_IDEMPOTENCY_SCOPE_LENGTH,
+        "http idempotency scope",
+        |byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'),
+    )
+}
+
+/// Validates the bounded ASCII grammar used for an HTTP idempotency key.
+#[allow(dead_code)]
+pub(crate) fn validate_http_idempotency_key(value: &str) -> StoreResult<()> {
+    validate_http_idempotency_value(
+        value,
+        1..=MAX_HTTP_IDEMPOTENCY_KEY_LENGTH,
+        "http idempotency key",
+        |byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'-'),
+    )
+}
+
+/// Validates the exact lowercase hexadecimal HTTP idempotency fingerprint.
+#[allow(dead_code)]
+pub(crate) fn validate_http_idempotency_fingerprint(value: &str) -> StoreResult<()> {
+    validate_http_idempotency_value(
+        value,
+        MAX_HTTP_IDEMPOTENCY_FINGERPRINT_LENGTH..=MAX_HTTP_IDEMPOTENCY_FINGERPRINT_LENGTH,
+        "http idempotency fingerprint",
+        |byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'),
+    )
+}
+
+#[allow(dead_code)]
+fn validate_http_idempotency_value(
+    value: &str,
+    length: std::ops::RangeInclusive<usize>,
+    field: &'static str,
+    is_allowed: fn(u8) -> bool,
+) -> StoreResult<()> {
+    if !length.contains(&value.len()) || !value.bytes().all(is_allowed) {
+        return Err(StoreError::InvalidInput { field });
+    }
+    Ok(())
+}
+
 fn normalize_legacy_audit_timestamp(value: &str) -> StoreResult<String> {
     let parsed = OffsetDateTime::parse(value, &Rfc3339)
         .map(|value| value.to_offset(time::UtcOffset::UTC))
@@ -21134,5 +21193,101 @@ END;
         assert!(debug.contains("Consumed"));
         assert!(debug.contains("1"));
         assert!(debug.contains("42"));
+    }
+
+    #[test]
+    fn http_idempotency_constants_and_validators() {
+        assert_eq!(super::HTTP_IDEMPOTENCY_SCOPE, "pa-http-v1");
+        assert_eq!(super::MAX_HTTP_IDEMPOTENCY_SCOPE_LENGTH, 64);
+        assert_eq!(super::MAX_HTTP_IDEMPOTENCY_KEY_LENGTH, 128);
+        assert_eq!(super::MAX_HTTP_IDEMPOTENCY_FINGERPRINT_LENGTH, 64);
+        assert_eq!(super::HTTP_IDEMPOTENCY_RESERVATION_SECONDS, 300);
+        assert_eq!(super::MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES, 64 * 1024);
+
+        assert!(super::validate_http_idempotency_scope("a").is_ok());
+        let scope_boundary = format!("A0._:-{}", "s".repeat(58));
+        assert!(super::validate_http_idempotency_scope(&scope_boundary).is_ok());
+
+        assert!(super::validate_http_idempotency_key("a").is_ok());
+        let key_boundary = format!("A0._~-{}", "k".repeat(122));
+        assert!(super::validate_http_idempotency_key(&key_boundary).is_ok());
+
+        assert!(super::validate_http_idempotency_fingerprint(VALID_HTTP_FINGERPRINT).is_ok());
+    }
+
+    #[test]
+    fn http_idempotency_validator_boundary_matrix() {
+        let invalid_scope_values = [
+            String::new(),
+            "s".repeat(super::MAX_HTTP_IDEMPOTENCY_SCOPE_LENGTH + 1),
+            "scope with space".to_owned(),
+            "scope/slash".to_owned(),
+            "scope\\backslash".to_owned(),
+            "scope\0nul".to_owned(),
+            "scope+other".to_owned(),
+            "scope-π".to_owned(),
+        ];
+        for value in invalid_scope_values {
+            let original = value.clone();
+            assert!(super::validate_http_idempotency_scope(&value).is_err());
+            assert!(value.as_bytes() == original.as_bytes());
+        }
+
+        let invalid_key_values = [
+            String::new(),
+            "k".repeat(super::MAX_HTTP_IDEMPOTENCY_KEY_LENGTH + 1),
+            "key with space".to_owned(),
+            "key/slash".to_owned(),
+            "key\\backslash".to_owned(),
+            "key\0nul".to_owned(),
+            "key+other".to_owned(),
+            "key:delimiter".to_owned(),
+            "key-π".to_owned(),
+        ];
+        for value in invalid_key_values {
+            let original = value.clone();
+            assert!(super::validate_http_idempotency_key(&value).is_err());
+            assert!(value.as_bytes() == original.as_bytes());
+        }
+
+        let invalid_fingerprint_values = [
+            String::new(),
+            "0".repeat(super::MAX_HTTP_IDEMPOTENCY_FINGERPRINT_LENGTH - 1),
+            "0".repeat(super::MAX_HTTP_IDEMPOTENCY_FINGERPRINT_LENGTH + 1),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeF".to_owned(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg".to_owned(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde π".to_owned(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde ".to_owned(),
+        ];
+        for value in invalid_fingerprint_values {
+            let original = value.clone();
+            assert!(super::validate_http_idempotency_fingerprint(&value).is_err());
+            assert!(value.as_bytes() == original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn http_idempotency_validator_errors_are_redacted() {
+        let scope_sentinel = "scope-secret-sentinel/with whitespace";
+        let key_sentinel = "key-secret-sentinel/with whitespace";
+        let fingerprint_sentinel =
+            "fingerprint-secret-sentinel/with whitespace and more than 64 bytes";
+        let errors = [
+            super::validate_http_idempotency_scope(scope_sentinel).expect_err("invalid scope"),
+            super::validate_http_idempotency_key(key_sentinel).expect_err("invalid key"),
+            super::validate_http_idempotency_fingerprint(fingerprint_sentinel)
+                .expect_err("invalid fingerprint"),
+        ];
+
+        for (error, sentinel) in [
+            (&errors[0], scope_sentinel),
+            (&errors[1], key_sentinel),
+            (&errors[2], fingerprint_sentinel),
+        ] {
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            assert!(!display.contains(sentinel));
+            assert!(!debug.contains(sentinel));
+        }
     }
 }
