@@ -1,6 +1,10 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
@@ -161,7 +165,7 @@ fn write_inner(
 
     let parent = destination_parent(destination)?;
     ensure_destination_absent(destination)?;
-    let mut temporary = TemporaryFile::create(parent)?;
+    let mut temporary = TemporaryFile::create(parent, destination)?;
 
     if fault == FaultStage::Write {
         return Err(WriterError::Write);
@@ -181,12 +185,14 @@ fn write_inner(
     temporary.close_file();
 
     ensure_destination_absent(destination)?;
+    temporary.ensure_owned()?;
     #[cfg(test)]
     wait_for_publication_race();
+    temporary.ensure_owned()?;
     if fault == FaultStage::Rename {
         return Err(WriterError::Rename);
     }
-    match publish_without_replacement(temporary.path(), destination) {
+    match publish_without_replacement_owned(temporary.path(), destination, temporary.identity()) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             return Err(WriterError::DestinationExists);
@@ -202,6 +208,22 @@ fn write_inner(
 }
 
 fn publish_without_replacement(source: &Path, destination: &Path) -> io::Result<()> {
+    let source_identity = fs::symlink_metadata(source)?;
+    publish_without_replacement_owned(source, destination, &source_identity)
+}
+
+fn publish_without_replacement_owned(
+    source: &Path,
+    destination: &Path,
+    source_identity: &fs::Metadata,
+) -> io::Result<()> {
+    if !path_matches_identity(source, source_identity) {
+        return Err(io::Error::new(
+            ErrorKind::Other,
+            "temporary file identity changed",
+        ));
+    }
+
     #[cfg(target_os = "linux")]
     {
         match rename_without_replacement_linux(source, destination) {
@@ -212,7 +234,18 @@ fn publish_without_replacement(source: &Path, destination: &Path) -> io::Result<
     }
 
     fs::hard_link(source, destination)?;
-    fs::remove_file(source)
+    if !path_matches_identity(source, source_identity) {
+        remove_if_owned(destination, source_identity);
+        return Err(io::Error::new(
+            ErrorKind::Other,
+            "temporary file identity changed",
+        ));
+    }
+    if let Err(error) = fs::remove_file(source) {
+        remove_if_owned(destination, source_identity);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -248,6 +281,37 @@ fn rename_noreplace_unavailable(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(22 | 38 | 95))
 }
 
+fn remove_if_owned(path: &Path, identity: &fs::Metadata) {
+    let Ok(current) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if same_file(identity, &current) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn path_matches_identity(path: &Path, identity: &fs::Metadata) -> bool {
+    fs::symlink_metadata(path)
+        .map(|current| same_file(identity, &current))
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    false
+}
+
 fn destination_parent(destination: &Path) -> Result<&Path, WriterError> {
     if destination.file_name().is_none() {
         return Err(WriterError::InvalidDestination);
@@ -256,8 +320,12 @@ fn destination_parent(destination: &Path) -> Result<&Path, WriterError> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let metadata = fs::metadata(parent).map_err(|_| WriterError::InvalidDestination)?;
+    let metadata = fs::symlink_metadata(parent).map_err(|_| WriterError::InvalidDestination)?;
     if !metadata.is_dir() {
+        return Err(WriterError::InvalidDestination);
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o022 != 0 {
         return Err(WriterError::InvalidDestination);
     }
     Ok(parent)
@@ -281,14 +349,18 @@ fn temporary_path(parent: &Path, sequence: u64) -> PathBuf {
 struct TemporaryFile {
     path: PathBuf,
     file: Option<File>,
+    identity: fs::Metadata,
     armed: bool,
 }
 
 impl TemporaryFile {
-    fn create(parent: &Path) -> Result<Self, WriterError> {
+    fn create(parent: &Path, destination: &Path) -> Result<Self, WriterError> {
         for _ in 0..TEMP_COLLISION_LIMIT {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = temporary_path(parent, sequence);
+            if path == destination {
+                continue;
+            }
             let mut options = OpenOptions::new();
             options.read(true).write(true).create_new(true);
             #[cfg(unix)]
@@ -299,9 +371,17 @@ impl TemporaryFile {
             }
             match options.open(&path) {
                 Ok(file) => {
+                    let identity = match file.metadata() {
+                        Ok(identity) => identity,
+                        Err(_) => {
+                            drop(file);
+                            return Err(WriterError::Write);
+                        }
+                    };
                     return Ok(Self {
                         path,
                         file: Some(file),
+                        identity,
                         armed: true,
                     });
                 }
@@ -314,6 +394,18 @@ impl TemporaryFile {
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn identity(&self) -> &fs::Metadata {
+        &self.identity
+    }
+
+    fn ensure_owned(&self) -> Result<(), WriterError> {
+        if path_matches_identity(&self.path, &self.identity) {
+            Ok(())
+        } else {
+            Err(WriterError::Rename)
+        }
     }
 
     fn file_mut(&mut self) -> &mut File {
@@ -335,7 +427,7 @@ impl Drop for TemporaryFile {
     fn drop(&mut self) {
         self.file.take();
         if self.armed {
-            let _ = fs::remove_file(&self.path);
+            remove_if_owned(&self.path, &self.identity);
         }
     }
 }
@@ -357,7 +449,9 @@ fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
 mod tests {
     use std::error::Error;
     use std::fs;
-    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
@@ -404,6 +498,13 @@ mod tests {
                         .and_then(|name| name.to_str())
                         .is_some_and(|name| name.starts_with(super::TEMP_FILE_PREFIX))
                 })
+                .collect()
+        }
+
+        fn temporary_entries_except(&self, excluded: &Path) -> Vec<PathBuf> {
+            self.temporary_entries()
+                .into_iter()
+                .filter(|path| path != excluded)
                 .collect()
         }
     }
@@ -620,6 +721,73 @@ mod tests {
             b"concurrent destination bytes"
         );
         assert!(directory.temporary_entries().is_empty());
+    }
+
+    #[test]
+    fn generated_temporary_sibling_never_equals_the_destination() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let sequence = super::TEMP_SEQUENCE.load(Ordering::Relaxed);
+        let destination = super::temporary_path(&directory.path, sequence);
+
+        published_or_directory_sync(AtomicSnapshotWriter::write(&destination, SNAPSHOT));
+        assert_eq!(
+            fs::read(&destination).expect("published snapshot"),
+            SNAPSHOT
+        );
+        assert!(directory.temporary_entries_except(&destination).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_parent_is_rejected_before_temporary_creation() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let destination = directory.destination("destination.bin");
+        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o777))
+            .expect("make test parent writable");
+
+        let result = AtomicSnapshotWriter::write(&destination, SNAPSHOT);
+
+        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o700))
+            .expect("restore private test parent");
+        assert_eq!(result, Err(WriterError::InvalidDestination));
+        assert!(!destination.exists());
+        assert!(directory.temporary_entries().is_empty());
+    }
+
+    #[test]
+    fn replaced_temporary_sibling_is_not_published_or_deleted() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let destination = directory.destination("destination.bin");
+        let barrier = Arc::new(Barrier::new(2));
+        super::set_publication_barrier(Some(Arc::clone(&barrier)));
+
+        let writer_destination = destination.clone();
+        let writer =
+            std::thread::spawn(move || AtomicSnapshotWriter::write(&writer_destination, SNAPSHOT));
+        barrier.wait();
+        let entries = directory.temporary_entries();
+        assert_eq!(entries.len(), 1, "writer should own one temporary sibling");
+        let temporary = entries
+            .into_iter()
+            .next()
+            .expect("writer temporary sibling exists");
+        fs::remove_file(&temporary).expect("remove writer temporary sibling");
+        fs::write(&temporary, b"foreign temporary bytes")
+            .expect("replace writer temporary sibling");
+        barrier.wait();
+
+        let result = writer.join().expect("writer thread completes");
+        super::set_publication_barrier(None);
+        assert_eq!(result, Err(WriterError::Rename));
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read(&temporary).expect("foreign temporary sibling remains"),
+            b"foreign temporary bytes"
+        );
+        assert_eq!(directory.temporary_entries().len(), 1);
     }
 
     #[test]
