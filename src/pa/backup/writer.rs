@@ -267,7 +267,6 @@ fn write_inner(
         .sync_all()
         .map_err(|_| WriterError::Sync)?;
 
-    ensure_destination_absent(destination)?;
     ensure_destination_absent_at(&parent_directory, destination)?;
     temporary.ensure_owned()?;
     #[cfg(all(test, unix))]
@@ -1416,6 +1415,9 @@ mod tests {
         barrier.wait();
         fs::rename(&directory.path, &moved).expect("rename validated parent directory");
         fs::create_dir(&directory.path).expect("replace parent directory");
+        let foreign_destination = directory.path.join("destination.bin");
+        fs::write(&foreign_destination, b"foreign destination bytes")
+            .expect("write replacement destination");
         barrier.wait();
 
         let result = writer.join().expect("writer thread completes");
@@ -1425,15 +1427,13 @@ mod tests {
             fs::read(moved.join("destination.bin")).expect("published snapshot in pinned parent"),
             SNAPSHOT
         );
-        assert!(!directory.path.join("destination.bin").exists());
-        assert!(directory.temporary_entries().is_empty());
-        assert!(
-            fs::read_dir(&directory.path)
-                .expect("replacement parent remains readable")
-                .next()
-                .is_none()
+        assert_eq!(
+            fs::read(&foreign_destination).expect("replacement destination remains"),
+            b"foreign destination bytes"
         );
+        assert!(directory.temporary_entries().is_empty());
 
+        fs::remove_file(&foreign_destination).expect("remove replacement destination");
         fs::remove_dir(&directory.path).expect("remove replacement parent");
         fs::remove_file(moved.join("destination.bin")).expect("remove published snapshot");
         fs::remove_dir(&moved).expect("remove moved parent");
