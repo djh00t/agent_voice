@@ -3,9 +3,9 @@
 - **Issue:** [#290](https://github.com/djh00t/agent_voice/issues/290)
 - **Package:** `task-9c-a`
 - **Evidence date:** 2026-08-31 (Australia/Sydney)
-- **Base revision:** `f8319ac` (`origin/main` at worktree creation)
-- **Implementation revision:** `2e2584e`
-- **Readback timestamp:** `2026-08-31T13:08:43Z`
+- **Base revision:** `eb9c791` (`origin/main` after the current-base rebase)
+- **Implementation revision:** `afc54c7`
+- **Readback timestamp:** `2026-08-31T13:12:17Z`
 
 ## Contract and prerequisite readback
 
@@ -31,8 +31,8 @@ configuration, dependency, or report path changed.
 
 The implementation history is one-file and one-logical-change per commit:
 
-- `c05cc2f` — test-only cursor contract and exact selectors (`src/pa/store.rs`)
-- `2e2584e` — cursor API, validation, and immediate CAS implementation (`src/pa/store.rs`)
+- `3f0bf1e` — test-only cursor contract and exact selectors (`src/pa/store.rs`)
+- `afc54c7` — cursor API, validation, and immediate CAS implementation (`src/pa/store.rs`)
 - report commit — this evidence file only
 
 The final changed-path readback after the report commit must contain only
@@ -125,18 +125,18 @@ changed.
 
 ## Evidence records
 
-- `{tier: LOCAL, kind: RED, selector_or_scope: provider_cursor_cas_rejects_stale_and_equal_retry, command_or_check: exact cargo test selector, expected: true named match and nonzero missing-API failure, exit_code: 101, observed_redacted: 37 compile errors for absent API and old return shape, source_revision: c05cc2f, timestamp_utc: 2026-08-31T13:08:43Z}`
-- `{tier: LOCAL, kind: GREEN, selector_or_scope: five exact provider cursor selectors, command_or_check: exact cargo test selectors, expected: one matched test per selector, exit_code: 0, observed_redacted: 1 passed and 550 filtered out for each, source_revision: 2e2584e, timestamp_utc: 2026-08-31T13:08:43Z}`
-- `{tier: LOCAL, kind: GREEN, selector_or_scope: provider_cursor aggregate, command_or_check: aggregate cargo test selector, expected: all cursor tests match and pass, exit_code: 0, observed_redacted: 5 passed and 546 filtered out, source_revision: 2e2584e, timestamp_utc: 2026-08-31T13:08:43Z}`
-- `{tier: LOCAL, kind: GREEN, selector_or_scope: pa::store module, command_or_check: full store cargo test selector, expected: no store regressions, exit_code: 0, observed_redacted: 178 passed and 373 filtered out, source_revision: 2e2584e, timestamp_utc: 2026-08-31T13:08:43Z}`
-- `{tier: LOCAL, kind: GREEN, selector_or_scope: src/pa/store.rs formatting, command_or_check: scoped rustfmt check, expected: no formatting diff, exit_code: 0, observed_redacted: clean, source_revision: 2e2584e, timestamp_utc: 2026-08-31T13:08:43Z}`
-- `{tier: LOCAL, kind: GREEN, selector_or_scope: owned diff whitespace, command_or_check: scoped git diff check, expected: no whitespace errors, exit_code: 0, observed_redacted: clean, source_revision: 2e2584e, timestamp_utc: 2026-08-31T13:08:43Z}`
-- `{tier: LOCAL, kind: GREEN, selector_or_scope: repository changed-scope gate, command_or_check: rtk make check after locked docs setup, expected: Rust tests, Clippy, rustdoc, and Docusaurus pass, exit_code: 0, observed_redacted: complete gate passed, source_revision: 2e2584e, timestamp_utc: 2026-08-31T13:08:43Z}`
-- `{tier: LOCAL, kind: NOT_RUN, selector_or_scope: whole-tree formatting, command_or_check: rtk cargo fmt --all -- --check, expected: exit 0, exit_code: 1, observed_redacted: pre-existing drift only in out-of-scope files, source_revision: 2e2584e, timestamp_utc: 2026-08-31T13:08:43Z}`
-- `{tier: STATIC, kind: REVIEW, selector_or_scope: prerequisite and ownership readback, command_or_check: issue/PR state readback, merge-ancestor check, and origin-main diff review, expected: merged gates and only owned cursor paths, exit_code: 0, observed_redacted: #136/#142/#157 merged and closed; #88 blocked coordination parent; #306 open; source diff limited to cursor source/tests before report, source_revision: 2e2584e, timestamp_utc: 2026-08-31T13:08:43Z}`
-- `{tier: STATIC, kind: REVIEW, selector_or_scope: CAS and redaction boundary, command_or_check: source symbol and diff scan, expected: one immediate parameterized CAS and fixed errors, exit_code: 0, observed_redacted: no legacy save/delete cursor API, no migration, and no raw fixture value in test output, source_revision: 2e2584e, timestamp_utc: 2026-08-31T13:08:43Z}`
-- `{tier: CI, kind: NOT_RUN, selector_or_scope: linked workflow, command_or_check: GitHub check readback, expected: independently observed result, exit_code: UNEXECUTED, observed_redacted: no CI result claimed, source_revision: 2e2584e, timestamp_utc: 2026-08-31T13:08:43Z}`
-- `{tier: LIVE, kind: NOT_RUN, selector_or_scope: provider and deployment boundary, command_or_check: live-provider/OAuth/network/deployment check, expected: not applicable to this local slice, exit_code: NOT_RUN, observed_redacted: no live operation or credential use, source_revision: 2e2584e, timestamp_utc: 2026-08-31T13:08:43Z}`
+- `{tier: LOCAL, kind: RED, selector_or_scope: provider_cursor_cas_rejects_stale_and_equal_retry, command_or_check: exact cargo test selector, expected: true named match and nonzero missing-API failure, exit_code: 101, observed_redacted: 37 compile errors for absent API and old return shape, source_revision: 3f0bf1e, timestamp_utc: 2026-08-31T13:12:17Z}`
+- `{tier: LOCAL, kind: GREEN, selector_or_scope: five exact provider cursor selectors, command_or_check: exact cargo test selectors, expected: one matched test per selector, exit_code: 0, observed_redacted: 1 passed and 550 filtered out for each, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
+- `{tier: LOCAL, kind: GREEN, selector_or_scope: provider_cursor aggregate, command_or_check: aggregate cargo test selector, expected: all cursor tests match and pass, exit_code: 0, observed_redacted: 5 passed and 546 filtered out, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
+- `{tier: LOCAL, kind: GREEN, selector_or_scope: pa::store module, command_or_check: full store cargo test selector, expected: no store regressions, exit_code: 0, observed_redacted: 178 passed and 373 filtered out, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
+- `{tier: LOCAL, kind: GREEN, selector_or_scope: src/pa/store.rs formatting, command_or_check: scoped rustfmt check, expected: no formatting diff, exit_code: 0, observed_redacted: clean, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
+- `{tier: LOCAL, kind: GREEN, selector_or_scope: owned diff whitespace, command_or_check: scoped git diff check, expected: no whitespace errors, exit_code: 0, observed_redacted: clean, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
+- `{tier: LOCAL, kind: GREEN, selector_or_scope: repository changed-scope gate, command_or_check: rtk make check after locked docs setup, expected: Rust tests, Clippy, rustdoc, and Docusaurus pass, exit_code: 0, observed_redacted: complete gate passed, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
+- `{tier: LOCAL, kind: NOT_RUN, selector_or_scope: whole-tree formatting, command_or_check: rtk cargo fmt --all -- --check, expected: exit 0, exit_code: 1, observed_redacted: pre-existing drift only in out-of-scope files, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
+- `{tier: STATIC, kind: REVIEW, selector_or_scope: prerequisite and ownership readback, command_or_check: issue/PR state readback, merge-ancestor check, and origin-main diff review, expected: merged gates and only owned cursor paths, exit_code: 0, observed_redacted: #136/#142/#157 merged and closed; #88 blocked coordination parent; #306 open; source diff limited to cursor source/tests before report, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
+- `{tier: STATIC, kind: REVIEW, selector_or_scope: CAS and redaction boundary, command_or_check: source symbol and diff scan, expected: one immediate parameterized CAS and fixed errors, exit_code: 0, observed_redacted: no legacy save/delete cursor API, no migration, and no raw fixture value in test output, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
+- `{tier: CI, kind: NOT_RUN, selector_or_scope: linked workflow, command_or_check: GitHub check readback, expected: independently observed result, exit_code: UNEXECUTED, observed_redacted: no CI result claimed, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
+- `{tier: LIVE, kind: NOT_RUN, selector_or_scope: provider and deployment boundary, command_or_check: live-provider/OAuth/network/deployment check, expected: not applicable to this local slice, exit_code: NOT_RUN, observed_redacted: no live operation or credential use, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
 
 ## Lifecycle, review, and rollback
 
