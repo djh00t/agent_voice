@@ -5,7 +5,7 @@
 - **Base:** `a20a28be3be37c84cbe5046415497b7053dd8906` (`origin/main`)
 - **Branch:** `codex/issue-250`
 - **Worktree:** `/Users/djh/work/src/github.com_local/djh00t/agent_voice`
-- **Implementation commits:** `f8909586f051b292afbc5cea5487cc41cc2d0a08` (tests), `7d636e769e2ee65328fc1fb61e0a4bb1d21b6c2c` (implementation), `0a5c4c86b29bac6387df300b6fd5aecff08457f6` (warning cleanup)
+- **Implementation commits:** `f8909586f051b292afbc5cea5487cc41cc2d0a08` (tests), `7d636e769e2ee65328fc1fb61e0a4bb1d21b6c2c` (implementation), `0a5c4c86b29bac6387df300b6fd5aecff08457f6` (warning cleanup), `7b7a369c8c391ffde98646f7df3255f3ab1cc55a` (diagnostic redaction test hardening)
 - **Report commit:** `THIS_REPORT_COMMIT` (resolve with `rtk git rev-parse HEAD` after checkout)
 
 ## Scope
@@ -51,8 +51,8 @@ verifiers, credentials, tokens, complete query URLs, or provider diagnostics.
     "expected": "the exact mismatched-state callback selector passes",
     "exit_code": 0,
     "observed": "1 passed, 28 filtered out",
-    "commit": "0a5c4c86b29bac6387df300b6fd5aecff08457f6",
-    "timestamp_utc": "2026-08-31T14:44:02Z"
+    "commit": "7b7a369c8c391ffde98646f7df3255f3ab1cc55a",
+    "timestamp_utc": "2026-08-31T14:55:25Z"
   },
   {
     "tier": "LOCAL",
@@ -62,8 +62,8 @@ verifiers, credentials, tokens, complete query URLs, or provider diagnostics.
     "expected": "all direct-path callback contract tests pass",
     "exit_code": 0,
     "observed": "29 passed in the direct-path suite, including the seven callback contract cases",
-    "commit": "0a5c4c86b29bac6387df300b6fd5aecff08457f6",
-    "timestamp_utc": "2026-08-31T14:44:02Z"
+    "commit": "7b7a369c8c391ffde98646f7df3255f3ab1cc55a",
+    "timestamp_utc": "2026-08-31T14:55:25Z"
   },
   {
     "tier": "LOCAL",
@@ -73,8 +73,8 @@ verifiers, credentials, tokens, complete query URLs, or provider diagnostics.
     "expected": "owned files pass scoped formatting",
     "exit_code": 0,
     "observed": "rustfmt check passed with no output",
-    "commit": "0a5c4c86b29bac6387df300b6fd5aecff08457f6",
-    "timestamp_utc": "2026-08-31T14:44:02Z"
+    "commit": "7b7a369c8c391ffde98646f7df3255f3ab1cc55a",
+    "timestamp_utc": "2026-08-31T14:55:25Z"
   },
   {
     "tier": "LOCAL",
@@ -84,8 +84,8 @@ verifiers, credentials, tokens, complete query URLs, or provider diagnostics.
     "expected": "no whitespace errors",
     "exit_code": 0,
     "observed": "diff check passed with no output",
-    "commit": "0a5c4c86b29bac6387df300b6fd5aecff08457f6",
-    "timestamp_utc": "2026-08-31T14:44:02Z"
+    "commit": "7b7a369c8c391ffde98646f7df3255f3ab1cc55a",
+    "timestamp_utc": "2026-08-31T14:55:25Z"
   },
   {
     "tier": "LOCAL",
@@ -95,8 +95,8 @@ verifiers, credentials, tokens, complete query URLs, or provider diagnostics.
     "expected": "Rust tests, strict lint, Rust docs, and website build pass",
     "exit_code": 0,
     "observed": "567 Rust tests ran; lint, Rust docs, and the remaining repository checks completed successfully with no warnings",
-    "commit": "0a5c4c86b29bac6387df300b6fd5aecff08457f6",
-    "timestamp_utc": "2026-08-31T14:47:40Z"
+    "commit": "7b7a369c8c391ffde98646f7df3255f3ab1cc55a",
+    "timestamp_utc": "2026-08-31T14:55:25Z"
   },
   {
     "tier": "STATIC",
