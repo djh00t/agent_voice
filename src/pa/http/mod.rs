@@ -100,5 +100,10 @@ impl fmt::Debug for ApiError {
 /// The shared HTTP operation result alias.
 pub type HttpResult<T> = Result<T, ApiError>;
 
+pub mod middleware_hmac;
+#[cfg(test)]
+#[path = "middleware_hmac_tests.rs"]
+mod middleware_hmac_tests;
+
 #[cfg(test)]
 mod contract_tests;
