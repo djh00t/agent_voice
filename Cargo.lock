@@ -44,6 +44,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "unsafe-libyaml",
  "url",
  "uuid",
  "xphone",
