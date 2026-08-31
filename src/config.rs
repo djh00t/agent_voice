@@ -39,6 +39,7 @@ impl AppConfig {
             Some(path) => {
                 let raw = fs::read_to_string(path)
                     .with_context(|| format!("failed to read config file {}", path.display()))?;
+                Self::validate_backup_policy_yaml_lexemes(&raw)?;
                 serde_yaml::from_str(&raw).with_context(|| "failed to parse YAML config")?
             }
             None if require_path => {
@@ -57,6 +58,89 @@ impl AppConfig {
         config.sync_legacy_openai_sections();
         config.validate()?;
         Ok(config)
+    }
+
+    fn validate_backup_policy_yaml_lexemes(raw: &str) -> Result<()> {
+        let mut backup_indent = None;
+
+        for line in raw.lines() {
+            let trimmed = line.trim_start_matches([' ', '\t']);
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let indent = line.len() - trimmed.len();
+
+            if let Some(parent_indent) = backup_indent {
+                if indent <= parent_indent {
+                    backup_indent = None;
+                } else if let Some((field, value)) = Self::backup_yaml_policy_lexeme(trimmed) {
+                    Self::validate_backup_policy_yaml_lexeme(field, value)?;
+                }
+            }
+
+            if indent == 0 && trimmed.starts_with("backup:") {
+                backup_indent = Some(indent);
+                if let Some(entries) = trimmed
+                    .strip_prefix("backup:")
+                    .map(str::trim)
+                    .and_then(|value| value.strip_prefix('{'))
+                    .and_then(|value| value.strip_suffix('}'))
+                {
+                    for entry in entries.split(',') {
+                        if let Some((field, value)) = Self::backup_yaml_policy_lexeme(entry.trim())
+                        {
+                            Self::validate_backup_policy_yaml_lexeme(field, value)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn backup_yaml_policy_lexeme(line: &str) -> Option<(&str, &str)> {
+        for field in ["retention_days", "max_age_hours"] {
+            let value = line.strip_prefix(field).or_else(|| {
+                line.strip_prefix('"')
+                    .and_then(|line| line.strip_prefix(field))
+                    .and_then(|line| line.strip_prefix('"'))
+            });
+            if let Some(value) = value
+                .map(str::trim_start)
+                .and_then(|line| line.strip_prefix(':'))
+            {
+                return Some((field, value));
+            }
+        }
+        None
+    }
+
+    fn validate_backup_policy_yaml_lexeme(field: &str, value: &str) -> Result<()> {
+        let value = value
+            .split_once('#')
+            .map_or(value, |(value, _)| value)
+            .trim();
+        if value.starts_with(['+', '-']) {
+            return Err(Self::backup_policy_yaml_error(field));
+        }
+        if value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'_')
+            && !value.is_empty()
+            && value.replace('_', "").parse::<u64>().is_err()
+        {
+            return Err(Self::backup_policy_yaml_error(field));
+        }
+        Ok(())
+    }
+
+    fn backup_policy_yaml_error(field: &str) -> anyhow::Error {
+        match field {
+            "retention_days" => backup_error(field, "invalid_retention"),
+            "max_age_hours" => backup_error(field, "invalid_max_age"),
+            _ => unreachable!("only backup policy fields reach this helper"),
+        }
     }
 
     /// Returns the first conventional config file path that exists on disk.
@@ -3750,6 +3834,62 @@ agent_api:
                 .to_string();
             assert_eq!(error, expected);
             assert!(!error.contains(value));
+        }
+    }
+
+    #[test]
+    fn app_config_load_rejects_signed_and_oversized_backup_policy_literals() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+
+        for (field, literal, expected) in [
+            (
+                "retention_days",
+                "+30",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                "+24",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+            (
+                "retention_days",
+                "18446744073709551616",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                "340282366920938463463374607431768211456",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+        ] {
+            let yaml = base_yaml.replacen(
+                &format!(
+                    "{field}: {}",
+                    if field == "retention_days" { 30 } else { 24 }
+                ),
+                &format!("{field}: {literal}"),
+                1,
+            );
+            let path = std::env::temp_dir().join(format!(
+                "agent-voice-backup-policy-{}-{}.yaml",
+                std::process::id(),
+                field
+            ));
+            fs::write(&path, yaml).unwrap();
+
+            let result = AppConfig::load(Some(&path), false);
+            fs::remove_file(&path).unwrap();
+            assert!(result.is_err());
+            let error = result.err().unwrap().to_string();
+
+            assert_eq!(error, expected);
+            assert!(!error.contains(literal));
         }
     }
 
