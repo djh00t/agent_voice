@@ -1,6 +1,10 @@
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(windows)]
@@ -130,8 +134,33 @@ unsafe extern "C" {
     ) -> std::os::raw::c_int;
 }
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn linkat(
+        old_directory: std::os::raw::c_int,
+        old_path: *const std::os::raw::c_char,
+        new_directory: std::os::raw::c_int,
+        new_path: *const std::os::raw::c_char,
+        flags: std::os::raw::c_int,
+    ) -> std::os::raw::c_int;
+    fn openat(
+        directory: std::os::raw::c_int,
+        path: *const std::os::raw::c_char,
+        flags: std::os::raw::c_int,
+        mode: std::os::raw::c_uint,
+    ) -> std::os::raw::c_int;
+    fn unlinkat(
+        directory: std::os::raw::c_int,
+        path: *const std::os::raw::c_char,
+        flags: std::os::raw::c_int,
+    ) -> std::os::raw::c_int;
+}
+
 #[cfg(test)]
 static PUBLICATION_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
+
+#[cfg(test)]
+static PARENT_HANDOFF_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
 
 #[cfg(test)]
 fn set_publication_barrier(barrier: Option<Arc<Barrier>>) {
@@ -154,6 +183,27 @@ fn wait_for_publication_race() {
     }
 }
 
+#[cfg(test)]
+fn set_parent_handoff_barrier(barrier: Option<Arc<Barrier>>) {
+    *PARENT_HANDOFF_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("parent handoff barrier is not poisoned") = barrier;
+}
+
+#[cfg(test)]
+fn wait_for_parent_handoff() {
+    let barrier = PARENT_HANDOFF_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("parent handoff barrier is not poisoned")
+        .clone();
+    if let Some(barrier) = barrier {
+        barrier.wait();
+        barrier.wait();
+    }
+}
+
 fn write_inner(
     destination: &Path,
     encoded_snapshot: &[u8],
@@ -164,8 +214,10 @@ fn write_inner(
     }
 
     let parent = destination_parent(destination)?;
+    let parent_directory = open_parent_directory(parent)?;
     ensure_destination_absent(destination)?;
-    let mut temporary = TemporaryFile::create(parent, destination)?;
+    ensure_destination_absent_at(&parent_directory, destination)?;
+    let mut temporary = TemporaryFile::create(parent, &parent_directory, destination)?;
 
     if fault == FaultStage::Write {
         return Err(WriterError::Write);
@@ -184,14 +236,22 @@ fn write_inner(
         .map_err(|_| WriterError::Sync)?;
 
     ensure_destination_absent(destination)?;
+    ensure_destination_absent_at(&parent_directory, destination)?;
     temporary.ensure_owned()?;
     #[cfg(test)]
     wait_for_publication_race();
     temporary.ensure_owned()?;
+    #[cfg(test)]
+    wait_for_parent_handoff();
     if fault == FaultStage::Rename {
         return Err(WriterError::Rename);
     }
-    match publish_without_replacement_owned(temporary.path(), destination, temporary.identity()) {
+    match publish_without_replacement_owned(
+        &parent_directory,
+        temporary.path(),
+        destination,
+        temporary.identity(),
+    ) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             return Err(WriterError::DestinationExists);
@@ -203,61 +263,79 @@ fn write_inner(
     if fault == FaultStage::DirectorySync {
         return Err(WriterError::DirectorySync);
     }
-    sync_parent_directory(parent).map_err(|_| WriterError::DirectorySync)
+    sync_parent_directory(&parent_directory).map_err(|_| WriterError::DirectorySync)
 }
 
 fn publish_without_replacement(source: &Path, destination: &Path) -> io::Result<()> {
     let source_identity = fs::symlink_metadata(source)?;
-    publish_without_replacement_owned(source, destination, &source_identity)
+    let parent = source
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_directory = File::open(parent)?;
+    publish_without_replacement_owned(&parent_directory, source, destination, &source_identity)
 }
 
+#[cfg(unix)]
 fn publish_without_replacement_owned(
+    parent: &File,
     source: &Path,
     destination: &Path,
     source_identity: &fs::Metadata,
 ) -> io::Result<()> {
-    if !path_matches_identity(source, source_identity) {
+    let source_name = path_name(source)?;
+    let destination_name = path_name(destination)?;
+    if !path_matches_identity_at(parent, &source_name, source_identity) {
         return Err(io::Error::other("temporary file identity changed"));
     }
 
     #[cfg(target_os = "linux")]
     {
-        match rename_without_replacement_linux(source, destination) {
+        match rename_without_replacement_linux(parent, &source_name, &destination_name) {
             Ok(()) => return Ok(()),
             Err(error) if rename_noreplace_unavailable(&error) => {}
             Err(error) => return Err(error),
         }
     }
 
-    fs::hard_link(source, destination)?;
-    if !path_matches_identity(source, source_identity) {
-        remove_if_owned(destination, source_identity);
+    link_without_replacement(parent, &source_name, &destination_name)?;
+    if !path_matches_identity_at(parent, &source_name, source_identity) {
+        let _ = unlink_at(parent, &destination_name);
         return Err(io::Error::other("temporary file identity changed"));
     }
-    if let Err(error) = fs::remove_file(source) {
-        remove_if_owned(destination, source_identity);
+    if let Err(error) = unlink_at(parent, &source_name) {
+        let _ = unlink_at(parent, &destination_name);
         return Err(error);
     }
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn rename_without_replacement_linux(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+#[cfg(not(unix))]
+fn publish_without_replacement_owned(
+    _parent: &File,
+    _source: &Path,
+    _destination: &Path,
+    _source_identity: &fs::Metadata,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        ErrorKind::Unsupported,
+        "atomic publication is unavailable on this platform",
+    ))
+}
 
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "source path contains NUL"))?;
-    let destination = CString::new(destination.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "destination path contains NUL"))?;
-    const AT_FDCWD: std::os::raw::c_int = -100;
+#[cfg(target_os = "linux")]
+fn rename_without_replacement_linux(
+    parent: &File,
+    source: &CStr,
+    destination: &CStr,
+) -> io::Result<()> {
     const RENAME_NOREPLACE: std::os::raw::c_uint = 1;
 
     let result = unsafe {
         renameat2(
-            AT_FDCWD,
+            parent.as_raw_fd(),
             source.as_ptr(),
-            AT_FDCWD,
+            parent.as_raw_fd(),
             destination.as_ptr(),
             RENAME_NOREPLACE,
         )
@@ -274,6 +352,54 @@ fn rename_noreplace_unavailable(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(22 | 38 | 95))
 }
 
+#[cfg(unix)]
+fn path_name(path: &Path) -> io::Result<CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "path has no file name"))?;
+    CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "path contains NUL"))
+}
+
+#[cfg(unix)]
+fn open_at(parent: &File, name: &CStr) -> io::Result<File> {
+    let descriptor = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), 0, 0) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn link_without_replacement(parent: &File, source: &CStr, destination: &CStr) -> io::Result<()> {
+    let result = unsafe {
+        linkat(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unlink_at(parent: &File, name: &CStr) -> io::Result<()> {
+    let result = unsafe { unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn remove_if_owned(path: &Path, identity: &fs::Metadata) {
     let Ok(current) = fs::symlink_metadata(path) else {
         return;
@@ -283,10 +409,33 @@ fn remove_if_owned(path: &Path, identity: &fs::Metadata) {
     }
 }
 
+#[cfg(not(unix))]
 fn path_matches_identity(path: &Path, identity: &fs::Metadata) -> bool {
     fs::symlink_metadata(path)
         .map(|current| same_file(identity, &current))
         .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn path_matches_identity_at(parent: &File, name: &CStr, identity: &fs::Metadata) -> bool {
+    open_at(parent, name)
+        .and_then(|file| file.metadata())
+        .map(|current| same_file(identity, &current))
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn remove_if_owned_at(parent: &File, name: &CStr, identity: &fs::Metadata) -> bool {
+    let Ok(file) = open_at(parent, name) else {
+        return false;
+    };
+    let Ok(current) = file.metadata() else {
+        return false;
+    };
+    if !same_file(identity, &current) {
+        return false;
+    }
+    unlink_at(parent, name).is_ok()
 }
 
 #[cfg(unix)]
@@ -305,6 +454,7 @@ fn same_file(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
     false
 }
 
+#[cfg(unix)]
 fn destination_parent(destination: &Path) -> Result<&Path, WriterError> {
     if destination.file_name().is_none() {
         return Err(WriterError::InvalidDestination);
@@ -324,12 +474,54 @@ fn destination_parent(destination: &Path) -> Result<&Path, WriterError> {
     Ok(parent)
 }
 
+#[cfg(not(unix))]
+fn destination_parent(_destination: &Path) -> Result<&Path, WriterError> {
+    Err(WriterError::InvalidDestination)
+}
+
+#[cfg(unix)]
+fn open_parent_directory(parent: &Path) -> Result<File, WriterError> {
+    let directory = File::open(parent).map_err(|_| WriterError::InvalidDestination)?;
+    let handle_metadata = directory
+        .metadata()
+        .map_err(|_| WriterError::InvalidDestination)?;
+    let path_metadata =
+        fs::symlink_metadata(parent).map_err(|_| WriterError::InvalidDestination)?;
+    if !handle_metadata.is_dir() || !same_file(&handle_metadata, &path_metadata) {
+        return Err(WriterError::InvalidDestination);
+    }
+    if handle_metadata.permissions().mode() & 0o022 != 0 {
+        return Err(WriterError::InvalidDestination);
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_parent_directory(_parent: &Path) -> Result<File, WriterError> {
+    Err(WriterError::InvalidDestination)
+}
+
 fn ensure_destination_absent(destination: &Path) -> Result<(), WriterError> {
     match fs::symlink_metadata(destination) {
         Ok(_) => Err(WriterError::DestinationExists),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(_) => Err(WriterError::InvalidDestination),
     }
+}
+
+#[cfg(unix)]
+fn ensure_destination_absent_at(parent: &File, destination: &Path) -> Result<(), WriterError> {
+    let name = path_name(destination).map_err(|_| WriterError::InvalidDestination)?;
+    match open_at(parent, &name) {
+        Ok(_) => Err(WriterError::DestinationExists),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(WriterError::InvalidDestination),
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_destination_absent_at(_parent: &File, _destination: &Path) -> Result<(), WriterError> {
+    Err(WriterError::InvalidDestination)
 }
 
 fn temporary_path(parent: &Path, sequence: u64) -> PathBuf {
@@ -349,13 +541,21 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 struct TemporaryFile {
     path: PathBuf,
+    parent: File,
     file: Option<File>,
     identity: fs::Metadata,
     armed: bool,
 }
 
 impl TemporaryFile {
-    fn create(parent: &Path, destination: &Path) -> Result<Self, WriterError> {
+    fn create(
+        parent: &Path,
+        parent_directory: &File,
+        destination: &Path,
+    ) -> Result<Self, WriterError> {
+        let parent_handle = parent_directory
+            .try_clone()
+            .map_err(|_| WriterError::Write)?;
         for _ in 0..TEMP_COLLISION_LIMIT {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = temporary_path(parent, sequence);
@@ -381,6 +581,7 @@ impl TemporaryFile {
                     };
                     return Ok(Self {
                         path,
+                        parent: parent_handle,
                         file: Some(file),
                         identity,
                         armed: true,
@@ -402,7 +603,13 @@ impl TemporaryFile {
     }
 
     fn ensure_owned(&self) -> Result<(), WriterError> {
-        if path_matches_identity(&self.path, &self.identity) {
+        #[cfg(unix)]
+        let owned = path_name(&self.path)
+            .map(|name| path_matches_identity_at(&self.parent, &name, &self.identity))
+            .unwrap_or(false);
+        #[cfg(not(unix))]
+        let owned = path_matches_identity(&self.path, &self.identity);
+        if owned {
             Ok(())
         } else {
             Err(WriterError::Rename)
@@ -423,6 +630,16 @@ impl TemporaryFile {
 impl Drop for TemporaryFile {
     fn drop(&mut self) {
         if self.armed {
+            #[cfg(unix)]
+            {
+                let removed = path_name(&self.path)
+                    .map(|name| remove_if_owned_at(&self.parent, &name, &self.identity))
+                    .unwrap_or(false);
+                if !removed {
+                    remove_if_owned(&self.path, &self.identity);
+                }
+            }
+            #[cfg(not(unix))]
             remove_if_owned(&self.path, &self.identity);
         }
         self.file.take();
@@ -430,12 +647,12 @@ impl Drop for TemporaryFile {
 }
 
 #[cfg(unix)]
-fn sync_parent_directory(parent: &Path) -> io::Result<()> {
-    File::open(parent)?.sync_all()
+fn sync_parent_directory(parent: &File) -> io::Result<()> {
+    parent.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
+fn sync_parent_directory(_parent: &File) -> io::Result<()> {
     Err(io::Error::new(
         ErrorKind::Unsupported,
         "directory synchronization is unavailable on this platform",
@@ -799,6 +1016,60 @@ mod tests {
             b"foreign temporary bytes"
         );
         assert_eq!(directory.temporary_entries().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validated_parent_handle_pins_publication() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let destination = directory.destination("destination.bin");
+        let moved = directory.path.with_file_name(format!(
+            "{}-moved",
+            directory
+                .path
+                .file_name()
+                .expect("test directory has a name")
+                .to_string_lossy()
+        ));
+        assert!(!moved.exists(), "moved test directory must be unused");
+
+        let barrier = Arc::new(Barrier::new(2));
+        super::set_parent_handoff_barrier(Some(Arc::clone(&barrier)));
+        let writer_destination = destination.clone();
+        let writer =
+            std::thread::spawn(move || AtomicSnapshotWriter::write(&writer_destination, SNAPSHOT));
+
+        barrier.wait();
+        let entries = directory.temporary_entries();
+        assert_eq!(entries.len(), 1, "writer should own one temporary sibling");
+        let temporary_name = entries[0]
+            .file_name()
+            .expect("temporary sibling has a name")
+            .to_owned();
+        fs::rename(&directory.path, &moved).expect("rename validated parent directory");
+        fs::create_dir(&directory.path).expect("replace parent directory");
+        let foreign_temporary = directory.path.join(&temporary_name);
+        fs::write(&foreign_temporary, b"foreign temporary bytes")
+            .expect("write replacement temporary sibling");
+        barrier.wait();
+
+        let result = writer.join().expect("writer thread completes");
+        super::set_parent_handoff_barrier(None);
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            fs::read(moved.join("destination.bin")).expect("published snapshot in pinned parent"),
+            SNAPSHOT
+        );
+        assert_eq!(
+            fs::read(&foreign_temporary).expect("replacement sibling remains"),
+            b"foreign temporary bytes"
+        );
+
+        fs::remove_file(&foreign_temporary).expect("remove replacement sibling");
+        fs::remove_dir(&directory.path).expect("remove replacement parent");
+        fs::remove_file(moved.join("destination.bin")).expect("remove published snapshot");
+        fs::remove_dir(&moved).expect("remove moved parent");
     }
 
     #[test]
