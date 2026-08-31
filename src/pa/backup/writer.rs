@@ -245,10 +245,9 @@ fn write_inner(
 
     let parent = destination_parent(destination)?;
     let parent_directory = open_parent_directory(parent)?;
-    ensure_destination_absent(destination)?;
-    ensure_destination_absent_at(&parent_directory, destination)?;
     #[cfg(all(test, unix))]
     wait_for_temporary_creation();
+    ensure_destination_absent_at(&parent_directory, destination)?;
     let mut temporary = TemporaryFile::create(parent, &parent_directory, destination)?;
 
     if fault == FaultStage::Write {
@@ -600,14 +599,6 @@ fn open_parent_directory(parent: &Path) -> Result<File, WriterError> {
 #[cfg(not(unix))]
 fn open_parent_directory(_parent: &Path) -> Result<File, WriterError> {
     Err(WriterError::InvalidDestination)
-}
-
-fn ensure_destination_absent(destination: &Path) -> Result<(), WriterError> {
-    match fs::symlink_metadata(destination) {
-        Ok(_) => Err(WriterError::DestinationExists),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(WriterError::InvalidDestination),
-    }
 }
 
 #[cfg(unix)]
