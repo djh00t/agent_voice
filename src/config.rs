@@ -1,5 +1,8 @@
 //! Runtime configuration loading for SIP, OpenAI, behavior, and accounting.
 
+#[path = "config/yaml_events.rs"]
+mod yaml_events;
+
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -39,6 +42,7 @@ impl AppConfig {
             Some(path) => {
                 let raw = fs::read_to_string(path)
                     .with_context(|| format!("failed to read config file {}", path.display()))?;
+                yaml_events::validate_syntax(&raw)?;
                 Self::validate_backup_policy_yaml_lexemes(&raw)?;
                 serde_yaml::from_str(&raw).with_context(|| "failed to parse YAML config")?
             }
