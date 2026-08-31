@@ -122,14 +122,14 @@ verifiers, credentials, tokens, complete query URLs, or provider diagnostics.
   },
   {
     "tier": "CI",
-    "kind": "NOT_RUN",
-    "selector_or_scope": "remote pull-request checks",
-    "command_or_check": "not run at report authoring time",
-    "expected": "independent CI evidence after PR creation",
-    "exit_code": null,
-    "observed": "pending remote pull-request evidence; local checks do not imply CI",
-    "commit": "0a5c4c86b29bac6387df300b6fd5aecff08457f6",
-    "timestamp_utc": "2026-08-31T14:44:02Z"
+    "kind": "GREEN",
+    "selector_or_scope": "PR #313 status checks at head ed9f3122e77b7f7672e70cc4bc567aaea745e538",
+    "command_or_check": "rtk gh pr checks 313 --repo djh00t/agent_voice; rtk gh pr view 313 --repo djh00t/agent_voice --json headRefOid,statusCheckRollup,mergeStateStatus,mergeable",
+    "expected": "all five independent PR checks pass",
+    "exit_code": 0,
+    "observed": "CI Checks Summary reported Passed: 5 and Failed: 0; Quality Gates, Compose Config, Analyze (javascript-typescript), Analyze (rust), and CodeQL each completed successfully, with CLEAN/MERGEABLE PR state",
+    "commit": "ed9f3122e77b7f7672e70cc4bc567aaea745e538",
+    "timestamp_utc": "2026-08-31T15:13:21Z"
   },
   {
     "tier": "LIVE",
@@ -160,7 +160,8 @@ verifiers, credentials, tokens, complete query URLs, or provider diagnostics.
 
 ## Non-claims and handoff
 
-CI, OAuth consent, credentials, provider/network behavior, deployment, and
-authenticated UAT were not run. Task 8b.3 (#251) consumes `OAuthCallback`,
-`AuthorizationCode`, and `validate_callback`; the public facade and module
-registration remain outside this package.
+The independent PR CI rollup is recorded above. OAuth consent, credentials,
+provider/network behavior, deployment, and authenticated UAT were not run.
+Task 8b.3 (#251) consumes `OAuthCallback`, `AuthorizationCode`, and
+`validate_callback`; the public facade and module registration remain outside
+this package.
