@@ -2226,6 +2226,92 @@ impl PaStore {
         Ok(())
     }
 
+    /// Atomically updates OAuth tokens while preserving an omitted refresh token.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_oauth_tokens(
+        &self,
+        cipher: &TokenCipher,
+        provider: &str,
+        account_id: &str,
+        access_token: &str,
+        refresh_token: Option<&str>,
+        expires_at: DateTime<Utc>,
+        scopes: &[String],
+    ) -> StoreResult<()> {
+        let provider = validate_oauth_identity(provider.to_owned(), "provider")?;
+        let account_id = validate_oauth_identity(account_id.to_owned(), "account_id")?;
+        if access_token.trim().is_empty() {
+            return Err(StoreError::InvalidInput {
+                field: "access_token",
+            });
+        }
+        if let Some(refresh_token) = refresh_token
+            && refresh_token.trim().is_empty()
+        {
+            return Err(StoreError::InvalidInput {
+                field: "refresh_token",
+            });
+        }
+        let scopes = normalize_scopes(scopes.to_vec())?;
+        let expires_at = expires_at.to_rfc3339_opts(SecondsFormat::AutoSi, true);
+        let scopes = serde_json::to_string(&scopes).map_err(|_| StoreError::StoredValueInvalid)?;
+
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let access_context = oauth_context(&provider, &account_id, "access");
+        let access_ciphertext = cipher
+            .encrypt(access_token, access_context.as_bytes())
+            .map_err(StoreError::Crypto)
+            .and_then(|envelope| serialize_envelope(&envelope))?;
+        let refresh_ciphertext = match refresh_token {
+            Some(refresh_token) => {
+                let refresh_context = oauth_context(&provider, &account_id, "refresh");
+                Some(
+                    cipher
+                        .encrypt(refresh_token, refresh_context.as_bytes())
+                        .map_err(StoreError::Crypto)
+                        .and_then(|envelope| serialize_envelope(&envelope))?,
+                )
+            }
+            None => transaction
+                .query_row(
+                    "SELECT refresh_token_ciphertext FROM oauth_credentials
+                     WHERE provider = ?1 AND account_id = ?2",
+                    params![&provider, &account_id],
+                    |row| row.get::<_, Option<Vec<u8>>>(0),
+                )
+                .optional()?
+                .flatten(),
+        };
+
+        transaction.execute(
+            "INSERT INTO oauth_credentials (
+                 provider, account_id, access_token_ciphertext,
+                 refresh_token_ciphertext, expires_at, scopes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(provider, account_id) DO UPDATE SET
+                 access_token_ciphertext = excluded.access_token_ciphertext,
+                 refresh_token_ciphertext = CASE
+                     WHEN excluded.refresh_token_ciphertext IS NULL
+                     THEN oauth_credentials.refresh_token_ciphertext
+                     ELSE excluded.refresh_token_ciphertext
+                 END,
+                 expires_at = excluded.expires_at,
+                 scopes = excluded.scopes,
+                 updated_at = CURRENT_TIMESTAMP",
+            params![
+                provider,
+                account_id,
+                access_ciphertext,
+                refresh_ciphertext,
+                expires_at,
+                scopes,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Decrypts and returns one OAuth credential by provider/account pair.
     pub fn load_oauth_credential(
         &self,
