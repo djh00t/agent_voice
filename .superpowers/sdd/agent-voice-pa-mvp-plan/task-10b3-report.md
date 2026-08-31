@@ -135,6 +135,7 @@ credential, deployment, or authenticated-UAT work in this package.
 
 - Source commit: `53e5161` (`feat(realtime): add closed client event values`).
 - Registration commit: `237d22b` (`test(realtime): register client event harness`).
+- Warning-fix commit: `efdb0ee` (`fix(realtime): keep client value API warning-free`).
 - The report is committed separately as the final one-file delivery commit;
   final `rtk git log --oneline -3` and `rtk git diff --name-only
   9daaefec70666f1bd4e35396bd4385136ab45992...HEAD` are the delivery readback.
@@ -149,4 +150,3 @@ Refs #97
 Refs #217
 Refs #219
 ```
-
