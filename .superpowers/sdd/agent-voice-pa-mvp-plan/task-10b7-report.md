@@ -208,6 +208,14 @@ readback was:
 - `eae96d8` — final report-only readback:
   `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
 
+The intervening `b1b83562`-based repair head also included these report-only
+readbacks before the latest main rebase:
+
+- `25f50d8` — report-only hash refresh:
+  `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
+- `eb498f4` — report-only main-base readback:
+  `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
+
 After rebasing onto the current `origin/main`, the equivalent delivery and
 repair commits are:
 
@@ -228,9 +236,12 @@ repair commits are:
   `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
 - `59be339` — report-only latest-base refresh:
   `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
+- `66eda15` — report-only complete commit readback:
+  `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
 
-The final report update follows as one more report-only commit; all listed
-commits preserve the exact-one-file rule.
+The final report correction follows as one more report-only commit and is
+intentionally described as the current update rather than self-listed; all
+commits named above preserve the exact-one-file rule.
 
 The delivering PR footer is exactly:
 
