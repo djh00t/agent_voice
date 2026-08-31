@@ -4147,7 +4147,7 @@ agent_api:
     }
 
     #[test]
-    fn app_config_load_rejects_flow_policy_literal_after_quoted_hash_and_comment() {
+    fn app_config_load_rejects_signed_policy_after_quoted_hash() {
         let mut config = AppConfig::default();
         config.sip.username = "test-user".to_string();
         config.sip.password = "test-password".to_string();
