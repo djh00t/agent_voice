@@ -122,7 +122,7 @@ at tests/realtime_server_response_events_contract.rs:215 and :242
 2 errors, 1 warning
 ```
 
-After `5200a2c`, the same selector passed and covered both invalid paths and a
+After `35b40d1`, the same selector passed and covered both invalid paths and a
 valid cancelled round trip:
 
 ```text
@@ -211,15 +211,17 @@ readback was:
 After rebasing onto the current `origin/main`, the equivalent delivery and
 repair commits are:
 
-- `433a330` — harness only: `tests/realtime_server_response_events_contract.rs`
-- `b6ccca2` — implementation and inline test only:
+- `dc6afad` — harness only: `tests/realtime_server_response_events_contract.rs`
+- `91cec30` — implementation and inline test only:
   `src/realtime/server_response_events.rs`
-- `2928aeb` — report only:
+- `2fff304` — report only:
   `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
-- `6eff69b` — report-only finalization:
+- `af32e33` — report-only finalization:
   `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
-- `5200a2c` — repair implementation and regression test only:
+- `35b40d1` — repair implementation and regression test only:
   `src/realtime/server_response_events.rs`
+- `97d06fe` — report-only rebased readback:
+  `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
 
 This report update is the next report-only repair commit and records the
 review evidence above; all listed commits preserve the exact-one-file rule.
