@@ -9,6 +9,9 @@
 pub mod values;
 
 #[cfg(test)]
+mod client_events;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn module_boundary_is_inert() {}
