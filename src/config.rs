@@ -538,12 +538,12 @@ struct BackupConfigFields {
     region: String,
     #[serde(default)]
     endpoint: Option<String>,
-    #[serde(default = "default_backup_retention_days")]
-    retention_days: u16,
+    #[serde(default)]
+    retention_days: Option<serde_yaml::Value>,
     #[serde(default = "default_backup_temp_dir")]
     temp_dir: PathBuf,
-    #[serde(default = "default_backup_max_age_hours")]
-    max_age_hours: u32,
+    #[serde(default)]
+    max_age_hours: Option<serde_yaml::Value>,
 }
 
 impl<'de> Deserialize<'de> for BackupConfig {
@@ -562,16 +562,46 @@ impl<'de> Deserialize<'de> for BackupConfig {
 
         let fields: BackupConfigFields = serde_yaml::from_value(value)
             .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let retention_days = parse_backup_yaml_retention(fields.retention_days)
+            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let max_age_hours = parse_backup_yaml_max_age(fields.max_age_hours)
+            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
         Ok(Self {
             enabled: fields.enabled,
             bucket: fields.bucket,
             prefix: fields.prefix,
             region: fields.region,
             endpoint: fields.endpoint,
-            retention_days: fields.retention_days,
+            retention_days,
             temp_dir: fields.temp_dir,
-            max_age_hours: fields.max_age_hours,
+            max_age_hours,
         })
+    }
+}
+
+fn parse_backup_yaml_retention(value: Option<serde_yaml::Value>) -> Result<u16> {
+    let parsed = match value {
+        Some(value) => serde_yaml::from_value::<u64>(value)
+            .map_err(|_| backup_error("retention_days", "invalid_retention"))?,
+        None => u64::from(default_backup_retention_days()),
+    };
+    if (1..=3650).contains(&parsed) {
+        Ok(parsed as u16)
+    } else {
+        Err(backup_error("retention_days", "invalid_retention"))
+    }
+}
+
+fn parse_backup_yaml_max_age(value: Option<serde_yaml::Value>) -> Result<u32> {
+    let parsed = match value {
+        Some(value) => serde_yaml::from_value::<u64>(value)
+            .map_err(|_| backup_error("max_age_hours", "invalid_max_age"))?,
+        None => u64::from(default_backup_max_age_hours()),
+    };
+    if (1..=168).contains(&parsed) {
+        Ok(parsed as u32)
+    } else {
+        Err(backup_error("max_age_hours", "invalid_max_age"))
     }
 }
 
@@ -3567,6 +3597,49 @@ agent_api:
                 .to_string();
             assert!(error.contains(&format!("unknown field `{field}`")));
             assert!(!error.contains("do-not-log-this"));
+        }
+    }
+
+    #[test]
+    fn backup_config_yaml_policy_errors_are_frozen_and_redacted() {
+        for (field, value, expected) in [
+            (
+                "retention_days",
+                "0",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "retention_days",
+                "65536",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "retention_days",
+                "do-not-log-this",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                "0",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+            (
+                "max_age_hours",
+                "4294967296",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+            (
+                "max_age_hours",
+                "do-not-log-this",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+        ] {
+            let yaml = format!("enabled: true\nbucket: agent-voice-test\n{field}: {value}\n");
+            let error = serde_yaml::from_str::<BackupConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, expected);
+            assert!(!error.contains(value));
         }
     }
 
