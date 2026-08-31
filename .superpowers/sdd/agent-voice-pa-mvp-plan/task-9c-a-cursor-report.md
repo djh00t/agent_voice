@@ -4,8 +4,8 @@
 - **Package:** `task-9c-a`
 - **Evidence date:** 2026-08-31 (Australia/Sydney)
 - **Base revision:** `eb9c791` (`origin/main` after the current-base rebase)
-- **Implementation revision:** `afc54c7`
-- **Readback timestamp:** `2026-08-31T13:12:17Z`
+- **Implementation revision:** `4a9c5e6`
+- **Readback timestamp:** `2026-08-31T13:30:27Z`
 
 ## Contract and prerequisite readback
 
@@ -17,6 +17,15 @@ tracked by #157. The merge commit was verified as an ancestor of
 open/status:blocked and owns coordination only. PR #306 remains open, so this
 package is intentionally based on the current base readback before that PR
 and must be rebased after #306 merges.
+
+Issue #290's binding clarification ([comment
+5479034348](https://github.com/djh00t/agent_voice/issues/290#issuecomment-5479034348))
+resolves the wording conflict between the frozen no-whitespace shorthand and
+the required #157 provider boundary. Cursor values use the provider-compatible
+contract: nonblank bounded ASCII with control characters rejected, including
+printable punctuation and embedded spaces. Stream IDs remain machine-safe and
+reject whitespace. Neither side trims, normalizes, decodes, or reserializes
+values.
 
 The implementation uses the existing encrypted `provider_cursors` table and
 existing redacted `StoreError` categories. It adds no migration, schema,
@@ -32,7 +41,13 @@ configuration, dependency, or report path changed.
 The implementation history is one-file and one-logical-change per commit:
 
 - `3f0bf1e` — test-only cursor contract and exact selectors (`src/pa/store.rs`)
-- `afc54c7` — cursor API, validation, and immediate CAS implementation (`src/pa/store.rs`)
+- `afc54c7` — cursor API and immediate CAS implementation (`src/pa/store.rs`)
+- `7f62967` — initial evidence report (this report only)
+- `b3cee16` — post-rebase evidence refresh (this report only)
+- `b032523` — provider-compatible cursor alphabet regression (`src/pa/store.rs`)
+- `9743376` — provider-compatible cursor validation (`src/pa/store.rs`)
+- `41679ac` — stream machine-safe regression (`src/pa/store.rs`)
+- `4a9c5e6` — separate stream and cursor validation (`src/pa/store.rs`)
 - report commit — this evidence file only
 
 The final changed-path readback after the report commit must contain only
@@ -49,6 +64,18 @@ filter matched a real test; no zero-test result was counted.
 rtk cargo test --lib pa::store::tests::provider_cursor_cas_rejects_stale_and_equal_retry -- --exact --nocapture
 exit 101
 cargo test: 37 errors, 0 warnings (1 suite)
+```
+
+During review repair, the exact invalid-input selector was also run after the
+stream-whitespace regression test and before the separate stream validator
+existed. It exited nonzero because the provider-compatible cursor validator
+was still being applied to stream IDs. This was a real named-test failure, not
+a filtered zero-test result.
+
+```text
+rtk cargo test --lib pa::store::tests::provider_cursor_invalid_inputs_are_atomic_and_redacted -- --exact --nocapture
+exit 101
+test result: FAILED; 0 passed; 1 failed; 0 ignored; 0 measured; 550 filtered out
 ```
 
 ## GREEN
@@ -93,7 +120,8 @@ cargo test: 178 passed, 373 filtered out (1 suite)
 The tests cover absent and nullable rows as `None`, first insert, encrypted
 file close/reopen, equal retry with stable timestamp and row count, exact
 stale/out-of-order conflicts, duplicate first-write rejection, stream
-isolation, two-handle one-winner behavior, invalid input before mutation, and
+isolation, two-handle one-winner behavior, provider-compatible printable
+cursor values, machine-safe stream values, invalid input before mutation, and
 redacted invalid/corrupt-state errors. They do not print fixture values.
 
 ## Checks
@@ -103,7 +131,7 @@ redacted invalid/corrupt-state errors. They do not print fixture values.
 | `rtk rustfmt --edition 2024 --check src/pa/store.rs` | PASS, exit 0 |
 | `rtk git diff --check -- src/pa/store.rs` | PASS, exit 0 |
 | `rtk make docs-install` | PASS, exit 0; checked-in website lockfile used |
-| `rtk make check` | PASS, exit 0; 551 Rust tests, Clippy, rustdoc, and Docusaurus completed |
+| `rtk make check` | PASS, exit 0; 551 Rust tests, Clippy, rustdoc, and Docusaurus completed after the final validation fix |
 
 The first `rtk make check` attempt exited 2 at `docs-build` because the fresh
 worktree did not yet have the checked-in website dependencies installed. No
@@ -126,28 +154,34 @@ changed.
 ## Evidence records
 
 - `{tier: LOCAL, kind: RED, selector_or_scope: provider_cursor_cas_rejects_stale_and_equal_retry, command_or_check: exact cargo test selector, expected: true named match and nonzero missing-API failure, exit_code: 101, observed_redacted: 37 compile errors for absent API and old return shape, source_revision: 3f0bf1e, timestamp_utc: 2026-08-31T13:12:17Z}`
-- `{tier: LOCAL, kind: GREEN, selector_or_scope: five exact provider cursor selectors, command_or_check: exact cargo test selectors, expected: one matched test per selector, exit_code: 0, observed_redacted: 1 passed and 550 filtered out for each, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
-- `{tier: LOCAL, kind: GREEN, selector_or_scope: provider_cursor aggregate, command_or_check: aggregate cargo test selector, expected: all cursor tests match and pass, exit_code: 0, observed_redacted: 5 passed and 546 filtered out, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
-- `{tier: LOCAL, kind: GREEN, selector_or_scope: pa::store module, command_or_check: full store cargo test selector, expected: no store regressions, exit_code: 0, observed_redacted: 178 passed and 373 filtered out, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
-- `{tier: LOCAL, kind: GREEN, selector_or_scope: src/pa/store.rs formatting, command_or_check: scoped rustfmt check, expected: no formatting diff, exit_code: 0, observed_redacted: clean, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
-- `{tier: LOCAL, kind: GREEN, selector_or_scope: owned diff whitespace, command_or_check: scoped git diff check, expected: no whitespace errors, exit_code: 0, observed_redacted: clean, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
-- `{tier: LOCAL, kind: GREEN, selector_or_scope: repository changed-scope gate, command_or_check: rtk make check after locked docs setup, expected: Rust tests, Clippy, rustdoc, and Docusaurus pass, exit_code: 0, observed_redacted: complete gate passed, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
-- `{tier: LOCAL, kind: NOT_RUN, selector_or_scope: whole-tree formatting, command_or_check: rtk cargo fmt --all -- --check, expected: exit 0, exit_code: 1, observed_redacted: pre-existing drift only in out-of-scope files, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
-- `{tier: STATIC, kind: REVIEW, selector_or_scope: prerequisite and ownership readback, command_or_check: issue/PR state readback, merge-ancestor check, and origin-main diff review, expected: merged gates and only owned cursor paths, exit_code: 0, observed_redacted: #136/#142/#157 merged and closed; #88 blocked coordination parent; #306 open; source diff limited to cursor source/tests before report, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
-- `{tier: STATIC, kind: REVIEW, selector_or_scope: CAS and redaction boundary, command_or_check: source symbol and diff scan, expected: one immediate parameterized CAS and fixed errors, exit_code: 0, observed_redacted: no legacy save/delete cursor API, no migration, and no raw fixture value in test output, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
-- `{tier: CI, kind: NOT_RUN, selector_or_scope: linked workflow, command_or_check: GitHub check readback, expected: independently observed result, exit_code: UNEXECUTED, observed_redacted: no CI result claimed, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
-- `{tier: LIVE, kind: NOT_RUN, selector_or_scope: provider and deployment boundary, command_or_check: live-provider/OAuth/network/deployment check, expected: not applicable to this local slice, exit_code: NOT_RUN, observed_redacted: no live operation or credential use, source_revision: afc54c7, timestamp_utc: 2026-08-31T13:12:17Z}`
+- `{tier: LOCAL, kind: GREEN, selector_or_scope: five exact provider cursor selectors, command_or_check: exact cargo test selectors, expected: one matched test per selector, exit_code: 0, observed_redacted: 1 passed and 550 filtered out for each, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
+- `{tier: LOCAL, kind: GREEN, selector_or_scope: provider_cursor aggregate, command_or_check: aggregate cargo test selector, expected: all cursor tests match and pass, exit_code: 0, observed_redacted: 5 passed and 546 filtered out, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
+- `{tier: LOCAL, kind: GREEN, selector_or_scope: pa::store module, command_or_check: full store cargo test selector, expected: no store regressions, exit_code: 0, observed_redacted: 178 passed and 373 filtered out, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
+- `{tier: LOCAL, kind: GREEN, selector_or_scope: src/pa/store.rs formatting, command_or_check: scoped rustfmt check, expected: no formatting diff, exit_code: 0, observed_redacted: clean, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
+- `{tier: LOCAL, kind: GREEN, selector_or_scope: owned diff whitespace, command_or_check: scoped git diff check, expected: no whitespace errors, exit_code: 0, observed_redacted: clean, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
+- `{tier: LOCAL, kind: GREEN, selector_or_scope: repository changed-scope gate, command_or_check: rtk make check after locked docs setup, expected: Rust tests, Clippy, rustdoc, and Docusaurus pass, exit_code: 0, observed_redacted: complete gate passed after final validation fix, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
+- `{tier: LOCAL, kind: NOT_RUN, selector_or_scope: whole-tree formatting, command_or_check: rtk cargo fmt --all -- --check, expected: exit 0, exit_code: 1, observed_redacted: pre-existing drift only in out-of-scope files, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
+- `{tier: STATIC, kind: REVIEW, selector_or_scope: prerequisite and ownership readback, command_or_check: issue/PR state readback, merge-ancestor check, and origin-main diff review, expected: merged gates and only owned cursor paths, exit_code: 0, observed_redacted: #136/#142/#157 merged and closed; #88 blocked coordination parent; #306 open; source diff limited to cursor source/tests before report, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
+- `{tier: STATIC, kind: REVIEW, selector_or_scope: validation clarification, command_or_check: #290 binding clarification and #157 provider validator readback, expected: distinct stream/cursor alphabets, exit_code: 0, observed_redacted: cursor provider-compatible printable ASCII; stream machine-safe; no normalization, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
+- `{tier: STATIC, kind: REVIEW, selector_or_scope: CAS and redaction boundary, command_or_check: source symbol and diff scan, expected: one immediate parameterized CAS and fixed errors, exit_code: 0, observed_redacted: no legacy save/delete cursor API, no migration, and no raw fixture value in test output, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
+- `{tier: STATIC, kind: REVIEW, selector_or_scope: atomic commit history, command_or_check: git show --name-status for every delivery commit, expected: one file per commit, exit_code: 0, observed_redacted: each source/test commit touches src/pa/store.rs only and each report commit touches the report only, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
+- `{tier: CI, kind: NOT_RUN, selector_or_scope: linked workflow, command_or_check: GitHub check readback before push, expected: independently observed result, exit_code: UNEXECUTED, observed_redacted: local evidence only; CI rerun after push, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
+- `{tier: LIVE, kind: NOT_RUN, selector_or_scope: provider and deployment boundary, command_or_check: live-provider/OAuth/network/deployment check, expected: not applicable to this local slice, exit_code: NOT_RUN, observed_redacted: no live operation or credential use, source_revision: 4a9c5e6, timestamp_utc: 2026-08-31T13:30:27Z}`
 
 ## Lifecycle, review, and rollback
 
 Issue #290 was moved from OPEN/status:blocked to OPEN/status:in-progress only
-after the merged prerequisite readback. It may move to status:review only after
-the delivering PR and this report are read back. It remains open; this package
-does not close #290 or any parent/prerequisite issue.
+after the merged prerequisite readback, then to OPEN/status:review after PR
+#311 and this report were read back. It remains open; this package does not
+close #290 or any parent/prerequisite issue.
 
-No independent reviewer result is available at report creation. Review remains
-a PR gate; unresolved findings block status:review and closure. CI and LIVE
-remain unexecuted/not applicable as recorded above.
+Review repair added provider-compatible cursor coverage and separate
+machine-safe stream validation in `31af7ab`/`b032523`/`9743376`/`41679ac`/
+`4a9c5e6`, with the exact selectors and full local gate rerun above. The
+atomicity finding was checked against the per-commit file lists and the
+malformed report message was reworded during the interactive rebase. PR #311
+must receive a fresh independent review after these commits are pushed; no
+unresolved review result is claimed here.
 
 Rollback is a reviewed reverse-order revert of the report, implementation, and
 test commits. It does not remove the existing encrypted schema or durable data,
