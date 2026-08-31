@@ -77,8 +77,8 @@ Result: 11 compile errors (0 warnings), including missing BackupConfig and
         AppConfig.backup; this was a true missing-contract failure.
 ```
 
-The remediation tests also demonstrated the original defects before their
-source changes:
+The prior remediation tests also demonstrated their original defects before
+their source changes:
 
 ```text
 Command: rtk cargo test --lib config::tests::backup_config_enabled_override_rejects_blank_and_malformed -- --exact --nocapture
@@ -100,12 +100,22 @@ Exit: 0
 Result: NUL prefix, endpoint query, max-age zero, and max-age overflow were
         already rejected; this test supplied regression coverage without a
         behavior change for those cases.
+```
 
+### Remediation D RED evidence
+
+The common-secret regression was authored for the change delivered at
+implementation head `5503c19c3769adfdabe670846d8b178891bd59c3`; it did not
+exist at the earlier implementation head `8a4173bfc360c9cb8fd9a0a3cda81c9977743697`.
+The RED run occurred on its immediate predecessor
+`821e9f7900b0d44fb6be0e6c6e27800a08cda9c5`, before the source and test change
+was committed:
+
+```text
 Command: rtk cargo test --lib config::tests::backup_config_rejects_common_secret_shaped_unknown_yaml_fields -- --exact --nocapture
 Exit: 101
-Result: the new regression initially reported 0 passed, 1 failed, and 576
-        filtered out because the four common credential names fell through to
-        serde's generic unknown-field error.
+Result: 0 passed, 1 failed, and 576 filtered out because the four common
+        credential names fell through to serde's generic unknown-field error.
 ```
 
 ### Focused GREEN evidence
@@ -113,6 +123,9 @@ Result: the new regression initially reported 0 passed, 1 failed, and 576
 At implementation head `8a4173bfc360c9cb8fd9a0a3cda81c9977743697`, each exact
 selector below exited `0`, executed exactly one listed test, and reported
 `1 passed, 575 filtered out`:
+
+The common-secret regression did not yet exist at this historical head and is
+therefore not included in this selector list or its 576-test module count.
 
 ```text
 rtk cargo test --lib config::tests::backup_config_contract -- --exact --nocapture
@@ -135,7 +148,8 @@ Result: 44 passed, 532 filtered out (576 config tests available).
 ```
 
 At implementation head `5503c19c3769adfdabe670846d8b178891bd59c3`, the
-broadened secret-field regression and complete config module passed:
+broadened secret-field regression was present and passed, alongside the
+complete config module:
 
 ```text
 Command: rtk cargo test --lib config::tests::backup_config_rejects_common_secret_shaped_unknown_yaml_fields -- --exact --nocapture
