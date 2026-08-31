@@ -6435,4 +6435,348 @@ mod tests {
             assert_no_calendar_operations(&control);
         }
     }
+
+    #[tokio::test]
+    async fn submit_owner_task_rejects_mismatched_find_response_without_mapping() {
+        for (index, mismatch) in [
+            "operation key",
+            "title",
+            "UTC interval",
+            "timezone",
+            "attendees",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let now = now();
+            let outlook_control = control(now);
+            let google_control = control(now);
+            let (store, outlook, google, outlook_session, google_session) =
+                fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+            let service = PaService::new(
+                &store,
+                &outlook,
+                &outlook_session,
+                &google,
+                &google_session,
+                &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            );
+            let verified = owner_verified(now);
+            let operation_key = format!("owner-find-boundary-{index}");
+            let prepared = service
+                .prepare_owner_task(
+                    owner_task_draft(&operation_key),
+                    Some(&format!("voice:{operation_key}")),
+                    now + Duration::hours(1),
+                    "UTC",
+                    &operation_key,
+                    &verified,
+                    "+61415850000",
+                    now,
+                )
+                .expect("prepare");
+            let expected_start = super::to_chrono_utc(prepared.starts_at()).expect("start");
+            let expected_end = super::to_chrono_utc(prepared.ends_at()).expect("end");
+            let response_range = TimeRange::new(
+                if mismatch == "UTC interval" {
+                    expected_start + ChronoDuration::minutes(15)
+                } else {
+                    expected_start
+                },
+                if mismatch == "UTC interval" {
+                    expected_end + ChronoDuration::minutes(15)
+                } else {
+                    expected_end
+                },
+            )
+            .expect("range");
+            let response = CalendarEvent::new(
+                format!("owner-find-response-{index}"),
+                if mismatch == "operation key" {
+                    "wrong-owner-operation".to_owned()
+                } else {
+                    operation_key.clone()
+                },
+                if mismatch == "title" {
+                    "Wrong title".to_owned()
+                } else {
+                    "Prepare the agenda".to_owned()
+                },
+                response_range,
+                if mismatch == "timezone" {
+                    "Australia/Sydney".to_owned()
+                } else {
+                    "UTC".to_owned()
+                },
+                if mismatch == "attendees" {
+                    vec![CalendarAttendee::needs_action(
+                        MailAddress::new("other@example.test").expect("attendee"),
+                    )]
+                } else {
+                    Vec::new()
+                },
+                outlook_control.now(),
+            )
+            .expect("response");
+            outlook
+                .queue_owner_find_response_override(response)
+                .expect("queue response");
+
+            let error = service
+                .submit_owner_task(&prepared, &verified, "+61415850000", now)
+                .await
+                .expect_err("mismatched find response must fail closed");
+            assert!(matches!(
+                error,
+                ServiceError::OutlookCalendar(ProviderError::Conflict)
+            ));
+            let placement = store
+                .load_owner_task_placement(prepared.owner_task_draft_id())
+                .expect("placement");
+            assert!(!placement.is_submitted());
+            assert!(placement.provider_event_id().is_none());
+            assert!(
+                store
+                    .list_audit_events(None, 10)
+                    .expect("audits")
+                    .is_empty()
+            );
+            assert_eq!(
+                outlook_control
+                    .invocation_count(FakeOperation::CalendarOwnerFind)
+                    .expect("find count"),
+                1
+            );
+            assert_eq!(
+                outlook_control
+                    .invocation_count(FakeOperation::CalendarBusy)
+                    .expect("outlook busy count"),
+                0
+            );
+            assert_eq!(
+                google_control
+                    .invocation_count(FakeOperation::CalendarBusy)
+                    .expect("google busy count"),
+                0
+            );
+            assert_eq!(
+                outlook_control
+                    .invocation_count(FakeOperation::CalendarOwnerCreate)
+                    .expect("create count"),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_owner_task_rejects_mismatched_create_response_without_mapping() {
+        for (index, mismatch) in [
+            "operation key",
+            "title",
+            "UTC interval",
+            "timezone",
+            "attendees",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let now = now();
+            let outlook_control = control(now);
+            let google_control = control(now);
+            let (store, outlook, google, outlook_session, google_session) =
+                fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+            let service = PaService::new(
+                &store,
+                &outlook,
+                &outlook_session,
+                &google,
+                &google_session,
+                &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            );
+            let verified = owner_verified(now);
+            let operation_key = format!("owner-create-boundary-{index}");
+            let prepared = service
+                .prepare_owner_task(
+                    owner_task_draft(&operation_key),
+                    Some(&format!("voice:{operation_key}")),
+                    now + Duration::hours(1),
+                    "UTC",
+                    &operation_key,
+                    &verified,
+                    "+61415850000",
+                    now,
+                )
+                .expect("prepare");
+            let expected_start = super::to_chrono_utc(prepared.starts_at()).expect("start");
+            let expected_end = super::to_chrono_utc(prepared.ends_at()).expect("end");
+            let response_range = TimeRange::new(
+                if mismatch == "UTC interval" {
+                    expected_start + ChronoDuration::minutes(15)
+                } else {
+                    expected_start
+                },
+                if mismatch == "UTC interval" {
+                    expected_end + ChronoDuration::minutes(15)
+                } else {
+                    expected_end
+                },
+            )
+            .expect("range");
+            let response = CalendarEvent::new(
+                format!("owner-create-response-{index}"),
+                if mismatch == "operation key" {
+                    "wrong-owner-operation".to_owned()
+                } else {
+                    operation_key.clone()
+                },
+                if mismatch == "title" {
+                    "Wrong title".to_owned()
+                } else {
+                    "Prepare the agenda".to_owned()
+                },
+                response_range,
+                if mismatch == "timezone" {
+                    "Australia/Sydney".to_owned()
+                } else {
+                    "UTC".to_owned()
+                },
+                if mismatch == "attendees" {
+                    vec![CalendarAttendee::needs_action(
+                        MailAddress::new("other@example.test").expect("attendee"),
+                    )]
+                } else {
+                    Vec::new()
+                },
+                outlook_control.now(),
+            )
+            .expect("response");
+            outlook
+                .queue_owner_create_response_override(response)
+                .expect("queue response");
+
+            let error = service
+                .submit_owner_task(&prepared, &verified, "+61415850000", now)
+                .await
+                .expect_err("mismatched create response must fail closed");
+            assert!(matches!(
+                error,
+                ServiceError::OutlookCalendar(ProviderError::Conflict)
+            ));
+            let placement = store
+                .load_owner_task_placement(prepared.owner_task_draft_id())
+                .expect("placement");
+            assert!(!placement.is_submitted());
+            assert!(placement.provider_event_id().is_none());
+            assert!(
+                store
+                    .list_audit_events(None, 10)
+                    .expect("audits")
+                    .is_empty()
+            );
+            assert_eq!(
+                outlook_control
+                    .invocation_count(FakeOperation::CalendarOwnerFind)
+                    .expect("find count"),
+                1
+            );
+            assert_eq!(
+                outlook_control
+                    .invocation_count(FakeOperation::CalendarBusy)
+                    .expect("outlook busy count"),
+                1
+            );
+            assert_eq!(
+                google_control
+                    .invocation_count(FakeOperation::CalendarBusy)
+                    .expect("google busy count"),
+                1
+            );
+            assert_eq!(
+                outlook_control
+                    .invocation_count(FakeOperation::CalendarOwnerCreate)
+                    .expect("create count"),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_owner_task_rejects_google_busy_before_create() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let google_busy = BusyInterval::new(
+            now + Duration::hours(1),
+            now + Duration::hours(1) + Duration::minutes(30),
+        )
+        .expect("google busy interval");
+        let (store, outlook, google, outlook_session, google_session) = fixture(
+            &outlook_control,
+            &google_control,
+            Vec::new(),
+            vec![google_busy],
+        );
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+        );
+        let verified = owner_verified(now);
+        let prepared = service
+            .prepare_owner_task(
+                owner_task_draft("owner-google-busy-boundary"),
+                Some("voice:owner-google-busy-boundary"),
+                now + Duration::hours(1),
+                "UTC",
+                "owner-google-busy-boundary-operation",
+                &verified,
+                "+61415850000",
+                now,
+            )
+            .expect("prepare");
+
+        let error = service
+            .submit_owner_task(&prepared, &verified, "+61415850000", now)
+            .await
+            .expect_err("Google-only busy must fail before create");
+        assert!(matches!(error, ServiceError::NoAvailability));
+        let placement = store
+            .load_owner_task_placement(prepared.owner_task_draft_id())
+            .expect("placement");
+        assert!(!placement.is_submitted());
+        assert!(placement.provider_event_id().is_none());
+        assert!(
+            store
+                .list_audit_events(None, 10)
+                .expect("audits")
+                .is_empty()
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerFind)
+                .expect("find count"),
+            1
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count"),
+            1
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerCreate)
+                .expect("create count"),
+            0
+        );
+    }
 }
