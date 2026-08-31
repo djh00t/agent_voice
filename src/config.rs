@@ -45,7 +45,9 @@ impl AppConfig {
             None => Self::default(),
         };
         config.apply_env_overrides_from_map(&std::env::vars().collect());
-        config.agent_api.oauth.normalize_and_validate()?;
+        let mut oauth = config.agent_api.oauth.clone();
+        oauth.normalize_and_validate()?;
+        config.agent_api.oauth = oauth;
         config.sync_legacy_openai_sections();
         config.validate()?;
         Ok(config)
