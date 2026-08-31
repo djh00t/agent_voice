@@ -685,10 +685,17 @@ impl Drop for CreatedTemporary {
                     return;
                 };
                 if let Some(identity) = self.identity.as_ref() {
-                    let _ = remove_if_owned_at(parent, &name, identity);
-                } else {
-                    let _ = unlink_at(parent, &name);
+                    let Some(file) = self.file.as_ref() else {
+                        return;
+                    };
+                    let Ok(current) = file.metadata() else {
+                        return;
+                    };
+                    if !same_file(identity, &current) {
+                        return;
+                    }
                 }
+                let _ = unlink_at(parent, &name);
             }
             #[cfg(not(unix))]
             {
@@ -1027,6 +1034,36 @@ mod tests {
         fs::remove_dir(&directory.path).expect("remove replacement parent");
         fs::remove_dir(&moved).expect("remove moved parent");
         assert!(!pinned_path_exists, "failed initialization removes pinned sibling");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_temporary_guard_cleanup_handles_unreadable_sibling() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let path = directory.destination("guarded.tmp");
+        let parent = fs::File::open(&directory.path).expect("test parent remains openable");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("created temporary sibling");
+        let identity = file.metadata().expect("created temporary identity");
+
+        let mut guard = super::CreatedTemporary::new(path.clone(), parent, file);
+        guard.identity = Some(identity);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
+            .expect("make temporary sibling unreadable");
+        drop(guard);
+
+        let path_exists = path.exists();
+        if path_exists {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("restore leaked sibling permissions");
+            fs::remove_file(&path).expect("remove leaked sibling after assertion");
+        }
+        assert!(!path_exists, "failed initialization removes unreadable sibling");
     }
 
     #[cfg(any(
