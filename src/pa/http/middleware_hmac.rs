@@ -7,7 +7,10 @@
 use std::fmt;
 use std::sync::Arc;
 
+use axum::body::Body;
+use futures_util::StreamExt;
 use http::HeaderMap;
+use parking_lot::Mutex;
 
 use crate::pa::auth::{self, AuthError, ReplayGuard};
 use crate::pa::store::PaStore;
@@ -19,11 +22,15 @@ pub const MAX_HTTP_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 /// A cloneable state bundle for the HMAC admission adapter.
 ///
+/// The persistent store handle is mutex-protected because its SQLite
+/// connection is not `Sync`; this keeps one replay store while allowing the
+/// admission adapter to be shared by the HTTP runtime.
+///
 /// The secret is supplied by validated runtime configuration. It is never
 /// read from a request or an ad hoc environment lookup.
 #[derive(Clone)]
 pub struct HmacAdmissionState {
-    store: Arc<PaStore>,
+    store: Arc<Mutex<PaStore>>,
     secret: Arc<[u8]>,
     clock: Arc<dyn Fn() -> i64 + Send + Sync + 'static>,
 }
@@ -31,7 +38,7 @@ pub struct HmacAdmissionState {
 impl HmacAdmissionState {
     /// Creates state from the existing PA store, validated secret, and clock.
     pub fn new<S>(
-        store: Arc<PaStore>,
+        store: Arc<Mutex<PaStore>>,
         secret: S,
         clock: impl Fn() -> i64 + Send + Sync + 'static,
     ) -> Self
@@ -105,13 +112,19 @@ impl fmt::Debug for HmacAdmissionResult {
 /// Authenticates one protected PA request against a persistent replay store.
 #[derive(Clone)]
 pub struct HmacAdmission {
-    state: HmacAdmissionState,
+    store: Arc<Mutex<PaStore>>,
+    secret: Arc<[u8]>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync + 'static>,
 }
 
 impl HmacAdmission {
     /// Creates an admission adapter from shared state.
     pub fn new(state: HmacAdmissionState) -> Self {
-        Self { state }
+        Self {
+            store: state.store,
+            secret: state.secret,
+            clock: state.clock,
+        }
     }
 
     /// Admits a request using the injected production clock.
@@ -127,14 +140,37 @@ impl HmacAdmission {
         M: AsRef<[u8]>,
         B: AsRef<[u8]>,
     {
-        self.admit_at(
-            method,
-            path_and_query,
-            body,
-            headers,
-            request_id,
-            (self.state.clock)(),
-        )
+        let now = (self.clock)();
+        self.admit_at(method, path_and_query, body, headers, request_id, now)
+    }
+
+    /// Reads and admits an Axum request body through the single bounded path.
+    #[allow(dead_code)]
+    pub(crate) async fn admit_body<M>(
+        &self,
+        method: M,
+        path_and_query: &str,
+        body: Body,
+        headers: &HeaderMap,
+        request_id: &str,
+    ) -> HmacAdmissionResult
+    where
+        M: AsRef<[u8]> + Send,
+    {
+        let body = match read_bounded_body(body).await {
+            Ok(body) => body,
+            Err(BodyReadError::TooLarge) => {
+                return HmacAdmissionResult::Rejected(ApiError::new(
+                    "request_body_too_large",
+                    "request body is too large",
+                    request_id.to_owned(),
+                ));
+            }
+            Err(BodyReadError::Invalid) => {
+                return rejected_body_invalid(request_id);
+            }
+        };
+        self.admit(method, path_and_query, body, headers, request_id)
     }
 
     /// Admits a request at a fixed timestamp for deterministic test seams.
@@ -152,60 +188,88 @@ impl HmacAdmission {
         M: AsRef<[u8]>,
         B: AsRef<[u8]>,
     {
-        let body = match buffer_body(body.as_ref()) {
-            Some(body) => body,
-            None => {
-                return HmacAdmissionResult::Rejected(ApiError::new(
-                    "request_body_too_large",
-                    "request body is too large",
-                    request_id.to_owned(),
-                ));
-            }
-        };
-        let method = match std::str::from_utf8(method.as_ref()) {
-            Ok(method) => method,
-            Err(_) => return rejected_authentication(request_id),
-        };
-
-        let timestamp = match required_header(headers, auth::X_AV_TIMESTAMP) {
-            Ok(value) => value,
-            Err(HeaderCardinality::Missing) => return rejected_required(request_id),
-            Err(HeaderCardinality::Duplicate) => return rejected_authentication(request_id),
-        };
-        let nonce = match required_header(headers, auth::X_AV_NONCE) {
-            Ok(value) => value,
-            Err(HeaderCardinality::Missing) => return rejected_required(request_id),
-            Err(HeaderCardinality::Duplicate) => return rejected_authentication(request_id),
-        };
-        let signature = match required_header(headers, auth::X_AV_SIGNATURE) {
-            Ok(value) => value,
-            Err(HeaderCardinality::Missing) => return rejected_required(request_id),
-            Err(HeaderCardinality::Duplicate) => return rejected_authentication(request_id),
-        };
-
-        let mut replay_guard = StoreReplayGuard::new(self.state.store.as_ref());
-        match auth::verify_request(
-            self.state.secret.as_ref(),
+        let store = self.store.lock();
+        admit_with_state(
+            &store,
+            self.secret.as_ref(),
             method,
             path_and_query,
-            timestamp,
-            nonce,
-            signature,
-            &body,
+            body,
+            headers,
+            request_id,
             now,
-            &mut replay_guard,
-        ) {
-            Ok(()) => HmacAdmissionResult::Accepted(AuthenticatedRequest {
-                body,
-                authenticated: AuthenticatedMarker,
-            }),
-            Err(AuthError::NonceReplay) if replay_guard.persistence_failed() => {
-                rejected_unavailable(request_id)
-            }
-            Err(AuthError::NonceReplay) => rejected_replay(request_id),
-            Err(_) if replay_guard.persistence_failed() => rejected_unavailable(request_id),
-            Err(_) => rejected_authentication(request_id),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_with_state<M, B>(
+    store: &PaStore,
+    secret: &[u8],
+    method: M,
+    path_and_query: &str,
+    body: B,
+    headers: &HeaderMap,
+    request_id: &str,
+    now: i64,
+) -> HmacAdmissionResult
+where
+    M: AsRef<[u8]>,
+    B: AsRef<[u8]>,
+{
+    let body = match buffer_body(body.as_ref()) {
+        Some(body) => body,
+        None => {
+            return HmacAdmissionResult::Rejected(ApiError::new(
+                "request_body_too_large",
+                "request body is too large",
+                request_id.to_owned(),
+            ));
         }
+    };
+    let method = match std::str::from_utf8(method.as_ref()) {
+        Ok(method) => method,
+        Err(_) => return rejected_authentication(request_id),
+    };
+
+    let timestamp = match required_header(headers, auth::X_AV_TIMESTAMP) {
+        Ok(value) => value,
+        Err(HeaderCardinality::Missing) => return rejected_required(request_id),
+        Err(HeaderCardinality::Duplicate) => return rejected_authentication(request_id),
+    };
+    let nonce = match required_header(headers, auth::X_AV_NONCE) {
+        Ok(value) => value,
+        Err(HeaderCardinality::Missing) => return rejected_required(request_id),
+        Err(HeaderCardinality::Duplicate) => return rejected_authentication(request_id),
+    };
+    let signature = match required_header(headers, auth::X_AV_SIGNATURE) {
+        Ok(value) => value,
+        Err(HeaderCardinality::Missing) => return rejected_required(request_id),
+        Err(HeaderCardinality::Duplicate) => return rejected_authentication(request_id),
+    };
+
+    let mut replay_guard = StoreReplayGuard::new(store);
+    match auth::verify_request(
+        secret,
+        method,
+        path_and_query,
+        timestamp,
+        nonce,
+        signature,
+        &body,
+        now,
+        &mut replay_guard,
+    ) {
+        Ok(()) => HmacAdmissionResult::Accepted(AuthenticatedRequest {
+            body,
+            authenticated: AuthenticatedMarker,
+        }),
+        Err(AuthError::NonceReplay) if replay_guard.persistence_failed() => {
+            rejected_unavailable(request_id)
+        }
+        Err(AuthError::NonceReplay) => rejected_replay(request_id),
+        Err(_) if replay_guard.persistence_failed() => rejected_unavailable(request_id),
+        Err(_) => rejected_authentication(request_id),
     }
 }
 
@@ -220,6 +284,28 @@ fn buffer_body(body: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(body.to_vec())
+}
+
+/// Reads one HTTP body stream, stopping as soon as the byte bound is exceeded.
+#[allow(dead_code)]
+pub(crate) async fn read_bounded_body(body: Body) -> Result<Vec<u8>, BodyReadError> {
+    let mut stream = body.into_data_stream();
+    let mut buffered = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| BodyReadError::Invalid)?;
+        if chunk.len() > MAX_HTTP_REQUEST_BODY_BYTES.saturating_sub(buffered.len()) {
+            return Err(BodyReadError::TooLarge);
+        }
+        buffered.extend_from_slice(&chunk);
+    }
+    Ok(buffered)
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) enum BodyReadError {
+    TooLarge,
+    Invalid,
 }
 
 fn required_header<'a>(
@@ -282,6 +368,15 @@ fn rejected_authentication(request_id: &str) -> HmacAdmissionResult {
     HmacAdmissionResult::Rejected(ApiError::new(
         "authentication_failed",
         "authentication failed",
+        request_id.to_owned(),
+    ))
+}
+
+#[allow(dead_code)]
+fn rejected_body_invalid(request_id: &str) -> HmacAdmissionResult {
+    HmacAdmissionResult::Rejected(ApiError::new(
+        "request_body_invalid",
+        "request body is invalid",
         request_id.to_owned(),
     ))
 }
