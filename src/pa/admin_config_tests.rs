@@ -117,6 +117,21 @@ fn admin_config_exact_json_and_validation() {
             .expect_err("duplicate patch field should be rejected");
     assert!(!duplicate.to_string().contains("second"));
 
+    let invalid_working_day =
+        serde_json::from_str::<AdminConfigPatch>(r#"{"working_days":["sentinel-working-day"]}"#)
+            .expect_err("unknown working day should be rejected");
+    assert!(
+        invalid_working_day
+            .to_string()
+            .starts_with("working_days contains an unsupported value")
+    );
+    assert!(
+        !invalid_working_day
+            .to_string()
+            .contains("sentinel-working-day")
+    );
+    assert!(!format!("{invalid_working_day:?}").contains("sentinel-working-day"));
+
     for patch in [
         AdminConfigPatch {
             working_days: Some(vec![WorkingDay::Monday, WorkingDay::Monday]),
