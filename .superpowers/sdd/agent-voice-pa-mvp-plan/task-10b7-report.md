@@ -5,7 +5,7 @@
 - **Evidence date:** 2026-08-31 (Australia/Sydney)
 - **Worktree:** `/Users/djh/.codex/worktrees/agent_voice-224`
 - **Branch:** `codex/issue-224`
-- **Base:** `bc2edf55eae758c6cfe0475f25ad76a331276a6b` (`origin/main`)
+- **Base:** `5799e89978e335783f8c05b14b2b04cf9292251c` (`origin/main`)
 
 ## Contract and readback
 
@@ -30,7 +30,9 @@ The final package owns exactly these three paths:
 
 - `src/realtime/server_response_events.rs`: closed response status,
   interruption reason, provider error, response summary, and `response.done`
-  values, plus inline focused tests.
+  values, plus inline focused tests. `ResponseSummary::new` validates
+  construction, and its serializer validates direct public values at the
+  serialization boundary.
 - `tests/realtime_server_response_events_contract.rs`: the amended guarded
   pre-registration harness. It exposes a test-only `realtime::values` alias,
   includes the real values module, and includes the real response source by
@@ -107,11 +109,40 @@ exit 0
 cargo test: 3 passed (1 suite, 0.00s)
 ```
 
+The review repair was developed with a genuine RED/GREEN cycle. After the
+regression assertions were added but before the construction and serialization
+boundary was repaired, the exact selector failed with the expected missing
+constructor errors:
+
+```text
+rtk cargo test --test realtime_server_response_events_contract server_response_events::tests::response_done_interruptions -- --exact
+exit 101
+error[E0599]: no function or associated item named `new` found for struct `ResponseSummary`
+at tests/realtime_server_response_events_contract.rs:215 and :242
+2 errors, 1 warning
+```
+
+After `5200a2c`, the same selector passed and covered both invalid paths and a
+valid cancelled round trip:
+
+```text
+rtk cargo test --test realtime_server_response_events_contract server_response_events::tests::response_done_interruptions -- --exact
+exit 0
+cargo test: 1 passed, 2 filtered out (1 suite, 0.00s)
+```
+
+The invalid constructor returns the shared redacted
+`InvalidInterruptionReason` classification. Direct public construction cannot
+serialize a non-cancelled response with a reason: both `ResponseSummary` and
+the enclosing `response.done` event fail at serialization. A cancelled value
+constructed with `ResponseSummary::new` serializes and deserializes unchanged.
+
 The focused test covers all five statuses, both cancellation reasons,
-cancellation-only reason validation, optional status details and provider
-error fields, required/null IDs and response/status fields, unknown statuses,
-unknown reasons, unknown tags/fields, malformed JSON, exact snake_case wire
-values, and redaction of rejected payloads and successful-value debug output.
+cancellation-only reason validation at construction and serialization,
+optional status details and provider error fields, required/null IDs and
+response/status fields, unknown statuses, unknown reasons, unknown tags/fields,
+malformed JSON, exact snake_case wire values, and redaction of rejected
+payloads and successful-value debug output.
 
 ## Checks
 
@@ -166,13 +197,32 @@ authenticated UAT were not run or observed locally.
 
 ## Delivery readback
 
-Package commits are one-file atomic commits:
+Package commits are one-file atomic commits. The original pre-rebase delivery
+readback was:
 
 - `a9be996` — harness only: `tests/realtime_server_response_events_contract.rs`
 - `90cc705` — implementation and inline test only:
   `src/realtime/server_response_events.rs`
 - `6687be0` — report only:
   `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
+- `eae96d8` — final report-only readback:
+  `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
+
+After rebasing onto the current `origin/main`, the equivalent delivery and
+repair commits are:
+
+- `433a330` — harness only: `tests/realtime_server_response_events_contract.rs`
+- `b6ccca2` — implementation and inline test only:
+  `src/realtime/server_response_events.rs`
+- `2928aeb` — report only:
+  `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
+- `6eff69b` — report-only finalization:
+  `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
+- `5200a2c` — repair implementation and regression test only:
+  `src/realtime/server_response_events.rs`
+
+This report update is the next report-only repair commit and records the
+review evidence above; all listed commits preserve the exact-one-file rule.
 
 The delivering PR footer is exactly:
 
