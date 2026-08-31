@@ -1,10 +1,17 @@
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+use rustix::fs::RenameFlags;
 #[cfg(unix)]
-use std::ffi::{CStr, CString};
+use rustix::{
+    fs::{self as rustix_fs, AtFlags, FileType, Mode, OFlags},
+};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Write};
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(windows)]
@@ -125,43 +132,6 @@ impl From<WriterFault> for FaultStage {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-unsafe extern "C" {
-    fn renameat2(
-        old_directory: std::os::raw::c_int,
-        old_path: *const std::os::raw::c_char,
-        new_directory: std::os::raw::c_int,
-        new_path: *const std::os::raw::c_char,
-        flags: std::os::raw::c_uint,
-    ) -> std::os::raw::c_int;
-}
-
-#[cfg(unix)]
-unsafe extern "C" {
-    fn openat(
-        directory: std::os::raw::c_int,
-        path: *const std::os::raw::c_char,
-        flags: std::os::raw::c_int,
-        mode: std::os::raw::c_uint,
-    ) -> std::os::raw::c_int;
-    fn unlinkat(
-        directory: std::os::raw::c_int,
-        path: *const std::os::raw::c_char,
-        flags: std::os::raw::c_int,
-    ) -> std::os::raw::c_int;
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-unsafe extern "C" {
-    fn renameatx_np(
-        old_directory: std::os::raw::c_int,
-        old_path: *const std::os::raw::c_char,
-        new_directory: std::os::raw::c_int,
-        new_path: *const std::os::raw::c_char,
-        flags: std::os::raw::c_uint,
-    ) -> std::os::raw::c_int;
-}
-
 #[cfg(all(test, unix))]
 static PUBLICATION_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
 
@@ -190,30 +160,6 @@ fn wait_for_publication_race() {
         barrier.wait();
         barrier.wait();
     }
-}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-#[repr(C, align(8))]
-struct RawStatStorage([u8; 256]);
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-))]
-unsafe extern "C" {
-    fn fstatat(
-        directory: std::os::raw::c_int,
-        path: *const std::os::raw::c_char,
-        stat: *mut RawStatStorage,
-        flags: std::os::raw::c_int,
-    ) -> std::os::raw::c_int;
 }
 
 #[cfg(all(test, unix))]
@@ -340,18 +286,18 @@ fn publish_without_replacement_owned(
 ) -> io::Result<()> {
     let source_name = path_name(source)?;
     let destination_name = path_name(destination)?;
-    if !path_matches_identity_at(parent, &source_name, source_identity) {
+    if !path_matches_identity_at(parent, source_name, source_identity) {
         return Err(io::Error::other("temporary file identity changed"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        rename_without_replacement_linux(parent, &source_name, &destination_name)
+        rename_without_replacement_linux(parent, source_name, destination_name)
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        rename_without_replacement_darwin(parent, &source_name, &destination_name)
+        rename_without_replacement_darwin(parent, source_name, destination_name)
     }
 
     #[cfg(not(any(
@@ -384,144 +330,64 @@ fn publish_without_replacement_owned(
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn rename_without_replacement_linux(
     parent: &File,
-    source: &CStr,
-    destination: &CStr,
+    source: &std::ffi::OsStr,
+    destination: &std::ffi::OsStr,
 ) -> io::Result<()> {
-    const RENAME_NOREPLACE: std::os::raw::c_uint = 1;
-
-    let result = unsafe {
-        renameat2(
-            parent.as_raw_fd(),
-            source.as_ptr(),
-            parent.as_raw_fd(),
-            destination.as_ptr(),
-            RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    Ok(rustix_fs::renameat_with(
+        parent,
+        source,
+        parent,
+        destination,
+        RenameFlags::NOREPLACE,
+    )?)
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn rename_without_replacement_darwin(
     parent: &File,
-    source: &CStr,
-    destination: &CStr,
+    source: &std::ffi::OsStr,
+    destination: &std::ffi::OsStr,
 ) -> io::Result<()> {
-    const RENAME_EXCL: std::os::raw::c_uint = 0x00000004;
-    const RENAME_NOFOLLOW_ANY: std::os::raw::c_uint = 0x00000010;
-
-    let result = unsafe {
-        renameatx_np(
-            parent.as_raw_fd(),
-            source.as_ptr(),
-            parent.as_raw_fd(),
-            destination.as_ptr(),
-            RENAME_EXCL | RENAME_NOFOLLOW_ANY,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    Ok(rustix_fs::renameat_with(
+        parent,
+        source,
+        parent,
+        destination,
+        RenameFlags::NOREPLACE,
+    )?)
 }
 
 #[cfg(unix)]
-fn path_name(path: &Path) -> io::Result<CString> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "path has no file name"))?;
-    CString::new(name.as_bytes())
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "path contains NUL"))
+fn path_name(path: &Path) -> io::Result<&std::ffi::OsStr> {
+    path.file_name()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "path has no file name"))
 }
 
 #[cfg(all(test, unix))]
-fn open_at(parent: &File, name: &CStr) -> io::Result<File> {
-    let flags = no_follow_open_flags()?;
-    open_at_with_flags(parent, name, flags, 0)
+fn open_at(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
+    let descriptor = rustix_fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    Ok(File::from(descriptor))
 }
 
 #[cfg(unix)]
-fn open_at_with_flags(
-    parent: &File,
-    name: &CStr,
-    flags: std::os::raw::c_int,
-    mode: std::os::raw::c_uint,
-) -> io::Result<File> {
-    let descriptor = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags, mode) };
-    if descriptor < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(descriptor) })
-}
-
-#[cfg(all(test, unix))]
-fn no_follow_open_flags() -> io::Result<std::os::raw::c_int> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        Ok(0o400000 | 0o4000 | 0o2000000)
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        Ok(0x100 | 0x4 | 0x01000000)
-    }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios"
-    )))]
-    {
-        Err(io::Error::new(
-            ErrorKind::Unsupported,
-            "no-follow directory entry access is unavailable on this platform",
-        ))
-    }
+fn open_temporary_at(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
+    let descriptor = rustix_fs::openat(
+        parent,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    Ok(File::from(descriptor))
 }
 
 #[cfg(unix)]
-fn temporary_open_flags() -> io::Result<std::os::raw::c_int> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        Ok(0o2 | 0o100 | 0o200 | 0o400000 | 0o2000000)
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        Ok(0x0002 | 0x0200 | 0x0800 | 0x0100 | 0x01000000)
-    }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios"
-    )))]
-    {
-        Err(io::Error::new(
-            ErrorKind::Unsupported,
-            "exclusive no-follow temporary creation is unavailable on this platform",
-        ))
-    }
-}
-
-#[cfg(unix)]
-fn open_temporary_at(parent: &File, name: &CStr) -> io::Result<File> {
-    open_at_with_flags(parent, name, temporary_open_flags()?, 0o600)
-}
-
-#[cfg(unix)]
-fn unlink_at(parent: &File, name: &CStr) -> io::Result<()> {
-    let result = unsafe { unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+fn unlink_at(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
+    Ok(rustix_fs::unlinkat(parent, name, AtFlags::empty())?)
 }
 
 fn remove_if_owned(path: &Path, identity: &fs::Metadata) {
@@ -555,49 +421,23 @@ fn metadata_identity(metadata: &fs::Metadata) -> (u64, u64, bool) {
     target_os = "macos",
     target_os = "ios"
 ))]
-fn entry_identity_at(parent: &File, name: &CStr) -> io::Result<(u64, u64, bool)> {
-    let mut stat = RawStatStorage([0; 256]);
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const AT_SYMLINK_NOFOLLOW: std::os::raw::c_int = 0x0100;
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    const AT_SYMLINK_NOFOLLOW: std::os::raw::c_int = 0x0020;
+fn entry_metadata_at(parent: &File, name: &Path) -> io::Result<rustix_fs::Stat> {
+    Ok(rustix_fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?)
+}
 
-    let result = unsafe {
-        fstatat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            &mut stat,
-            AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let device = {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            unsafe { std::ptr::read_unaligned(stat.0.as_ptr().cast::<u64>()) }
-        }
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            u64::from(unsafe { std::ptr::read_unaligned(stat.0.as_ptr().cast::<u32>()) })
-        }
-    };
-    let inode = unsafe { std::ptr::read_unaligned(stat.0.as_ptr().add(8).cast::<u64>()) };
-    let is_symlink = {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            let mode = unsafe { std::ptr::read_unaligned(stat.0.as_ptr().add(24).cast::<u32>()) };
-            mode & 0o170000 == 0o120000
-        }
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            let mode = unsafe { std::ptr::read_unaligned(stat.0.as_ptr().add(4).cast::<u16>()) };
-            u32::from(mode) & 0o170000 == 0o120000
-        }
-    };
-    Ok((device, inode, is_symlink))
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn entry_identity_at(parent: &File, name: &std::ffi::OsStr) -> io::Result<(u64, u64, bool)> {
+    let stat = entry_metadata_at(parent, Path::new(name))?;
+    Ok((
+        stat.st_dev as u64,
+        stat.st_ino as u64,
+        FileType::from_raw_mode(stat.st_mode) == FileType::Symlink,
+    ))
 }
 
 #[cfg(all(
@@ -609,7 +449,7 @@ fn entry_identity_at(parent: &File, name: &CStr) -> io::Result<(u64, u64, bool)>
         target_os = "ios"
     ))
 ))]
-fn entry_identity_at(_parent: &File, _name: &CStr) -> io::Result<(u64, u64, bool)> {
+fn entry_identity_at(_parent: &File, _name: &std::ffi::OsStr) -> io::Result<(u64, u64, bool)> {
     Err(io::Error::new(
         ErrorKind::Unsupported,
         "handle-relative metadata access is unavailable on this platform",
@@ -617,14 +457,18 @@ fn entry_identity_at(_parent: &File, _name: &CStr) -> io::Result<(u64, u64, bool
 }
 
 #[cfg(unix)]
-fn path_matches_identity_at(parent: &File, name: &CStr, identity: &fs::Metadata) -> bool {
+fn path_matches_identity_at(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    identity: &fs::Metadata,
+) -> bool {
     entry_identity_at(parent, name)
         .map(|current| !current.2 && current == metadata_identity(identity))
         .unwrap_or(false)
 }
 
 #[cfg(unix)]
-fn remove_if_owned_at(parent: &File, name: &CStr, identity: &fs::Metadata) -> bool {
+fn remove_if_owned_at(parent: &File, name: &std::ffi::OsStr, identity: &fs::Metadata) -> bool {
     let Ok(current) = entry_identity_at(parent, name) else {
         return false;
     };
@@ -651,6 +495,11 @@ fn same_file(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
+fn trusted_parent_stat(stat: &rustix_fs::Stat) -> bool {
+    stat.st_mode & 0o022 == 0
+}
+
+#[cfg(unix)]
 fn destination_parent(destination: &Path) -> Result<&Path, WriterError> {
     if destination.file_name().is_none() {
         return Err(WriterError::InvalidDestination);
@@ -661,10 +510,6 @@ fn destination_parent(destination: &Path) -> Result<&Path, WriterError> {
         .unwrap_or_else(|| Path::new("."));
     let metadata = fs::symlink_metadata(parent).map_err(|_| WriterError::InvalidDestination)?;
     if !metadata.is_dir() {
-        return Err(WriterError::InvalidDestination);
-    }
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o022 != 0 {
         return Err(WriterError::InvalidDestination);
     }
     Ok(parent)
@@ -683,10 +528,11 @@ fn open_parent_directory(parent: &Path) -> Result<File, WriterError> {
         .map_err(|_| WriterError::InvalidDestination)?;
     let path_metadata =
         fs::symlink_metadata(parent).map_err(|_| WriterError::InvalidDestination)?;
-    if !handle_metadata.is_dir() || !same_file(&handle_metadata, &path_metadata) {
-        return Err(WriterError::InvalidDestination);
-    }
-    if handle_metadata.permissions().mode() & 0o022 != 0 {
+    let stat = rustix_fs::fstat(&directory).map_err(|_| WriterError::InvalidDestination)?;
+    if !handle_metadata.is_dir()
+        || !same_file(&handle_metadata, &path_metadata)
+        || !trusted_parent_stat(&stat)
+    {
         return Err(WriterError::InvalidDestination);
     }
     Ok(directory)
@@ -700,7 +546,7 @@ fn open_parent_directory(_parent: &Path) -> Result<File, WriterError> {
 #[cfg(unix)]
 fn ensure_destination_absent_at(parent: &File, destination: &Path) -> Result<(), WriterError> {
     let name = path_name(destination).map_err(|_| WriterError::InvalidDestination)?;
-    match entry_identity_at(parent, &name) {
+    match entry_identity_at(parent, name) {
         Ok(_) => Err(WriterError::DestinationExists),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(_) => Err(WriterError::InvalidDestination),
@@ -781,10 +627,10 @@ impl Drop for CreatedTemporary {
                     return;
                 };
                 if let Some(identity) = self.identity.as_ref() {
-                    let _ = remove_if_owned_at(parent, &name, identity);
+                    let _ = remove_if_owned_at(parent, name, identity);
                     return;
                 }
-                let _ = unlink_at(parent, &name);
+                let _ = unlink_at(parent, name);
             }
             #[cfg(not(unix))]
             {
@@ -820,7 +666,7 @@ impl TemporaryFile {
             #[cfg(unix)]
             let open_result = {
                 let name = path_name(&path).map_err(|_| WriterError::Write)?;
-                open_temporary_at(&parent_handle, &name)
+                open_temporary_at(&parent_handle, name)
             };
             #[cfg(not(unix))]
             let open_result: io::Result<File> = Err(io::Error::new(
@@ -870,7 +716,7 @@ impl TemporaryFile {
     fn ensure_owned(&self) -> Result<(), WriterError> {
         #[cfg(unix)]
         let owned = path_name(&self.path)
-            .map(|name| path_matches_identity_at(&self.parent, &name, &self.identity))
+            .map(|name| path_matches_identity_at(&self.parent, name, &self.identity))
             .unwrap_or(false);
         #[cfg(not(unix))]
         let owned = path_matches_identity(&self.path, &self.identity);
@@ -898,7 +744,7 @@ impl Drop for TemporaryFile {
             #[cfg(unix)]
             {
                 let removed = path_name(&self.path)
-                    .map(|name| remove_if_owned_at(&self.parent, &name, &self.identity))
+                    .map(|name| remove_if_owned_at(&self.parent, name, &self.identity))
                     .unwrap_or(false);
                 if !removed {
                     remove_if_owned(&self.path, &self.identity);
@@ -926,6 +772,13 @@ fn sync_parent_directory(_parent: &File) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    use rustix::io::{FdFlags, fcntl_getfd};
     use std::error::Error;
     use std::fs;
     #[cfg(any(
@@ -935,15 +788,8 @@ mod tests {
         target_os = "ios"
     ))]
     use std::os::unix::fs::symlink;
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios"
-    ))]
-    use std::os::fd::AsRawFd;
     #[cfg(unix)]
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(any(
@@ -956,20 +802,6 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use super::{AtomicSnapshotWriter, WriterError, WriterFault, write_with_fault};
-
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios"
-    ))]
-    unsafe extern "C" {
-        fn fcntl(
-            descriptor: std::os::raw::c_int,
-            command: std::os::raw::c_int,
-            ...,
-        ) -> std::os::raw::c_int;
-    }
 
     const SNAPSHOT: &[u8] = b"agent-voice-encoded-snapshot-v1";
     const TEST_PAYLOAD: &[u8] =
@@ -1122,7 +954,10 @@ mod tests {
         fs::remove_file(&path).expect("remove replacement sibling");
         fs::remove_dir(&directory.path).expect("remove replacement parent");
         fs::remove_dir(&moved).expect("remove moved parent");
-        assert!(!pinned_path_exists, "failed initialization removes pinned sibling");
+        assert!(
+            !pinned_path_exists,
+            "failed initialization removes pinned sibling"
+        );
     }
 
     #[cfg(unix)]
@@ -1152,7 +987,10 @@ mod tests {
                 .expect("restore leaked sibling permissions");
             fs::remove_file(&path).expect("remove leaked sibling after assertion");
         }
-        assert!(!path_exists, "failed initialization removes unreadable sibling");
+        assert!(
+            !path_exists,
+            "failed initialization removes unreadable sibling"
+        );
     }
 
     #[cfg(any(
@@ -1240,9 +1078,6 @@ mod tests {
     ))]
     #[test]
     fn raw_openat_descriptors_are_close_on_exec() {
-        const F_GETFD: std::os::raw::c_int = 1;
-        const FD_CLOEXEC: std::os::raw::c_int = 1;
-
         let _lock = lock_tests();
         let directory = TestDirectory::new();
         let destination = directory.destination("destination.bin");
@@ -1253,17 +1088,19 @@ mod tests {
             .file
             .as_ref()
             .expect("temporary file remains open");
-        let temporary_flags = unsafe { fcntl(temporary_file.as_raw_fd(), F_GETFD) };
         assert!(
-            temporary_flags >= 0 && temporary_flags & FD_CLOEXEC != 0,
+            fcntl_getfd(temporary_file)
+                .expect("temporary descriptor flags")
+                .contains(FdFlags::CLOEXEC),
             "temporary openat descriptor must be close-on-exec"
         );
 
         let name = super::path_name(temporary.path()).expect("temporary sibling has a name");
-        let probe = super::open_at(&temporary.parent, &name).expect("open temporary identity");
-        let probe_flags = unsafe { fcntl(probe.as_raw_fd(), F_GETFD) };
+        let probe = super::open_at(&temporary.parent, name).expect("open temporary identity");
         assert!(
-            probe_flags >= 0 && probe_flags & FD_CLOEXEC != 0,
+            fcntl_getfd(&probe)
+                .expect("identity descriptor flags")
+                .contains(FdFlags::CLOEXEC),
             "identity openat descriptor must be close-on-exec"
         );
     }
@@ -1589,6 +1426,28 @@ mod tests {
         assert_eq!(result, Err(WriterError::InvalidDestination));
         assert!(!destination.exists());
         assert!(directory.temporary_entries().is_empty());
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn handle_relative_stat_reports_the_real_file_identity() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let entry = directory.destination("entry.bin");
+        fs::write(&entry, SNAPSHOT).expect("write entry");
+        let parent = fs::File::open(&directory.path).expect("open parent");
+        let stat = super::entry_metadata_at(&parent, Path::new("entry.bin"))
+            .expect("no-follow entry metadata");
+        let metadata = fs::symlink_metadata(&entry).expect("entry metadata");
+
+        assert_eq!(stat.st_dev as u64, metadata.dev());
+        assert_eq!(stat.st_ino as u64, metadata.ino());
+        assert_eq!(stat.st_mode & 0o170000, 0o100000);
     }
 
     #[cfg(any(
