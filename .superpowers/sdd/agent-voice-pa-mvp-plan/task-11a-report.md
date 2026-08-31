@@ -433,8 +433,9 @@ reported all five checks green:
 | Analyze (rust) | PASS | [CodeQL job 99559816427](https://github.com/djh00t/agent_voice/actions/runs/33413884007/job/99559816427) |
 | CodeQL aggregate | PASS | [aggregate run 99560043383](https://github.com/djh00t/agent_voice/runs/99560043383) |
 
-At the current repair head `d6e03cb8dc476f499e5cdb6d3aea5525be03c785`, the
-fresh CI run is partially complete:
+At historical implementation-head snapshot
+`d6e03cb8dc476f499e5cdb6d3aea5525be03c785`, the fresh CI run is partially
+complete:
 
 | Check | Result | Evidence |
 | --- | --- | --- |
@@ -444,8 +445,8 @@ fresh CI run is partially complete:
 | Analyze (rust) | PENDING | [CodeQL job 99574696812](https://github.com/djh00t/agent_voice/actions/runs/33418456384/job/99574696812) |
 | CodeQL aggregate | NEUTRAL / SKIPPING | [aggregate run 99574940345](https://github.com/djh00t/agent_voice/runs/99574940345) |
 
-At the current implementation head `c8ddc77f45931a02ad7b7f82ccb02488858034c5`,
-all five checks are green:
+At historical implementation-head snapshot
+`c8ddc77f45931a02ad7b7f82ccb02488858034c5`, all five checks are green:
 
 | Check | Result | Evidence |
 | --- | --- | --- |
