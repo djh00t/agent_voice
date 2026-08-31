@@ -106,8 +106,11 @@ impl AppConfig {
         let mut quote = None;
         let mut escaped = false;
         let mut start = 0;
+        let bytes = value.as_bytes();
+        let mut index = 0;
 
-        for (index, byte) in value.bytes().enumerate() {
+        while index < bytes.len() {
+            let byte = bytes[index];
             match quote {
                 Some(b'"') => {
                     if escaped {
@@ -120,7 +123,8 @@ impl AppConfig {
                 }
                 Some(b'\'') => {
                     if byte == b'\'' {
-                        if value.as_bytes().get(index + 1) == Some(&b'\'') {
+                        if bytes.get(index + 1) == Some(&b'\'') {
+                            index += 2;
                             continue;
                         }
                         quote = None;
@@ -136,6 +140,7 @@ impl AppConfig {
                     _ => {}
                 },
             }
+            index += 1;
         }
 
         entries.push(&value[start..]);
@@ -4164,6 +4169,27 @@ agent_api:
             "backup.retention_days: invalid_retention",
             "+30",
             "flow-quoted-hash-comment",
+        );
+    }
+
+    #[test]
+    fn app_config_load_rejects_flow_policy_literal_after_doubled_single_quote() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml = replace_backup_yaml_mapping(
+            &base_yaml,
+            "backup: { temp_dir: 'foo'', x', retention_days: +30 }",
+        );
+
+        assert_backup_policy_load_error(
+            yaml,
+            "backup.retention_days: invalid_retention",
+            "+30",
+            "flow-doubled-single-quote",
         );
     }
 
