@@ -577,10 +577,24 @@ impl<'de> Deserialize<'de> for BackupConfig {
 
 fn is_secret_shaped_backup_field(field: &str) -> bool {
     let normalized = field.to_ascii_lowercase().replace(['-', '.'], "_");
-    normalized.contains("master_key")
-        || normalized.contains("raw_secret")
-        || normalized == "raw_key"
-        || normalized == "secret"
+    // Keep this classification closed to credential-shaped names and known
+    // compound variants; ordinary unknown keys must retain serde's generic error.
+    let exact_secret_fields = matches!(
+        normalized.as_str(),
+        "access_token"
+            | "credentials"
+            | "master_key"
+            | "raw_key"
+            | "raw_secret"
+            | "secret"
+            | "secret_access_key"
+            | "secret_key"
+    );
+    let segments = normalized.split('_').collect::<Vec<_>>();
+    exact_secret_fields
+        || segments
+            .windows(2)
+            .any(|pair| matches!(pair, ["master", "key"] | ["raw", "secret"]))
 }
 
 impl Default for BackupConfig {
@@ -3524,6 +3538,34 @@ agent_api:
                 .unwrap_err()
                 .to_string();
             assert_eq!(error, "backup: secret_field_rejected");
+            assert!(!error.contains("do-not-log-this"));
+        }
+    }
+
+    #[test]
+    fn backup_config_rejects_common_secret_shaped_unknown_yaml_fields() {
+        for field in [
+            "secret_key",
+            "secret_access_key",
+            "access_token",
+            "credentials",
+        ] {
+            let yaml =
+                format!("enabled: true\nbucket: agent-voice-test\n{field}: do-not-log-this\n");
+            let error = serde_yaml::from_str::<BackupConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "backup: secret_field_rejected");
+            assert!(!error.contains("do-not-log-this"));
+        }
+
+        for field in ["object_key", "monkey"] {
+            let yaml =
+                format!("enabled: true\nbucket: agent-voice-test\n{field}: do-not-log-this\n");
+            let error = serde_yaml::from_str::<BackupConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("unknown field `{field}`")));
             assert!(!error.contains("do-not-log-this"));
         }
     }
