@@ -5,7 +5,7 @@
 - **Evidence date:** 2026-08-31 (Australia/Sydney)
 - **Base revision:** `a20a28b` (`origin/main` after #305/#306/#307/#309)
 - **Implementation revision:** `498eff8`
-- **Readback timestamp:** `2026-08-31T13:56:46Z`
+- **Readback timestamp:** `2026-08-31T14:00:10Z`
 
 ## Contract and prerequisite readback
 
@@ -53,6 +53,7 @@ The implementation history is one-file and one-logical-change per commit:
 - `91bb984` — evidence refresh after integrating current main (`.superpowers/sdd/agent-voice-pa-mvp-plan/task-9c-a-cursor-report.md`)
 - `91d4cbe` — final post-rebase selector and gate evidence (`.superpowers/sdd/agent-voice-pa-mvp-plan/task-9c-a-cursor-report.md`)
 - `2cd5f94` — remove the obsolete post-#306 rollback instruction (`.superpowers/sdd/agent-voice-pa-mvp-plan/task-9c-a-cursor-report.md`)
+- `3f88539` — finalize cursor handoff evidence (`.superpowers/sdd/agent-voice-pa-mvp-plan/task-9c-a-cursor-report.md`)
 - `HEAD` — this final report-only commit (self-reference intentionally has no literal SHA; `.superpowers/sdd/agent-voice-pa-mvp-plan/task-9c-a-cursor-report.md`)
 
 The final changed-path readback after the report commit must contain only
@@ -136,7 +137,7 @@ redacted invalid/corrupt-state errors. They do not print fixture values.
 | `rtk rustfmt --edition 2024 --check src/pa/store.rs` | PASS, exit 0 |
 | `rtk git diff --check -- src/pa/store.rs` | PASS, exit 0 |
 | `rtk make docs-install` | PASS, exit 0; checked-in website lockfile used |
-| `rtk make check` | PASS, exit 0; 551 Rust tests, Clippy, rustdoc, and Docusaurus completed after the final validation fix |
+| `rtk make check` | PASS, exit 0; 570 Rust tests, Clippy, rustdoc, and Docusaurus completed after the final validation fix |
 
 The first `rtk make check` attempt exited 2 at `docs-build` because the fresh
 worktree did not yet have the checked-in website dependencies installed. No
@@ -165,7 +166,7 @@ changed.
 - `{tier: LOCAL, kind: GREEN, selector_or_scope: src/pa/store.rs formatting, command_or_check: scoped rustfmt check, expected: no formatting diff, exit_code: 0, observed_redacted: clean, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
 - `{tier: LOCAL, kind: GREEN, selector_or_scope: owned diff whitespace, command_or_check: scoped git diff check, expected: no whitespace errors, exit_code: 0, observed_redacted: clean, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
 - `{tier: LOCAL, kind: GREEN, selector_or_scope: repository changed-scope gate, command_or_check: rtk make check after locked docs setup, expected: Rust tests, Clippy, rustdoc, and Docusaurus pass, exit_code: 0, observed_redacted: complete gate passed after final validation fix and main integration rebase, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
-- `{tier: LOCAL, kind: NOT_RUN, selector_or_scope: whole-tree formatting, command_or_check: rtk cargo fmt --all -- --check, expected: exit 0, exit_code: 1, observed_redacted: pre-existing drift only in out-of-scope files, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
+- `{tier: LOCAL, kind: REVIEW, selector_or_scope: whole-tree formatting, command_or_check: rtk cargo fmt --all -- --check, expected: 0 differences, exit_code: 1, observed_redacted: executed check found pre-existing drift only in out-of-scope files; owned file remains clean, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
 - `{tier: STATIC, kind: REVIEW, selector_or_scope: prerequisite and ownership readback, command_or_check: issue/PR state readback, merge-ancestor check, and origin-main diff review, expected: merged gates and only owned cursor paths, exit_code: 0, observed_redacted: #136/#142/#157 merged and closed; #88 blocked coordination parent; #306 merged; source diff limited to cursor source/tests after final rebase, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
 - `{tier: STATIC, kind: REVIEW, selector_or_scope: validation clarification, command_or_check: #290 binding clarification and #157 provider validator readback, expected: distinct stream/cursor alphabets, exit_code: 0, observed_redacted: cursor provider-compatible printable ASCII; stream machine-safe; no normalization, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
 - `{tier: STATIC, kind: REVIEW, selector_or_scope: CAS and redaction boundary, command_or_check: source symbol and diff scan, expected: one immediate parameterized CAS and fixed errors, exit_code: 0, observed_redacted: no legacy save/delete cursor API, no migration, and no raw fixture value in test output, source_revision: 498eff8, timestamp_utc: 2026-08-31T13:38:00Z}`
@@ -186,10 +187,13 @@ with the exact selectors and full local gate rerun above. The atomicity finding
 was checked against the exhaustive per-commit file list, and the malformed
 report message was reworded during the interactive rebase. Fresh review of
 `91d4cbe` found one stale rollback sentence about #306; docs-only repairs
-`2cd5f94` and `HEAD` remove that sentence and complete the exact delivery
-history/readback. The final pushed head has five green CI checks; a fresh
-independent review remains the handoff verification step. No unresolved
-implementation finding is claimed here.
+`2cd5f94` and `3f88539` removed that sentence and completed the exact delivery
+history/readback. Fresh review of `3f88539` also corrected the final 570-test
+gate count and classified the executed whole-tree formatter residual as a
+review finding rather than an unexecuted check; `HEAD` records this repair.
+The final pushed head has five green CI checks; a fresh independent review
+remains the handoff verification step. No unresolved implementation finding is
+claimed here.
 
 Rollback is a reviewed reverse-order revert of the report, implementation, and
 test commits. It does not remove the existing encrypted schema or durable data,
