@@ -6705,7 +6705,14 @@ fn validate_message_identifier(value: String, field: &'static str) -> StoreResul
 }
 
 fn validate_provider_cursor_identifier(value: String, field: &'static str) -> StoreResult<String> {
-    validate_machine_identifier_with_limit(value, field, MAX_PROVIDER_CURSOR_LENGTH)
+    if value.trim().is_empty()
+        || value.len() > MAX_PROVIDER_CURSOR_LENGTH
+        || !value.is_ascii()
+        || value.chars().any(char::is_control)
+    {
+        return Err(StoreError::InvalidInput { field });
+    }
+    Ok(value)
 }
 
 fn validate_machine_identifier_with_limit(
