@@ -45,6 +45,9 @@ impl AppConfig {
             None => Self::default(),
         };
         config.apply_env_overrides_from_map(&std::env::vars().collect());
+        let mut oauth = config.agent_api.oauth.clone();
+        oauth.normalize_and_validate()?;
+        config.agent_api.oauth = oauth;
         config.sync_legacy_openai_sections();
         config.validate()?;
         Ok(config)
@@ -310,6 +313,7 @@ impl AppConfig {
         );
 
         apply_string(env, "AGENT_API_LISTEN", &mut self.agent_api.listen);
+        self.agent_api.oauth.apply_env_overrides_from_map(env);
         apply_bool(
             env,
             "AUTO_ANSWER_INCOMING",
@@ -1204,6 +1208,21 @@ impl Default for PaOAuthConfig {
 }
 
 impl PaOAuthConfig {
+    fn apply_env_overrides_from_map(&mut self, env: &std::collections::HashMap<String, String>) {
+        if let Some(value) = env.get("AGENT_VOICE_PA_MICROSOFT_CLIENT_ID") {
+            self.microsoft.client_id = Some(normalize_env_value(value).to_string());
+        }
+        if let Some(value) = env.get("AGENT_VOICE_PA_MICROSOFT_CLIENT_SECRET") {
+            self.microsoft.client_secret = Some(Secret(normalize_env_value(value).to_string()));
+        }
+        if let Some(value) = env.get("AGENT_VOICE_PA_GOOGLE_CLIENT_ID") {
+            self.google.client_id = Some(normalize_env_value(value).to_string());
+        }
+        if let Some(value) = env.get("AGENT_VOICE_PA_GOOGLE_CLIENT_SECRET") {
+            self.google.client_secret = Some(Secret(normalize_env_value(value).to_string()));
+        }
+    }
+
     /// Returns the configuration associated with the selected provider.
     pub fn for_provider(&self, provider: OAuthProvider) -> &OAuthProviderConfig {
         match provider {
@@ -1540,12 +1559,15 @@ mod oauth_url {
 /// HTTP listener settings for the local agent control API.
 pub struct AgentApiConfig {
     pub listen: String,
+    #[serde(default)]
+    pub oauth: PaOAuthConfig,
 }
 
 impl Default for AgentApiConfig {
     fn default() -> Self {
         Self {
             listen: default_agent_api_listen(),
+            oauth: PaOAuthConfig::default(),
         }
     }
 }
@@ -2797,6 +2819,181 @@ microsoft:
             assert!(error.contains(&format!("agent_api.oauth.microsoft.{field}")));
             assert!(!error.contains("secret-only"));
             assert!(!error.contains("MICROSOFT_CLIENT_SECRET"));
+        }
+    }
+
+    #[test]
+    fn app_config_oauth_path_defaults_when_omitted() {
+        let config: AppConfig = serde_yaml::from_str(
+            r#"
+sip:
+  username: user
+  password: password
+  host: sip.example.test
+openai:
+  api_key: sk-test
+agent_api:
+  listen: 127.0.0.1:8089
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.agent_api.listen, "127.0.0.1:8089");
+        assert_eq!(config.agent_api.oauth, PaOAuthConfig::default());
+    }
+
+    #[test]
+    fn app_config_oauth_env_overrides_yaml_and_blank_fails() {
+        let mut config: AppConfig = serde_yaml::from_str(
+            r#"
+sip:
+  username: user
+  password: password
+  host: sip.example.test
+openai:
+  api_key: sk-test
+agent_api:
+  listen: 127.0.0.1:8089
+  oauth:
+    microsoft:
+      client_id: yaml-microsoft-id
+      client_secret: yaml-microsoft-secret
+    google:
+      client_id: yaml-google-id
+      client_secret: yaml-google-secret
+"#,
+        )
+        .unwrap();
+        let env = HashMap::from([
+            (
+                "AGENT_VOICE_PA_MICROSOFT_CLIENT_ID".to_string(),
+                " env-microsoft-id ".to_string(),
+            ),
+            (
+                "AGENT_VOICE_PA_MICROSOFT_CLIENT_SECRET".to_string(),
+                "env-microsoft-secret".to_string(),
+            ),
+            (
+                "AGENT_VOICE_PA_GOOGLE_CLIENT_ID".to_string(),
+                "env-google-id".to_string(),
+            ),
+            (
+                "AGENT_VOICE_PA_GOOGLE_CLIENT_SECRET".to_string(),
+                "env-google-secret".to_string(),
+            ),
+        ]);
+
+        config.agent_api.oauth.apply_env_overrides_from_map(&env);
+        config.agent_api.oauth.normalize_and_validate().unwrap();
+
+        assert_eq!(
+            config.agent_api.oauth.microsoft.client_id.as_deref(),
+            Some("env-microsoft-id")
+        );
+        assert_eq!(
+            config
+                .agent_api
+                .oauth
+                .microsoft
+                .client_secret
+                .as_ref()
+                .map(Secret::as_str),
+            Some("env-microsoft-secret")
+        );
+        assert_eq!(
+            config.agent_api.oauth.google.client_id.as_deref(),
+            Some("env-google-id")
+        );
+        assert_eq!(
+            config
+                .agent_api
+                .oauth
+                .google
+                .client_secret
+                .as_ref()
+                .map(Secret::as_str),
+            Some("env-google-secret")
+        );
+
+        let mut blank = config;
+        let blank_env = HashMap::from([(
+            "AGENT_VOICE_PA_MICROSOFT_CLIENT_ID".to_string(),
+            "   ".to_string(),
+        )]);
+        blank
+            .agent_api
+            .oauth
+            .apply_env_overrides_from_map(&blank_env);
+        let error = blank
+            .agent_api
+            .oauth
+            .normalize_and_validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("agent_api.oauth.microsoft.client_id"));
+        assert!(error.contains("blank"));
+    }
+
+    #[test]
+    fn oauth_example_has_only_documented_credential_placeholders() {
+        let example = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/agent_voice.example.yaml"
+        ));
+        let yaml: serde_yaml::Value = serde_yaml::from_str(example).unwrap();
+        let oauth = &yaml["agent_api"]["oauth"];
+
+        assert_eq!(
+            oauth["microsoft"]["client_id"].as_str(),
+            Some("${AGENT_VOICE_PA_MICROSOFT_CLIENT_ID}")
+        );
+        assert_eq!(
+            oauth["microsoft"]["client_secret"].as_str(),
+            Some("${AGENT_VOICE_PA_MICROSOFT_CLIENT_SECRET}")
+        );
+        assert_eq!(
+            oauth["google"]["client_id"].as_str(),
+            Some("${AGENT_VOICE_PA_GOOGLE_CLIENT_ID}")
+        );
+        assert_eq!(
+            oauth["google"]["client_secret"].as_str(),
+            Some("${AGENT_VOICE_PA_GOOGLE_CLIENT_SECRET}")
+        );
+
+        assert_eq!(
+            oauth["microsoft"]["authorize_url"].as_str(),
+            Some("https://login.microsoftonline.com/common/oauth2/v2.0/authorize")
+        );
+        assert_eq!(
+            oauth["microsoft"]["token_url"].as_str(),
+            Some("https://login.microsoftonline.com/common/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            oauth["microsoft"]["redirect_uri"].as_str(),
+            Some("http://127.0.0.1:8089/oauth/microsoft/callback")
+        );
+        assert_eq!(
+            oauth["google"]["authorize_url"].as_str(),
+            Some("https://accounts.google.com/o/oauth2/v2/auth")
+        );
+        assert_eq!(
+            oauth["google"]["token_url"].as_str(),
+            Some("https://oauth2.googleapis.com/token")
+        );
+        assert_eq!(
+            oauth["google"]["redirect_uri"].as_str(),
+            Some("http://127.0.0.1:8089/oauth/google/callback")
+        );
+
+        let placeholders = [
+            "${AGENT_VOICE_PA_MICROSOFT_CLIENT_ID}",
+            "${AGENT_VOICE_PA_MICROSOFT_CLIENT_SECRET}",
+            "${AGENT_VOICE_PA_GOOGLE_CLIENT_ID}",
+            "${AGENT_VOICE_PA_GOOGLE_CLIENT_SECRET}",
+        ];
+        assert_eq!(example.matches("${").count(), placeholders.len());
+        for placeholder in placeholders {
+            assert_eq!(example.matches(placeholder).count(), 1);
         }
     }
 }

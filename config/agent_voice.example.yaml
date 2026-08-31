@@ -51,6 +51,28 @@ voice:
 
 agent_api:
   listen: "127.0.0.1:8089"
+  oauth:
+    microsoft:
+      client_id: "${AGENT_VOICE_PA_MICROSOFT_CLIENT_ID}"
+      client_secret: "${AGENT_VOICE_PA_MICROSOFT_CLIENT_SECRET}"
+      authorize_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+      token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+      scopes:
+        - "Calendars.ReadWrite"
+        - "Mail.Read"
+        - "offline_access"
+        - "openid"
+        - "profile"
+      redirect_uri: "http://127.0.0.1:8089/oauth/microsoft/callback"
+    google:
+      client_id: "${AGENT_VOICE_PA_GOOGLE_CLIENT_ID}"
+      client_secret: "${AGENT_VOICE_PA_GOOGLE_CLIENT_SECRET}"
+      authorize_url: "https://accounts.google.com/o/oauth2/v2/auth"
+      token_url: "https://oauth2.googleapis.com/token"
+      scopes:
+        - "https://www.googleapis.com/auth/calendar.events"
+        - "https://www.googleapis.com/auth/gmail.modify"
+      redirect_uri: "http://127.0.0.1:8089/oauth/google/callback"
 
 speech:
   stt_provider: "openai"
