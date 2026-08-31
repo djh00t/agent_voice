@@ -442,11 +442,11 @@ fn open_at_with_flags(
 fn no_follow_open_flags() -> io::Result<std::os::raw::c_int> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        Ok(0o400000 | 0o4000)
+        Ok(0o400000 | 0o4000 | 0o2000000)
     }
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        Ok(0x100 | 0x4)
+        Ok(0x100 | 0x4 | 0x01000000)
     }
     #[cfg(not(any(
         target_os = "linux",
@@ -466,11 +466,11 @@ fn no_follow_open_flags() -> io::Result<std::os::raw::c_int> {
 fn temporary_open_flags() -> io::Result<std::os::raw::c_int> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        Ok(0o2 | 0o100 | 0o200 | 0o400000)
+        Ok(0o2 | 0o100 | 0o200 | 0o400000 | 0o2000000)
     }
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        Ok(0x0002 | 0x0200 | 0x0800 | 0x0100)
+        Ok(0x0002 | 0x0200 | 0x0800 | 0x0100 | 0x01000000)
     }
     #[cfg(not(any(
         target_os = "linux",
@@ -848,6 +848,13 @@ mod tests {
         target_os = "ios"
     ))]
     use std::os::unix::fs::symlink;
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    use std::os::fd::AsRawFd;
     #[cfg(unix)]
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -862,6 +869,20 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use super::{AtomicSnapshotWriter, WriterError, WriterFault, write_with_fault};
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    unsafe extern "C" {
+        fn fcntl(
+            descriptor: std::os::raw::c_int,
+            command: std::os::raw::c_int,
+            ...,
+        ) -> std::os::raw::c_int;
+    }
 
     const SNAPSHOT: &[u8] = b"agent-voice-encoded-snapshot-v1";
     const TEST_PAYLOAD: &[u8] =
@@ -1015,6 +1036,42 @@ mod tests {
         fs::remove_dir(&directory.path).expect("remove replacement parent");
         fs::remove_dir(&moved).expect("remove moved parent");
         assert!(!pinned_path_exists, "failed initialization removes pinned sibling");
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn raw_openat_descriptors_are_close_on_exec() {
+        const F_GETFD: std::os::raw::c_int = 1;
+        const FD_CLOEXEC: std::os::raw::c_int = 1;
+
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let destination = directory.destination("destination.bin");
+        let parent = fs::File::open(&directory.path).expect("test parent remains openable");
+        let temporary = super::TemporaryFile::create(&directory.path, &parent, &destination)
+            .expect("create temporary sibling");
+        let temporary_file = temporary
+            .file
+            .as_ref()
+            .expect("temporary file remains open");
+        let temporary_flags = unsafe { fcntl(temporary_file.as_raw_fd(), F_GETFD) };
+        assert!(
+            temporary_flags >= 0 && temporary_flags & FD_CLOEXEC != 0,
+            "temporary openat descriptor must be close-on-exec"
+        );
+
+        let name = super::path_name(temporary.path()).expect("temporary sibling has a name");
+        let probe = super::open_at(&temporary.parent, &name).expect("open temporary identity");
+        let probe_flags = unsafe { fcntl(probe.as_raw_fd(), F_GETFD) };
+        assert!(
+            probe_flags >= 0 && probe_flags & FD_CLOEXEC != 0,
+            "identity openat descriptor must be close-on-exec"
+        );
     }
 
     #[cfg(any(
