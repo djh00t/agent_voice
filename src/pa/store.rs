@@ -3745,10 +3745,7 @@ impl PaStore {
         owner_task_draft_id: i64,
         provider_event_id: impl AsRef<str>,
     ) -> StoreResult<StoredOwnerTaskPlacement> {
-        let provider_event_id = validate_machine_identifier(
-            provider_event_id.as_ref().to_owned(),
-            "provider_event_id",
-        )?;
+        let provider_event_id = validate_provider_event_id(provider_event_id.as_ref().to_owned())?;
         // Serialize the read-then-write transition so concurrent confirmed
         // calls converge instead of one failing on a deferred lock upgrade.
         let transaction =
@@ -6242,9 +6239,10 @@ fn decode_owner_task_placement(
         || validate_owner_task_timezone(&row.timezone).is_err()
         || validate_machine_identifier(row.operation_key.clone(), "operation_key").is_err()
         || validate_machine_identifier(row.owner_fingerprint.clone(), "owner_fingerprint").is_err()
-        || row.provider_event_id.as_deref().is_some_and(|value| {
-            validate_machine_identifier(value.to_owned(), "provider_event_id").is_err()
-        })
+        || row
+            .provider_event_id
+            .as_deref()
+            .is_some_and(|value| validate_provider_event_id(value.to_owned()).is_err())
     {
         return Err(stored_record_invalid("owner task placement"));
     }
@@ -6694,6 +6692,19 @@ fn validate_machine_identifier(value: String, field: &'static str) -> StoreResul
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
     {
         return Err(StoreError::InvalidInput { field });
+    }
+    Ok(value)
+}
+
+fn validate_provider_event_id(value: String) -> StoreResult<String> {
+    if value.trim().is_empty()
+        || value.len() > MAX_TASK_ID_LENGTH
+        || !value.is_ascii()
+        || value.chars().any(char::is_control)
+    {
+        return Err(StoreError::InvalidInput {
+            field: "provider_event_id",
+        });
     }
     Ok(value)
 }
@@ -7959,15 +7970,15 @@ mod tests {
         AuditEntityType, AuditEventType, CURRENT_SCHEMA_VERSION, MAX_APPOINTMENT_QUOTE_SLOTS,
         MAX_AUDIT_ENTITY_ID_LENGTH, MAX_AUDIT_LIST_LIMIT, MAX_MESSAGE_ID_LENGTH,
         MAX_MESSAGE_LIST_LIMIT, MAX_MESSAGE_SENDER_LENGTH, MAX_MESSAGE_SUBJECT_LENGTH,
-        MAX_MESSAGE_SUMMARY_LENGTH, MAX_TASK_DURATION_MINUTES, MAX_TASK_TITLE_LENGTH, MIGRATIONS,
-        MessageProvider, MessageSummary, MessageTriageState, Migration, NotificationKind,
-        NotificationRecipient, NotificationStatus, NotificationTemplateData, OAuthCredential,
-        PaStore, ProposalSource, StoreError, StoreResult, StoredAppointmentDraft,
-        StoredAppointmentQuote, StoredAppointmentQuoteState, StoredMessage, StoredProposal,
-        StoredTask, StoredTaskState, TaskTitle, apply_sqlcipher_key, run_migrations_with,
-        validate_audit_entity_id, validate_audit_idempotency_key, validate_message_id,
-        validate_message_sender, validate_message_subject, validate_message_summary,
-        verify_sqlcipher,
+        MAX_MESSAGE_SUMMARY_LENGTH, MAX_TASK_DURATION_MINUTES, MAX_TASK_ID_LENGTH,
+        MAX_TASK_TITLE_LENGTH, MIGRATIONS, MessageProvider, MessageSummary, MessageTriageState,
+        Migration, NotificationKind, NotificationRecipient, NotificationStatus,
+        NotificationTemplateData, OAuthCredential, PaStore, ProposalSource, StoreError,
+        StoreResult, StoredAppointmentDraft, StoredAppointmentQuote, StoredAppointmentQuoteState,
+        StoredMessage, StoredProposal, StoredTask, StoredTaskState, TaskTitle, apply_sqlcipher_key,
+        run_migrations_with, validate_audit_entity_id, validate_audit_idempotency_key,
+        validate_message_id, validate_message_sender, validate_message_subject,
+        validate_message_summary, verify_sqlcipher,
     };
 
     const DATABASE_KEY: &[u8] = b"task-4a-test-key";
@@ -17201,12 +17212,15 @@ END;
             .expect("second prepare");
 
         let submitted = store
-            .submit_owner_task_placement(first.0.id(), "outlook-event-1")
+            .submit_owner_task_placement(first.0.id(), "outlook/event+opaque==")
             .expect("submit");
-        assert_eq!(submitted.provider_event_id(), Some("outlook-event-1"));
+        assert_eq!(
+            submitted.provider_event_id(),
+            Some("outlook/event+opaque==")
+        );
         assert_eq!(
             store
-                .submit_owner_task_placement(first.0.id(), "outlook-event-1")
+                .submit_owner_task_placement(first.0.id(), "outlook/event+opaque==")
                 .expect("exact submit retry"),
             submitted
         );
@@ -17217,7 +17231,7 @@ END;
             })
         ));
         assert!(matches!(
-            store.submit_owner_task_placement(second.0.id(), "outlook-event-1"),
+            store.submit_owner_task_placement(second.0.id(), "outlook/event+opaque=="),
             Err(StoreError::Conflict {
                 resource: "owner task placement"
             })
@@ -17229,6 +17243,113 @@ END;
                 .provider_event_id(),
             None
         );
+    }
+
+    #[test]
+    fn owner_task_provider_event_id_submission_rejects_invalid_inputs_without_mutation() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open");
+        let draft = owner_task(
+            TaskKind::Callback,
+            "Reject invalid event IDs",
+            15,
+            None,
+            "owner-submit-invalid-event-id",
+        );
+        let starts_at = OffsetDateTime::parse("2025-01-02T03:04:05Z", &Rfc3339).expect("start");
+        let stored = store
+            .save_prepared_owner_task(
+                Some("owner:submit:invalid-event-id"),
+                &draft,
+                starts_at,
+                starts_at + TimeDuration::minutes(15),
+                "Australia/Sydney",
+                "owner-submit-invalid-operation",
+                "owner-submit-invalid-fingerprint",
+            )
+            .expect("prepare");
+
+        for value in ["", "   ", "A\nB", "A\0B", "é"] {
+            assert!(matches!(
+                store.submit_owner_task_placement(stored.0.id(), value),
+                Err(StoreError::InvalidInput {
+                    field: "provider_event_id"
+                })
+            ));
+        }
+        let oversized = "a".repeat(MAX_TASK_ID_LENGTH + 1);
+        assert!(matches!(
+            store.submit_owner_task_placement(stored.0.id(), oversized),
+            Err(StoreError::InvalidInput {
+                field: "provider_event_id"
+            })
+        ));
+        assert_eq!(
+            store
+                .load_owner_task_placement(stored.0.id())
+                .expect("placement remains prepared")
+                .provider_event_id(),
+            None
+        );
+    }
+
+    #[test]
+    fn owner_task_provider_event_id_corruption_fails_closed_without_disclosure() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open");
+        let draft = owner_task(
+            TaskKind::Callback,
+            "Reject corrupt event IDs",
+            15,
+            None,
+            "owner-corrupt-event-id",
+        );
+        let starts_at = OffsetDateTime::parse("2025-01-02T03:04:05Z", &Rfc3339).expect("start");
+        let stored = store
+            .save_prepared_owner_task(
+                Some("owner:corrupt:event-id"),
+                &draft,
+                starts_at,
+                starts_at + TimeDuration::minutes(15),
+                "Australia/Sydney",
+                "owner-corrupt-operation",
+                "owner-corrupt-fingerprint",
+            )
+            .expect("prepare");
+        store
+            .connection()
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow corruption fixture");
+
+        for value in ["", "   ", "A\nB", "A\0B", "é"] {
+            store
+                .connection()
+                .execute(
+                    "UPDATE owner_task_placements SET state = 'submitted', provider_event_id = ?1",
+                    [value],
+                )
+                .expect("corrupt provider event ID");
+            let error = store
+                .load_owner_task_placement(stored.0.id())
+                .expect_err("corrupt provider event ID must fail closed");
+            assert!(matches!(error, StoreError::StoredRecordInvalid { .. }));
+            if !value.is_empty() {
+                assert!(!error.to_string().contains(value));
+                assert!(!format!("{error:?}").contains(value));
+            }
+        }
+        let oversized = "a".repeat(MAX_TASK_ID_LENGTH + 1);
+        store
+            .connection()
+            .execute(
+                "UPDATE owner_task_placements SET state = 'submitted', provider_event_id = ?1",
+                [&oversized],
+            )
+            .expect("corrupt oversized provider event ID");
+        let error = store
+            .load_owner_task_placement(stored.0.id())
+            .expect_err("oversized provider event ID must fail closed");
+        assert!(matches!(error, StoreError::StoredRecordInvalid { .. }));
+        assert!(!error.to_string().contains(&oversized));
+        assert!(!format!("{error:?}").contains(&oversized));
     }
 
     #[test]
