@@ -284,18 +284,35 @@ Malformed schema assumptions, failed constraints, duplicate migration/index, une
   re-review were triggered after `7a874473` and remain required before handoff.
 - `LIVE`: `UNEXECUTED`; no deployment, provider, OAuth, cluster, or UAT evidence exists or is claimed.
 
-Residual gates: #255/PR #265 must be merged and verified before delivery;
-current-head CI and re-review must pass; rebase/retarget and current-base rerun
-remain required after the prerequisite merges; #269 and later transition
-packages remain separate. PR #273 is pushed, open, and stacked on PR #265.
+PR #265/#255 merged into `main`. PR #273 was then automatically retargeted to
+`main`; its old stacked history conflicted because the predecessor commits had
+been rewritten before merge. The old stacked predecessor tree and merged
+predecessor tree were verified byte-identical for `src/pa/store.rs`, then only
+the 24 child commits were rebased onto `origin/main` at `9daaefec70666f1b`.
+The resulting history is zero commits behind and 24 one-file commits ahead of
+that base. A fresh current-base `rtk make check` exited `0` with 537 unit tests,
+the integration contracts, 3 compile-fail doctests, strict Clippy, Rust docs,
+and the Docusaurus production build.
+
+Residual gates: the guarded branch update, fresh current-head CI, and current-
+head re-review must pass before handoff. #269 and later transition packages
+remain separate. PR #273 is open directly against `main`.
 
 ## Reviewer and lifecycle
 
-Controller review must verify the exact base/stack, one-file source commit, migration transaction/idempotency, constraint semantics, no downstream leakage, and all evidence rows. If #265/#255 changes, stop and rebase/retarget before further work. The future delivering PR must contain `Closes #256`, `Refs #255`, `Refs #68`, and `Refs #58`; it must not promote LOCAL/STATIC results to CI/LIVE.
+Controller review must verify the exact `main` base, one-file commit history,
+migration transaction/idempotency, constraint semantics, no downstream
+leakage, and all evidence rows. The delivering PR contains `Closes #256`,
+`Refs #255`, `Refs #68`, and `Refs #58`; it must not promote LOCAL/STATIC
+results to CI/LIVE.
 
 ## Completion evidence
 
 - Implementer: isolated stack owner; exact identity not recorded.
+- Current rebased source range: `4e394762f92bbca18c6c0dfc5a038950bed77937`
+  through `b85aac1ccc43cc818da4bfba9035646516bd310a`.
+- The source commit identifiers below are the immutable pre-rebase review
+  artifacts; their one-file changes were replayed without content changes.
 - Source commit: `25a905225f34641699d5fa08fc3da3110ca6e2c6`.
 - Round-2 source follow-up: `25074b38e5a0e0bfe9c2505bb669badddbc740e7`.
 - Round-3 source remediation: `7a874473ae32d179d9f5068dfafe81afe7bb91c9`.
