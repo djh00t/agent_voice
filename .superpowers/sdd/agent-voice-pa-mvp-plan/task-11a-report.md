@@ -5,18 +5,19 @@
 - **Evidence date:** 2026-09-01 (Australia/Sydney)
 - **Base SHA:** `a20a28be3be37c84cbe5046415497b7053dd8906` (`origin/main` after
   `rtk git fetch origin main`)
-- **Implementation head SHA:** `10e1454e9ce8e143a29f1039ff3e0e13920f23b0`
+- **Implementation head SHA:** `85944280cde19ca995e0ae898afc09383d56f8e5`
   (latest source/config implementation commit before this report-only change)
-- **Pre-report head SHA:** `3e7fff1bfc305c221665e5862adbf9fc366d1142`
+- **Pre-report head SHA:** `85944280cde19ca995e0ae898afc09383d56f8e5`
   (previous source/report tip before this report-only refresh)
 - **Report head SHA:** `THIS_REPORT_COMMIT` (self-reference; resolve with
   `rtk git rev-parse HEAD` after checkout)
 - **Report lineage:** `7ca2da030b775502bb3b60c53726cf919869d80e`,
-  `3e7fff1bfc305c221665e5862adbf9fc366d1142` (prior reports), and
+  `3e7fff1bfc305c221665e5862adbf9fc366d1142`,
+  `90654596e9e13c518af53ea268051d33b4df701c` (prior reports), and
   `THIS_REPORT_COMMIT` (self-reference; resolve with `rtk git rev-parse HEAD`)
 - **PR:** [#314](https://github.com/djh00t/agent_voice/pull/314)
 - **Branch:** `codex/agent-voice-issue-85`
-- **Evidence worktree:** `/private/tmp/agent-voice-pr314-report-refresh` (removed
+- **Evidence worktree:** `/private/tmp/agent-voice-fix314-report-final` (removed
   after delivery)
 - **Prerequisite:** #218 is closed. Its `AgentApiConfig.oauth` field and
   post-environment OAuth normalization handoff were re-read from `origin/main`
@@ -180,14 +181,37 @@ This closes the remaining production-load gap for
 lexical scanner. The regression asserts the frozen redacted
 `backup.retention_days: invalid_retention` error and does not echo `+30`.
 
-### Follow-up I quoted-hash flow evidence
+### Historical follow-up I quoted-hash flow evidence
 
-The current implementation at `10e1454e9ce8e143a29f1039ff3e0e13920f23b0`
+The historical implementation at `10e1454e9ce8e143a29f1039ff3e0e13920f23b0`
 makes the bounded comment scan quote-aware. A `#` inside a single- or
 double-quoted scalar is retained as YAML data, while an unquoted `#` still
 starts the trailing comment. The regression places `temp_dir: "backup#tmp"`
 before `retention_days: +30` and proves the signed policy literal is rejected
 with `backup.retention_days: invalid_retention` without echoing either value.
+
+### Follow-up J unseparated-hash and quoted-top-level-key evidence
+
+The historical implementation at `49fcc907e0222cf2ce37d77f6dd38ce4d11288bc`
+recognizes YAML comment markers only at the start of a value or after
+separation whitespace, and recognizes plain, single-quoted, and double-quoted
+top-level `backup` keys. The unseparated plain-hash regression
+`app_config_load_rejects_flow_policy_literal_after_unseparated_plain_hash`
+keeps `backup#tmp` as scalar data before scanning the later signed policy
+literal. The quoted-top-level-key regression
+`app_config_load_rejects_flow_policy_literal_after_quoted_top_level_backup_key`
+covers both quote forms. Both regressions assert the frozen redacted
+`backup.retention_days: invalid_retention` error without echoing the raw value.
+
+### Follow-up K quoted-flow-entry evidence
+
+The current implementation at `0f90abfefb56a32177db042aa21609deb80ac5b4`,
+carried at final head `85944280cde19ca995e0ae898afc09383d56f8e5`, splits simple-flow
+entries only at commas outside single- and double-quoted scalars. The regression
+`app_config_load_accepts_flow_comma_inside_quoted_scalar` covers a comma in
+`temp_dir: "foo, retention_days: +30"` and confirms that valid scalar data is
+not scanned as a second policy entry. Commit `8594428` renames the quoted-hash
+regression to the exact selector `app_config_load_rejects_signed_policy_after_quoted_hash`.
 
 ### Focused GREEN evidence
 
@@ -373,7 +397,7 @@ Result: cargo test 584 passed, 0 failed; integration suites passed with
         cargo clippy, cargo doc, and Docusaurus build completed successfully.
 ```
 
-At current implementation head `10e1454e9ce8e143a29f1039ff3e0e13920f23b0`,
+At historical implementation head `10e1454e9ce8e143a29f1039ff3e0e13920f23b0`,
 the quoted-hash ordering regression and the final local gate passed:
 
 ```text
@@ -390,6 +414,52 @@ Command: rtk make check
 Exit: 0
 Result: cargo test 585 passed, 0 failed; integration suites, doc-tests,
         cargo clippy, cargo doc, and Docusaurus completed successfully.
+```
+
+### Follow-up K RED evidence
+
+The quoted-flow-entry regression was red on predecessor `49fcc907e0222cf2ce37d77f6dd38ce4d11288bc`
+before the source repair:
+
+```text
+Command: rtk cargo test --lib config::tests::app_config_load_accepts_flow_comma_inside_quoted_scalar -- --exact --nocapture
+Exit: 101
+Result: 0 passed, 1 failed, and 587 filtered out because a comma inside a
+        quoted scalar was split as a separate flow entry.
+```
+
+At current implementation head `85944280cde19ca995e0ae898afc09383d56f8e5`,
+all current policy-edge selectors and the full local evidence passed:
+
+```text
+Command: rtk cargo test --lib config::tests::app_config_load_accepts_flow_comma_inside_quoted_scalar -- --exact --nocapture
+Exit: 0
+Result: 1 passed, 587 filtered out; commas inside quoted scalar values remain
+        data and the valid flow mapping loads successfully.
+
+Command: rtk cargo test --lib config::tests::app_config_load_rejects_signed_policy_after_quoted_hash -- --exact --nocapture
+Exit: 0
+Result: 1 passed, 587 filtered out; the quoted hash remains scalar data and
+        the later signed policy literal is rejected without echo.
+
+Command: rtk cargo test --lib config::tests::app_config_load_rejects_flow_policy_literal_after_unseparated_plain_hash -- --exact --nocapture
+Exit: 0
+Result: 1 passed, 587 filtered out; the unseparated plain hash remains scalar
+        data and the later signed policy literal is rejected without echo.
+
+Command: rtk cargo test --lib config::tests::app_config_load_rejects_flow_policy_literal_after_quoted_top_level_backup_key -- --exact --nocapture
+Exit: 0
+Result: 1 passed, 587 filtered out; both quoted top-level `backup` key forms
+        are scanned and the signed policy literal is rejected without echo.
+
+Command: rtk cargo test --lib config -- --nocapture
+Exit: 0
+Result: 56 passed, 532 filtered out.
+
+Command: rtk make check
+Exit: 0
+Result: cargo test 588 passed, 0 failed; integration and doc tests, cargo
+        clippy, cargo doc, and Docusaurus build completed successfully.
 ```
 
 Configuration normalization is clone-then-assign. Failed parsing or validation
@@ -410,17 +480,17 @@ Exit: 0
 ```
 
 The implementation range through source head
-`10e1454e9ce8e143a29f1039ff3e0e13920f23b0` was inspected with:
+`85944280cde19ca995e0ae898afc09383d56f8e5` was inspected with:
 
 ```text
-Command: rtk git diff --name-status origin/main...10e1454e9ce8e143a29f1039ff3e0e13920f23b0
+Command: rtk git diff --name-status origin/main...85944280cde19ca995e0ae898afc09383d56f8e5
 Exit: 0
 Result: exactly the three owned paths src/config.rs, config/agent_voice.example.yaml,
         and .superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md.
 ```
 
-The twenty-two delivery commits before this report are each one-file commits;
-`rtk git log --stat origin/main..3e7fff1bfc305c221665e5862adbf9fc366d1142`
+The twenty-six delivery commits before this report are each one-file commits;
+`rtk git log --stat origin/main..85944280cde19ca995e0ae898afc09383d56f8e5`
 returned the following path boundaries:
 
 | Commit | Path | Change |
@@ -447,6 +517,10 @@ returned the following path boundaries:
 | `7ca2da030b775502bb3b60c53726cf919869d80e` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Record trailing-comment repair evidence. |
 | `10e1454e9ce8e143a29f1039ff3e0e13920f23b0` | `src/config.rs` | Make flow-comment detection quote-aware and add the quoted-hash regression. |
 | `3e7fff1bfc305c221665e5862adbf9fc366d1142` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Label historical evidence heads before the final report refresh. |
+| `90654596e9e13c518af53ea268051d33b4df701c` | `.superpowers/sdd/agent-voice-pa-mvp-plan/task-11a-report.md` | Finalize current implementation, review, and CI evidence. |
+| `49fcc907e0222cf2ce37d77f6dd38ce4d11288bc` | `src/config.rs` | Recognize YAML policy edge syntax and add plain-hash/quoted-top-level-key regressions. |
+| `0f90abfefb56a32177db042aa21609deb80ac5b4` | `src/config.rs` | Scan quoted flow entries safely and add the quoted-comma regression. |
+| `85944280cde19ca995e0ae898afc09383d56f8e5` | `src/config.rs` | Align the quoted-hash regression selector with the evidence report. |
 
 The repository-wide formatter remains a pre-existing, out-of-scope issue:
 
@@ -518,7 +592,7 @@ report capture:
 | Analyze (rust) | PENDING | [CodeQL job 99610500087](https://github.com/djh00t/agent_voice/actions/runs/33429310805/job/99610500087) |
 | CodeQL aggregate | SKIPPING | [aggregate run 99610724526](https://github.com/djh00t/agent_voice/runs/99610724526) |
 
-At current source/report head `3e7fff1bfc305c221665e5862adbf9fc366d1142`,
+At historical source/report head `3e7fff1bfc305c221665e5862adbf9fc366d1142`,
 CI run `33432612484` passed after the failed SQLCipher initialization job was
 rerun unchanged. The original failure affected unrelated admin-config store
 tests; the rerun completed the same repository gate successfully.
@@ -530,6 +604,24 @@ tests; the rerun completed the same repository gate successfully.
 | Analyze (javascript-typescript) | PASS | [CodeQL job 99621347479](https://github.com/djh00t/agent_voice/actions/runs/33432612521/job/99621347479) |
 | Analyze (rust) | PASS | [CodeQL job 99621347698](https://github.com/djh00t/agent_voice/actions/runs/33432612521/job/99621347698) |
 | CodeQL aggregate | PASS | [aggregate run 99621579644](https://github.com/djh00t/agent_voice/runs/99621579644) |
+
+At implementation head `85944280cde19ca995e0ae898afc09383d56f8e5`, all five PR
+checks are green:
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Quality Gates | PASS | [CI job 99639563255](https://github.com/djh00t/agent_voice/actions/runs/33438159759/job/99639563255) |
+| Compose Config | PASS | [CI job 99639563400](https://github.com/djh00t/agent_voice/actions/runs/33438159759/job/99639563400) |
+| Analyze (javascript-typescript) | PASS | [CodeQL job 99639560351](https://github.com/djh00t/agent_voice/actions/runs/33438158655/job/99639560351) |
+| Analyze (rust) | PASS | [CodeQL job 99639560690](https://github.com/djh00t/agent_voice/actions/runs/33438158655/job/99639560690) |
+| CodeQL aggregate | PASS | [CodeQL alert check 99639788889](https://github.com/djh00t/agent_voice/runs/99639788889) |
+
+CodeQL alert 54 was investigated at the exact implementation head and
+dismissed as a false positive. The reported cleartext sink is test-only
+`{result:?}` formatting; `Secret` debug output is `[REDACTED]`, the injected
+sentinel is absent from the failure output, and the focused redaction test
+passed. Inline reply `3898407944` records this evidence, and the alert was
+dismissed with reason `false positive`.
 
 The final report-only commit uses `THIS_REPORT_COMMIT` for its unavoidable
 self-reference and will trigger a fresh workflow. CI is repository evidence
@@ -590,6 +682,15 @@ The quoted-hash flow finding (`3897715118`) and stale historical-head-label
 finding (`3897715125`) were answered against `10e1454e9ce8e143a29f1039ff3e0e13920f23b0`
 and `3e7fff1bfc305c221665e5862adbf9fc366d1142`; both threads were resolved. All
 ten review threads were resolved at the final evidence capture.
+The quoted-flow-entry finding (`3897959545`) was answered by `3898267375`
+against `0f90abfefb56a32177db042aa21609deb80ac5b4` and final head
+`85944280cde19ca995e0ae898afc09383d56f8e5`; its thread was resolved. The
+quoted-hash selector finding (`3897959550`) was answered by `3898269014`
+against `85944280cde19ca995e0ae898afc09383d56f8e5`; its thread was resolved.
+The CodeQL alert thread (`3898294521`) was answered by `3898407944` against
+implementation head `85944280cde19ca995e0ae898afc09383d56f8e5`; the false-positive
+finding was resolved and alert 54 was dismissed. The current GraphQL snapshot
+contains 16 review threads, all 16 resolved and zero unresolved.
 
 ## Acceptance mapping
 
@@ -600,7 +701,7 @@ ten review threads were resolved at the final evidence capture.
 | Stable error classes never echo raw values or secret-shaped fields | secret-field selectors, YAML enabled/scalar selectors, redaction assertions, and source review | PASS (LOCAL/STATIC) |
 | Bucket, region, prefix, endpoint, policy, and scratch path fail closed | destination, required-negative, and YAML policy-error selectors | PASS (LOCAL) |
 | YAML wrong-type and out-of-range policy values map to frozen redacted errors | `backup_config_yaml_policy_errors_are_frozen_and_redacted` | PASS (LOCAL/STATIC) |
-| Production file loads reject signed and oversized policy literals before semantic YAML parsing | `app_config_load_rejects_signed_and_oversized_backup_policy_literals`, single-quoted block/flow selectors, trailing-comment and quoted-hash flow selectors, and raw-lexeme guard source review | PASS (LOCAL/STATIC; standard block/simple-flow scope) |
+| Production file loads reject signed and oversized policy literals before semantic YAML parsing | `app_config_load_rejects_signed_and_oversized_backup_policy_literals`, single-quoted block/flow selectors, trailing-comment, quoted-hash, quoted-comma, unseparated-plain-hash, and quoted-top-level-key flow selectors, and raw-lexeme guard source review | PASS (LOCAL/STATIC; standard block/simple-flow scope) |
 | Direct `BackupConfig` parsing rejects lexical plus signs | `serde_yaml` semantic-number boundary | LIMITATION (documented; not claimed) |
 | Empty endpoint userinfo is rejected and non-default production ports remain disallowed | empty-userinfo selector; endpoint source review; frozen addendum | PASS (LOCAL/STATIC) |
 | Explicit test-only loopback HTTP is isolated from production validation | `backup_config_snapshot_and_runtime_handoffs` | PASS (LOCAL) |
@@ -608,7 +709,8 @@ ten review threads were resolved at the final evidence capture.
 
 **Package status:** implementation and LOCAL/STATIC evidence are ready for
 review; issue #85 is labelled `status:review` at final capture. The exact
-pre-report head `3e7fff1bfc305c221665e5862adbf9fc366d1142` has all five checks green after
-the unchanged failed-job rerun. The final report-only commit will trigger a new
-workflow; its own head status is not claimed until GitHub reports it. Live,
-deployment, merge, and approval evidence remain separate gates.
+implementation head `85944280cde19ca995e0ae898afc09383d56f8e5` has 56 focused
+config tests, a successful full local gate, five green PR checks, a clean
+mergeable state, and zero unresolved review threads. The report-only commit is
+eligible for the requested delivery gate. Live, deployment, merge, and approval
+evidence remain separate gates.
