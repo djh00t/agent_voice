@@ -3,11 +3,12 @@
 - **Issue:** [#222](https://github.com/djh00t/agent_voice/issues/222)
 - **Package:** `task-10b.5`
 - **Evidence date:** 2026-08-31 (Australia/Sydney)
-- **Worktree:** `/private/tmp/agent-voice-issue-222`
-- **Branch:** `codex/agent-voice-issue-222`
-- **Base:** `1fdfd9fd3d09e95aafd46823fd82bfa8c44a7ac9` (`origin/main`)
-- **Implementation commit:** `8b9dee9f7989d17cfe3deddd06b7710f8a37cbb8`
-- **Harness commit:** `9bc67efe8227d8b4fb22a15c9e9fcd0b300332f8`
+- **Worktree:** `/private/tmp/agent-voice-issue-222-fix1`
+- **Branch:** `codex/agent-voice-issue-222` (PR #304 delivery ref)
+- **Base:** `b1b83562b3f2f92b58445448a76ab770a977597f` (`origin/main`)
+- **Implementation commit:** `554bbaa` (`feat(realtime): add closed output-audio server values`)
+- **Harness commit:** `c9b4e15` (`test(realtime): add output-audio contract harness`)
+- **Duplicate-member repair commit:** `48b71d0` (`fix(realtime): reject duplicate server event members`)
 
 ## Contract and readback
 
@@ -85,14 +86,43 @@ required IDs and indexes, missing/null fields, malformed/noncanonical/
 alternate/oversized audio, transcript bounds, unknown tags and fields,
 obsolete `response.audio.*` aliases, and redacted failures/debug output.
 
+## Review repair: duplicate JSON members
+
+Fresh independent review [P2 comment 3893820253](https://github.com/djh00t/agent_voice/pull/304#discussion_r3893820253)
+identified that `Value::deserialize` allowed serde_json's last-wins object
+member behavior. An obsolete first `type`, repeated identifiers/indexes, or
+repeated payload members could therefore be hidden by a later duplicate.
+
+The fix-loop RED command was run after adding regression cases and before the
+repair implementation:
+
+```text
+rtk cargo test --test realtime_server_audio_events_contract server_audio_events::tests::output_audio_events -- --exact
+exit 101
+fixture must be rejected: RealtimeServerAudioEvent(<redacted>)
+```
+
+The same selector is GREEN after `48b71d0`:
+
+```text
+rtk cargo test --test realtime_server_audio_events_contract server_audio_events::tests::output_audio_events -- --exact
+exit 0
+cargo test: 1 passed, 2 filtered out (1 suite, 0.00s)
+```
+
+The decoder now builds `serde_json::Value` through a recursive serde visitor
+that rejects a repeated key before insertion. Regression coverage rejects
+duplicate `type`, every required identifier and index, audio `delta`, and
+transcript `transcript`; rejected errors remain fixed and redacted.
+
 ## Checks
 
 | Check | Result |
 | --- | --- |
-| `rtk run rustfmt --edition 2024 --check src/realtime/server_audio_events.rs tests/realtime_server_audio_events_contract.rs` | PASS |
-| `rtk cargo clippy --all-targets --all-features -- -D warnings` | PASS — no issues found |
-| `rtk git diff --check origin/main..HEAD` | PASS |
-| `rtk make check` | PASS — 537 Rust tests, 3 doc-tests, Clippy, rustdoc, and Docusaurus |
+| `rtk rustfmt --edition 2021 --check src/realtime/server_audio_events.rs` | PASS |
+| `rtk cargo clippy --test realtime_server_audio_events_contract -- -D warnings` | PASS — no issues found |
+| `rtk git diff --check` | PASS |
+| `rtk make check` | PASS — 548 library tests, integration suites (6, 18, 230, 3, 19), 3 doc-tests, Clippy, rustdoc, and Docusaurus |
 
 The first `rtk make check` attempt found the fresh-worktree environment had no
 Docusaurus executable. `rtk make docs-install` installed from the checked-in
@@ -126,11 +156,12 @@ were not run or observed.
 
 ## Delivery readback
 
-The branch contains two implementation commits plus this one-file report
-commit. Each commit touches exactly one path and uses the required multiline
-Conventional Commit format. The final changed-path readback must contain only
-the three owned paths listed above. No dependency, `src/realtime/mod.rs`,
-dispatcher, export, sibling event, or parent tracker file changed.
+The branch contains one production implementation commit, one harness commit,
+one duplicate-member repair commit, and one-file report commits. Each commit
+touches exactly one path and uses the required multiline Conventional Commit
+format. The final changed-path readback must contain only the three owned paths
+listed above. No dependency, `src/realtime/mod.rs`, dispatcher, export,
+sibling event, or parent tracker file changed.
 
 The delivering PR footer is exactly:
 
