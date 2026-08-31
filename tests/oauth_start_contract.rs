@@ -102,6 +102,20 @@ fn expected_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, verifier.as_bytes()))
 }
 
+fn assert_oauth_error<T>(result: OAuthResult<T>, expected: OAuthError) {
+    assert!(
+        matches!(result, Err(error) if error == expected),
+        "unexpected OAuth error"
+    );
+}
+
+fn assert_verifier_matches(result: OAuthResult<String>, expected: &str) {
+    assert!(
+        matches!(result, Ok(verifier) if verifier == expected),
+        "verifier mismatch"
+    );
+}
+
 #[test]
 fn pkce_url_contract() {
     for (provider, access_type) in [
@@ -158,10 +172,7 @@ fn pkce_url_contract() {
         assert_eq!(start.authorize_url.fragment(), None);
         assert_eq!(start.authorize_url.query_pairs().count(), expected.len());
 
-        let verifier = store
-            .consume(&start.state, now_plus(1))
-            .expect("reserved verifier can be consumed");
-        assert_eq!(verifier, expected_verifier);
+        assert_verifier_matches(store.consume(&start.state, now_plus(1)), &expected_verifier);
     }
 }
 
@@ -229,11 +240,11 @@ fn prequeried_or_fragmented_authorize_url_fails_before_randomness_or_store_mutat
             NOW,
         );
 
-        assert_eq!(result, Err(OAuthError::InvalidConfiguration));
+        assert_oauth_error(result, OAuthError::InvalidConfiguration);
         assert_eq!(random.calls(), 0);
-        assert_eq!(
+        assert_oauth_error(
             store.consume(&URL_SAFE_NO_PAD.encode([0x41; 32]), NOW),
-            Err(OAuthError::InvalidState)
+            OAuthError::InvalidState,
         );
     }
 }
@@ -250,7 +261,7 @@ fn missing_client_id_and_expiry_overflow_fail_before_randomness_or_reservation()
         &random,
         NOW,
     );
-    assert_eq!(result, Err(OAuthError::InvalidConfiguration));
+    assert_oauth_error(result, OAuthError::InvalidConfiguration);
     assert_eq!(random.calls(), 0);
 
     let config = config_with_id(OAuthProvider::Microsoft, "client-id");
@@ -263,11 +274,11 @@ fn missing_client_id_and_expiry_overflow_fail_before_randomness_or_reservation()
         &random,
         DateTime::<Utc>::MAX_UTC,
     );
-    assert_eq!(result, Err(OAuthError::InvalidConfiguration));
+    assert_oauth_error(result, OAuthError::InvalidConfiguration);
     assert_eq!(random.calls(), 0);
-    assert_eq!(
+    assert_oauth_error(
         store.consume(&URL_SAFE_NO_PAD.encode([0x51; 32]), NOW),
-        Err(OAuthError::InvalidState)
+        OAuthError::InvalidState,
     );
 }
 
@@ -276,38 +287,29 @@ fn state_store_is_single_use_expiring_and_failure_atomic() {
     let mut store = InMemoryOAuthStateStore::default();
     let expires_at = now_plus(10);
 
-    assert_eq!(
+    assert_oauth_error(
         store.reserve("", "verifier", expires_at),
-        Err(OAuthError::InvalidState)
+        OAuthError::InvalidState,
     );
-    assert_eq!(
+    assert_oauth_error(
         store.reserve("state", "", expires_at),
-        Err(OAuthError::InvalidCode)
+        OAuthError::InvalidCode,
     );
     store
         .reserve("state", "verifier", expires_at)
         .expect("first reservation");
-    assert_eq!(
+    assert_oauth_error(
         store.reserve("state", "replacement", expires_at),
-        Err(OAuthError::StateAlreadyUsed)
+        OAuthError::StateAlreadyUsed,
     );
-    assert_eq!(store.consume("", NOW), Err(OAuthError::InvalidState));
-    assert_eq!(store.consume("unknown", NOW), Err(OAuthError::InvalidState));
-    assert_eq!(
-        store.consume("state", expires_at),
-        Err(OAuthError::StateExpired)
+    assert_oauth_error(store.consume("", NOW), OAuthError::InvalidState);
+    assert_oauth_error(store.consume("unknown", NOW), OAuthError::InvalidState);
+    assert_oauth_error(store.consume("state", expires_at), OAuthError::StateExpired);
+    assert_verifier_matches(
+        store.consume("state", expires_at - Duration::seconds(1)),
+        "verifier",
     );
-    assert!(
-        matches!(
-            store.consume("state", expires_at - Duration::seconds(1)),
-            Ok(verifier) if verifier == "verifier"
-        ),
-        "reserved verifier was not returned"
-    );
-    assert_eq!(
-        store.consume("state", NOW),
-        Err(OAuthError::StateAlreadyUsed)
-    );
+    assert_oauth_error(store.consume("state", NOW), OAuthError::StateAlreadyUsed);
 }
 
 #[test]
@@ -318,10 +320,7 @@ fn state_store_purges_expired_entries_past_the_replay_window() {
         .expect("expired fixture reservation");
     store.purge_expired(NOW);
 
-    assert!(
-        matches!(store.consume("expired", NOW), Err(OAuthError::InvalidState)),
-        "expired entry remained after purge"
-    );
+    assert_oauth_error(store.consume("expired", NOW), OAuthError::InvalidState);
 }
 
 #[test]
@@ -335,13 +334,13 @@ fn state_store_keeps_only_bounded_replay_tombstones() {
         .reserve("expired", "discard-after-expiry", NOW)
         .expect("expired fixture reservation");
 
-    assert_eq!(
+    assert_verifier_matches(
         store.consume("consumed", now_plus(1)),
-        Ok("discard-after-consume".to_owned())
+        "discard-after-consume",
     );
-    assert_eq!(
+    assert_oauth_error(
         store.reserve("consumed", "replacement", expires_at),
-        Err(OAuthError::StateAlreadyUsed)
+        OAuthError::StateAlreadyUsed,
     );
     assert!(
         format!("{store:?}").contains("entry_count: 2"),
@@ -356,10 +355,7 @@ fn state_store_keeps_only_bounded_replay_tombstones() {
     store
         .reserve("consumed", "replacement", expires_at)
         .expect("state can be reused after its replay window");
-    assert_eq!(
-        store.consume("consumed", now_plus(1)),
-        Ok("replacement".to_owned())
-    );
+    assert_verifier_matches(store.consume("consumed", now_plus(1)), "replacement");
 }
 
 #[test]
@@ -375,7 +371,7 @@ fn begin_failure_from_duplicate_state_does_not_replace_existing_verifier() {
         NOW,
     )
     .expect("first start");
-    assert_eq!(
+    assert_oauth_error(
         oauth_start::begin(
             OAuthProvider::Microsoft,
             &config.microsoft,
@@ -383,15 +379,9 @@ fn begin_failure_from_duplicate_state_does_not_replace_existing_verifier() {
             &random,
             NOW,
         ),
-        Err(OAuthError::StateAlreadyUsed)
+        OAuthError::StateAlreadyUsed,
     );
-    assert!(
-        matches!(
-            store.consume(&first.state, NOW),
-            Ok(verifier) if verifier == first.code_verifier
-        ),
-        "duplicate start replaced the reserved verifier"
-    );
+    assert_verifier_matches(store.consume(&first.state, NOW), &first.code_verifier);
 }
 
 #[test]
@@ -399,7 +389,7 @@ fn randomness_failure_never_reserves_partial_state() {
     let config = config_with_id(OAuthProvider::Google, "client-id");
     let random = DeterministicRandom::failing_after(1);
     let mut store = InMemoryOAuthStateStore::default();
-    assert_eq!(
+    assert_oauth_error(
         oauth_start::begin(
             OAuthProvider::Google,
             &config.google,
@@ -407,12 +397,12 @@ fn randomness_failure_never_reserves_partial_state() {
             &random,
             NOW,
         ),
-        Err(OAuthError::RandomnessFailure)
+        OAuthError::RandomnessFailure,
     );
     assert_eq!(random.calls(), 2);
-    assert_eq!(
+    assert_oauth_error(
         store.consume(&URL_SAFE_NO_PAD.encode([0u8; 32]), NOW),
-        Err(OAuthError::InvalidState)
+        OAuthError::InvalidState,
     );
 }
 
@@ -430,6 +420,21 @@ fn start_debug_and_errors_redact_state_verifier_and_complete_urls() {
     let debug = format!("{start:?}");
     assert!(!debug.contains(SENTINEL));
     assert!(!debug.contains("authorize.example.test"));
+
+    let panic = std::panic::catch_unwind(|| {
+        assert_verifier_matches(Ok(SENTINEL.to_owned()), "different-verifier");
+    })
+    .expect_err("mismatched verifier should fail the assertion");
+    let mentions_sentinel = panic
+        .downcast_ref::<String>()
+        .is_some_and(|message| message.contains(SENTINEL))
+        || panic
+            .downcast_ref::<&str>()
+            .is_some_and(|message| message.contains(SENTINEL));
+    assert!(
+        !mentions_sentinel,
+        "verifier assertion leaked the sentinel into failure diagnostics"
+    );
 
     for error in [
         OAuthError::InvalidState,
