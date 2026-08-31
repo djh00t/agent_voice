@@ -2325,7 +2325,7 @@ impl PaStore {
     /// error.
     pub fn load_provider_cursor(&self, stream_id: impl AsRef<str>) -> StoreResult<Option<String>> {
         let stream_id =
-            validate_provider_cursor_identifier(stream_id.as_ref().to_owned(), "stream_id")?;
+            validate_provider_stream_identifier(stream_id.as_ref().to_owned(), "stream_id")?;
         let cursor = self
             .connection
             .query_row(
@@ -2355,7 +2355,7 @@ impl PaStore {
         expected: Option<&str>,
         next: &str,
     ) -> StoreResult<()> {
-        let stream_id = validate_provider_cursor_identifier(stream_id.to_owned(), "stream_id")?;
+        let stream_id = validate_provider_stream_identifier(stream_id.to_owned(), "stream_id")?;
         let expected = expected
             .map(|value| validate_provider_cursor_identifier(value.to_owned(), "expected"))
             .transpose()?;
@@ -6713,6 +6713,10 @@ fn validate_provider_cursor_identifier(value: String, field: &'static str) -> St
         return Err(StoreError::InvalidInput { field });
     }
     Ok(value)
+}
+
+fn validate_provider_stream_identifier(value: String, field: &'static str) -> StoreResult<String> {
+    validate_machine_identifier_with_limit(value, field, MAX_PROVIDER_CURSOR_LENGTH)
 }
 
 fn validate_machine_identifier_with_limit(
