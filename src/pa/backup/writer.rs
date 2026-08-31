@@ -218,10 +218,7 @@ fn publish_without_replacement_owned(
     source_identity: &fs::Metadata,
 ) -> io::Result<()> {
     if !path_matches_identity(source, source_identity) {
-        return Err(io::Error::new(
-            ErrorKind::Other,
-            "temporary file identity changed",
-        ));
+        return Err(io::Error::other("temporary file identity changed"));
     }
 
     #[cfg(target_os = "linux")]
@@ -236,10 +233,7 @@ fn publish_without_replacement_owned(
     fs::hard_link(source, destination)?;
     if !path_matches_identity(source, source_identity) {
         remove_if_owned(destination, source_identity);
-        return Err(io::Error::new(
-            ErrorKind::Other,
-            "temporary file identity changed",
-        ));
+        return Err(io::Error::other("temporary file identity changed"));
     }
     if let Err(error) = fs::remove_file(source) {
         remove_if_owned(destination, source_identity);
