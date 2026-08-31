@@ -311,6 +311,20 @@ fn state_store_is_single_use_expiring_and_failure_atomic() {
 }
 
 #[test]
+fn state_store_purges_expired_entries_past_the_replay_window() {
+    let mut store = InMemoryOAuthStateStore::default();
+    store
+        .reserve("expired", "discard-me", NOW)
+        .expect("expired fixture reservation");
+    store.purge_expired(NOW);
+
+    assert!(
+        matches!(store.consume("expired", NOW), Err(OAuthError::InvalidState)),
+        "expired entry remained after purge"
+    );
+}
+
+#[test]
 fn begin_failure_from_duplicate_state_does_not_replace_existing_verifier() {
     let config = config_with_id(OAuthProvider::Microsoft, "client-id");
     let random = DeterministicRandom::new([[0x61; 32], [0x62; 32], [0x61; 32], [0x62; 32]]);
