@@ -523,8 +523,7 @@ impl CalendarReadProvider for FakeCalendarRead {
             }
             let mut matching_changes = Vec::new();
             for (position, change) in state.changes.iter().enumerate().skip(start) {
-                if let Some(change) =
-                    change_for_sync(change, &time_range, &mut prior_event_ranges)?
+                if let Some(change) = change_for_sync(change, &time_range, &mut prior_event_ranges)?
                 {
                     matching_changes.push((position, change));
                 }
@@ -1053,11 +1052,8 @@ fn change_for_sync(
             return Ok(Some(change.clone()));
         }
         if was_matching {
-            return CalendarChange::deleted(
-                event.provider_event_id(),
-                event.last_modified_at(),
-            )
-            .map(Some);
+            return CalendarChange::deleted(event.provider_event_id(), event.last_modified_at())
+                .map(Some);
         }
         return Ok(None);
     }
@@ -1088,7 +1084,8 @@ fn offset_key(value: time::OffsetDateTime) -> (i64, u32) {
 #[cfg(test)]
 mod tests {
     use super::{FakeCalendarRead, FakeGoogleCalendar, FakeOutlookCalendar};
-    use crate::pa::availability::BusyInterval;
+    use crate::pa::availability::{AvailabilityPolicy, BusyInterval};
+    use crate::pa::domain::{AppointmentKind, CallerIdentity, ConfirmedEmail, IdempotencyKey};
     use crate::pa::fakes::{FakeControl, FakeOperation};
     use crate::pa::providers::{
         CalendarAttendee, CalendarChange, CalendarEvent, CalendarReadProvider, CalendarSyncRequest,
@@ -1096,11 +1093,15 @@ mod tests {
         OutlookCalendarProvider, OwnerEventDraft, ProviderError, ProviderEventId, ProviderFuture,
         ProviderSession, RetryAfter, Rsvp, TimeRange,
     };
+    use crate::pa::service::{
+        ConfirmedPreparedRequest, ExplicitConfirmation, PaService, ServiceError,
+    };
+    use crate::pa::store::PaStore;
     use chrono::{DateTime, Duration, Utc};
     use futures_util::FutureExt;
     use std::fmt;
     use std::sync::Arc;
-    use time::{OffsetDateTime, UtcOffset};
+    use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
     const NOW: &str = "2026-08-29T12:34:56Z";
 
@@ -2198,6 +2199,245 @@ mod tests {
                 .expect("find count"),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn google_ambiguous_create_is_recovered_by_operation_lookup() {
+        let submission_now =
+            OffsetDateTime::parse("2026-08-31T08:00:00Z", &Rfc3339).expect("valid now");
+        let fake_now = DateTime::<Utc>::from_timestamp(
+            submission_now.unix_timestamp(),
+            submission_now.nanosecond(),
+        )
+        .expect("chrono now");
+        let outlook_control = FakeControl::new(fake_now);
+        let google_control = FakeControl::new(fake_now);
+        let store = PaStore::open_in_memory(b"calendar-test-key").expect("store");
+        let outlook = FakeOutlookCalendar::new(
+            &outlook_control,
+            Vec::<BusyInterval>::new(),
+            Vec::<CalendarChange>::new(),
+        );
+        let google = FakeGoogleCalendar::new(
+            &google_control,
+            Vec::<BusyInterval>::new(),
+            Vec::<CalendarChange>::new(),
+        );
+        let outlook_session = ProviderSession::new("outlook-account", "outlook-access-token", None)
+            .expect("outlook session");
+        let google_session = ProviderSession::new("google-account", "google-access-token", None)
+            .expect("google session");
+        let service = PaService::with_owner(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            MailAddress::new("owner@example.test").expect("owner"),
+        );
+        let prepared = service
+            .prepare_request(
+                service
+                    .search_slots(AppointmentKind::Meeting, submission_now, 1)
+                    .await
+                    .expect("search")
+                    .quote()
+                    .id(),
+                0,
+                CallerIdentity::new(
+                    "Ada Lovelace",
+                    ConfirmedEmail::confirm("ada@example.test").expect("caller email"),
+                )
+                .expect("caller"),
+                AppointmentKind::Meeting,
+                None,
+                "voice:ambiguous-recovery",
+                IdempotencyKey::new("appointment:ambiguous-recovery").expect("idempotency key"),
+                submission_now,
+            )
+            .expect("prepare");
+        google
+            .queue_ambiguous_create_failure(ProviderError::Unavailable)
+            .expect("queue ambiguous failure");
+
+        let first_error = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                submission_now,
+            )
+            .await
+            .expect_err("ambiguous create must fail closed");
+        assert!(matches!(
+            &first_error,
+            ServiceError::GoogleCalendar(ProviderError::Unavailable)
+        ));
+        assert_eq!(first_error.to_string(), "google calendar operation failed");
+        assert_eq!(format!("{first_error:?}"), "GoogleCalendar");
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            1
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            2
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count"),
+            2
+        );
+
+        let count = |table: &str| {
+            store
+                .connection()
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("row count")
+        };
+        assert_eq!(count("proposals"), 1);
+        assert_eq!(count("event_mappings"), 0);
+        assert_eq!(count("notification_outbox"), 0);
+        assert_eq!(count("audit_events"), 0);
+
+        let remote_event = {
+            let state = google.read.state.lock().expect("state");
+            assert_eq!(state.google_proposal_create_drafts.len(), 1);
+            assert_eq!(state.google_proposal_events.len(), 1);
+            assert_eq!(state.changes.len(), 1);
+            state.google_proposal_events[0].clone()
+        };
+        assert_eq!(
+            remote_event.operation_key(),
+            format!("pa-google-proposal-draft-{}", prepared.draft_id())
+        );
+        assert_eq!(remote_event.title(), "Pending assistant request");
+        assert_eq!(remote_event.timezone(), prepared.timezone());
+        assert_eq!(remote_event.attendees().len(), 1);
+        assert_eq!(
+            remote_event.attendees()[0].address().as_str(),
+            "owner@example.test"
+        );
+        assert_eq!(remote_event.attendees()[0].rsvp(), Rsvp::NeedsAction);
+
+        let recovered = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared.clone(), ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                submission_now + time::Duration::minutes(1),
+            )
+            .await
+            .expect("lookup recovery");
+        assert!(recovered.is_pending());
+        assert!(recovered.requester_notification_id().is_some());
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            2
+        );
+        assert_eq!(count("proposals"), 1);
+        assert_eq!(count("event_mappings"), 1);
+        assert_eq!(count("notification_outbox"), 2);
+        assert_eq!(count("audit_events"), 4);
+        let mapping = store
+            .load_event_mapping_by_proposal_id(recovered.proposal_id())
+            .expect("mapping");
+        assert_eq!(mapping.id(), recovered.event_mapping_id());
+        assert_eq!(mapping.provider(), "google_calendar");
+        let notifications = store.list_pending_notifications().expect("outbox");
+        assert_eq!(notifications.len(), 2);
+        assert!(notifications.iter().all(|notification| {
+            notification.proposal_id() == Some(recovered.proposal_id())
+                && notification.event_mapping_id() == Some(recovered.event_mapping_id())
+        }));
+        let audits = store.list_audit_events(None, 10).expect("audits");
+        assert_eq!(audits.len(), 4);
+        assert_eq!(
+            audits
+                .iter()
+                .map(|audit| audit.idempotency_key())
+                .collect::<Vec<_>>(),
+            vec![
+                format!("pa-audit-request-submitted-{}", prepared.draft_id()),
+                format!("pa-audit-proposal-created-{}", recovered.proposal_id()),
+                format!(
+                    "pa-audit-notification-enqueued-owner-{}",
+                    recovered.proposal_id()
+                ),
+                format!(
+                    "pa-audit-notification-enqueued-requester-{}",
+                    recovered.proposal_id()
+                ),
+            ]
+        );
+        for original in &audits {
+            let reloaded = store
+                .load_audit_event_by_idempotency_key(original.idempotency_key())
+                .expect("audit reload");
+            assert_eq!(&reloaded, original);
+        }
+
+        let stable_retry = service
+            .submit_request(
+                ConfirmedPreparedRequest::new(prepared, ExplicitConfirmation::new())
+                    .expect("confirmation"),
+                submission_now + time::Duration::minutes(2),
+            )
+            .await
+            .expect("stable exact retry");
+        assert_eq!(stable_retry, recovered);
+        let audits_after_retry = store.list_audit_events(None, 10).expect("audits");
+        assert_eq!(audits_after_retry, audits);
+        for (original, after_retry) in audits.iter().zip(&audits_after_retry) {
+            assert_eq!(after_retry, original);
+            let reloaded = store
+                .load_audit_event_by_idempotency_key(after_retry.idempotency_key())
+                .expect("audit reload after retry");
+            assert_eq!(&reloaded, original);
+        }
+        assert_eq!(count("proposals"), 1);
+        assert_eq!(count("event_mappings"), 1);
+        assert_eq!(count("notification_outbox"), 2);
+        assert_eq!(count("audit_events"), 4);
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalCreate)
+                .expect("create count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarProposalFind)
+                .expect("find count"),
+            2
+        );
+        let debug = format!("{google:?}");
+        assert!(debug.contains("proposal_event_count: 1"));
+        assert!(!debug.contains("pa-google-proposal-draft-"));
+        assert!(!debug.contains("fake-google-proposal-event-"));
+        assert!(!debug.contains("Pending assistant request"));
+        assert!(!debug.contains("owner@example.test"));
+        assert!(!debug.contains("google-access-token"));
     }
 
     #[test]
