@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{AdminConfigPatch, AdminConfigStore, TaskDurationsPatch, WorkingDay};
-use crate::pa::store::{PaStore, StoreError};
+use crate::pa::store::{MAX_TASK_DURATION_MINUTES, PaStore, StoreError};
 use serde_json::json;
 
 const DATABASE_KEY: &[u8] = b"fixed-admin-config-test-key";
@@ -170,6 +170,87 @@ fn admin_config_exact_json_and_validation() {
             .expect_err("invalid patch should fail before update");
         assert!(!format!("{error:?}").contains("not/a-timezone"));
     }
+}
+
+#[test]
+fn task_durations_enforce_domain_max() {
+    let store = in_memory_store();
+    let admin = AdminConfigStore::new(Arc::clone(&store));
+    let before = admin.read().expect("read default config");
+    let maximum = MAX_TASK_DURATION_MINUTES;
+    let accepted = admin
+        .update_config(
+            before.version,
+            AdminConfigPatch {
+                task_duration_minutes: Some(TaskDurationsPatch {
+                    bill: Some(maximum),
+                    callback: Some(maximum),
+                    reading: Some(maximum),
+                    email_reply: Some(maximum),
+                    preparation: Some(maximum),
+                }),
+                ..AdminConfigPatch::default()
+            },
+        )
+        .expect("domain maximum should be accepted");
+    assert_eq!(accepted.task_duration_minutes.bill, maximum);
+    assert_eq!(accepted.task_duration_minutes.callback, maximum);
+    assert_eq!(accepted.task_duration_minutes.reading, maximum);
+    assert_eq!(accepted.task_duration_minutes.email_reply, maximum);
+    assert_eq!(accepted.task_duration_minutes.preparation, maximum);
+
+    for (field, durations) in [
+        (
+            "task_duration_bill_minutes",
+            TaskDurationsPatch {
+                bill: Some(maximum + 1),
+                ..TaskDurationsPatch::default()
+            },
+        ),
+        (
+            "task_duration_callback_minutes",
+            TaskDurationsPatch {
+                callback: Some(maximum + 1),
+                ..TaskDurationsPatch::default()
+            },
+        ),
+        (
+            "task_duration_reading_minutes",
+            TaskDurationsPatch {
+                reading: Some(maximum + 1),
+                ..TaskDurationsPatch::default()
+            },
+        ),
+        (
+            "task_duration_email_reply_minutes",
+            TaskDurationsPatch {
+                email_reply: Some(maximum + 1),
+                ..TaskDurationsPatch::default()
+            },
+        ),
+        (
+            "task_duration_preparation_minutes",
+            TaskDurationsPatch {
+                preparation: Some(maximum + 1),
+                ..TaskDurationsPatch::default()
+            },
+        ),
+    ] {
+        let error = admin
+            .update_config(
+                accepted.version,
+                AdminConfigPatch {
+                    task_duration_minutes: Some(durations),
+                    ..AdminConfigPatch::default()
+                },
+            )
+            .expect_err("duration above domain maximum should fail");
+        assert!(matches!(
+            error,
+            StoreError::InvalidInput { field: actual } if actual == field
+        ));
+    }
+    assert_eq!(admin.read().expect("read unchanged config"), accepted);
 }
 
 #[test]
