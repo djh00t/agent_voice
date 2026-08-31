@@ -528,20 +528,20 @@ pub struct BackupConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackupConfigFields {
-    #[serde(default = "default_backup_enabled")]
-    enabled: bool,
     #[serde(default)]
-    bucket: String,
-    #[serde(default = "default_backup_prefix")]
-    prefix: String,
+    enabled: Option<serde_yaml::Value>,
     #[serde(default)]
-    region: String,
+    bucket: Option<serde_yaml::Value>,
     #[serde(default)]
-    endpoint: Option<String>,
+    prefix: Option<serde_yaml::Value>,
+    #[serde(default)]
+    region: Option<serde_yaml::Value>,
+    #[serde(default)]
+    endpoint: Option<serde_yaml::Value>,
     #[serde(default)]
     retention_days: Option<serde_yaml::Value>,
-    #[serde(default = "default_backup_temp_dir")]
-    temp_dir: PathBuf,
+    #[serde(default)]
+    temp_dir: Option<serde_yaml::Value>,
     #[serde(default)]
     max_age_hours: Option<serde_yaml::Value>,
 }
@@ -560,28 +560,138 @@ impl<'de> Deserialize<'de> for BackupConfig {
             return Err(serde::de::Error::custom("backup: secret_field_rejected"));
         }
 
-        let fields: BackupConfigFields = serde_yaml::from_value(value)
+        let fields: BackupConfigFields = serde_yaml::from_value(value.clone())
             .map_err(|error| serde::de::Error::custom(error.to_string()))?;
-        let retention_days = parse_backup_yaml_retention(fields.retention_days)
-            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
-        let max_age_hours = parse_backup_yaml_max_age(fields.max_age_hours)
-            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let enabled = parse_backup_yaml_enabled(
+            fields
+                .enabled
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "enabled")),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let bucket = parse_backup_yaml_string(
+            fields
+                .bucket
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "bucket")),
+            "bucket",
+            "invalid_bucket",
+            String::new(),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let prefix = parse_backup_yaml_string(
+            fields
+                .prefix
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "prefix")),
+            "prefix",
+            "invalid_prefix",
+            default_backup_prefix(),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let region = parse_backup_yaml_string(
+            fields
+                .region
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "region")),
+            "region",
+            "invalid_region",
+            String::new(),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let endpoint = parse_backup_yaml_endpoint(
+            fields
+                .endpoint
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "endpoint")),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let retention_days = parse_backup_yaml_retention(
+            fields
+                .retention_days
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "retention_days")),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let temp_dir = parse_backup_yaml_temp_dir(
+            fields
+                .temp_dir
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "temp_dir")),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let max_age_hours = parse_backup_yaml_max_age(
+            fields
+                .max_age_hours
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "max_age_hours")),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
         Ok(Self {
-            enabled: fields.enabled,
-            bucket: fields.bucket,
-            prefix: fields.prefix,
-            region: fields.region,
-            endpoint: fields.endpoint,
+            enabled,
+            bucket,
+            prefix,
+            region,
+            endpoint,
             retention_days,
-            temp_dir: fields.temp_dir,
+            temp_dir,
             max_age_hours,
         })
     }
 }
 
-fn parse_backup_yaml_retention(value: Option<serde_yaml::Value>) -> Result<u16> {
+fn backup_yaml_field<'a>(
+    value: &'a serde_yaml::Value,
+    field: &str,
+) -> Option<&'a serde_yaml::Value> {
+    let key = serde_yaml::Value::String(field.to_string());
+    value.as_mapping()?.get(&key)
+}
+
+fn parse_backup_yaml_enabled(value: Option<&serde_yaml::Value>) -> Result<bool> {
+    match value {
+        Some(value) => serde_yaml::from_value::<bool>(value.clone())
+            .map_err(|_| backup_error("enabled", "missing_required")),
+        None => Ok(default_backup_enabled()),
+    }
+}
+
+fn parse_backup_yaml_string(
+    value: Option<&serde_yaml::Value>,
+    field: &str,
+    code: &str,
+    default: String,
+) -> Result<String> {
+    match value {
+        Some(value) => {
+            serde_yaml::from_value::<String>(value.clone()).map_err(|_| backup_error(field, code))
+        }
+        None => Ok(default),
+    }
+}
+
+fn parse_backup_yaml_endpoint(value: Option<&serde_yaml::Value>) -> Result<Option<String>> {
+    match value {
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => serde_yaml::from_value::<String>(value.clone())
+            .map(Some)
+            .map_err(|_| backup_error("endpoint", "invalid_endpoint")),
+        None => Ok(None),
+    }
+}
+
+fn parse_backup_yaml_temp_dir(value: Option<&serde_yaml::Value>) -> Result<PathBuf> {
+    match value {
+        Some(value) => serde_yaml::from_value::<String>(value.clone())
+            .map(PathBuf::from)
+            .map_err(|_| backup_error("temp_dir", "invalid_temp_dir")),
+        None => Ok(default_backup_temp_dir()),
+    }
+}
+
+fn parse_backup_yaml_retention(value: Option<&serde_yaml::Value>) -> Result<u16> {
     let parsed = match value {
-        Some(value) => serde_yaml::from_value::<u64>(value)
+        Some(value) => serde_yaml::from_value::<u64>(value.clone())
             .map_err(|_| backup_error("retention_days", "invalid_retention"))?,
         None => u64::from(default_backup_retention_days()),
     };
@@ -592,9 +702,9 @@ fn parse_backup_yaml_retention(value: Option<serde_yaml::Value>) -> Result<u16> 
     }
 }
 
-fn parse_backup_yaml_max_age(value: Option<serde_yaml::Value>) -> Result<u32> {
+fn parse_backup_yaml_max_age(value: Option<&serde_yaml::Value>) -> Result<u32> {
     let parsed = match value {
-        Some(value) => serde_yaml::from_value::<u64>(value)
+        Some(value) => serde_yaml::from_value::<u64>(value.clone())
             .map_err(|_| backup_error("max_age_hours", "invalid_max_age"))?,
         None => u64::from(default_backup_max_age_hours()),
     };
@@ -3640,6 +3750,37 @@ agent_api:
                 .to_string();
             assert_eq!(error, expected);
             assert!(!error.contains(value));
+        }
+    }
+
+    #[test]
+    fn backup_config_yaml_enabled_type_errors_are_frozen_and_redacted() {
+        for value in ["do-not-log-enabled-sentinel", "1", "null"] {
+            let yaml = format!("enabled: {value}\nbucket: agent-voice-test\n");
+            let error = serde_yaml::from_str::<BackupConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "backup.enabled: missing_required");
+            assert!(!error.contains(value));
+        }
+    }
+
+    #[test]
+    fn backup_config_yaml_scalar_type_errors_are_frozen_and_redacted() {
+        for (field, expected) in [
+            ("bucket", "backup.bucket: invalid_bucket"),
+            ("prefix", "backup.prefix: invalid_prefix"),
+            ("region", "backup.region: invalid_region"),
+            ("endpoint", "backup.endpoint: invalid_endpoint"),
+            ("temp_dir", "backup.temp_dir: invalid_temp_dir"),
+        ] {
+            let sentinel = format!("do-not-log-{field}-sentinel");
+            let yaml = format!("{field}: [{sentinel}]\n");
+            let error = serde_yaml::from_str::<BackupConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, expected);
+            assert!(!error.contains(&sentinel));
         }
     }
 
