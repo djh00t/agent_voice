@@ -5,7 +5,7 @@ use std::io::{self, ErrorKind, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Arc, Barrier, Mutex, OnceLock};
@@ -339,6 +339,14 @@ fn temporary_path(parent: &Path, sequence: u64) -> PathBuf {
     ))
 }
 
+fn same_path(left: &Path, right: &Path) -> bool {
+    left.components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .eq(right
+            .components()
+            .filter(|component| !matches!(component, Component::CurDir)))
+}
+
 struct TemporaryFile {
     path: PathBuf,
     file: Option<File>,
@@ -351,7 +359,7 @@ impl TemporaryFile {
         for _ in 0..TEMP_COLLISION_LIMIT {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = temporary_path(parent, sequence);
-            if path == destination {
+            if same_path(&path, destination) {
                 continue;
             }
             let mut options = OpenOptions::new();
@@ -725,6 +733,20 @@ mod tests {
             SNAPSHOT
         );
         assert!(directory.temporary_entries_except(&destination).is_empty());
+    }
+
+    #[test]
+    fn temporary_path_comparison_normalizes_current_directory() {
+        let _lock = lock_tests();
+        let sequence = super::TEMP_SEQUENCE.load(Ordering::Relaxed);
+        let bare_destination = PathBuf::from(format!(
+            "{}{}-{sequence}.tmp",
+            super::TEMP_FILE_PREFIX,
+            std::process::id()
+        ));
+        let synthesized = super::temporary_path(Path::new("."), sequence);
+
+        assert!(super::same_path(&bare_destination, &synthesized));
     }
 
     #[cfg(unix)]
