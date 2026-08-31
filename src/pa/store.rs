@@ -13718,6 +13718,7 @@ END;
         let invalid_streams = vec![
             String::new(),
             " ".to_owned(),
+            "stream id".to_owned(),
             "stream\tid".to_owned(),
             "stream\nid".to_owned(),
             "é".to_owned(),
@@ -13740,7 +13741,7 @@ END;
             .expect("invalid stream row count");
         assert!(count == 0);
 
-        let printable_stream = "microsoft.mail:account-a printable";
+        let printable_stream = "microsoft.mail:account-printable";
         let printable_cursor = "page=abc/def+ 1";
         store
             .advance_provider_cursor(printable_stream, None, printable_cursor)
