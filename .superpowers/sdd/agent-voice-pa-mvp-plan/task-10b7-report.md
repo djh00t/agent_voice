@@ -5,7 +5,7 @@
 - **Evidence date:** 2026-08-31 (Australia/Sydney)
 - **Worktree:** `/Users/djh/.codex/worktrees/agent_voice-224`
 - **Branch:** `codex/issue-224`
-- **Base:** `5469cad6` (`origin/main`)
+- **Base:** `5469cad6862f69264cb55b159c4443038fa84864` (`origin/main`)
 
 ## Contract and readback
 
@@ -222,9 +222,15 @@ repair commits are:
   `src/realtime/server_response_events.rs`
 - `04b7533` — report-only rebased readback:
   `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
+- `c31b60c` — report-only hash refresh:
+  `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
+- `571d3c4` — report-only main-base readback:
+  `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
+- `59be339` — report-only latest-base refresh:
+  `.superpowers/sdd/agent-voice-pa-mvp-plan/task-10b7-report.md`
 
-This report update is the next report-only repair commit and records the
-review evidence above; all listed commits preserve the exact-one-file rule.
+The final report update follows as one more report-only commit; all listed
+commits preserve the exact-one-file rule.
 
 The delivering PR footer is exactly:
 
