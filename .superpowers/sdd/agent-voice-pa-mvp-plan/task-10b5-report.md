@@ -122,7 +122,7 @@ transcript `transcript`; rejected errors remain fixed and redacted.
 | `rtk rustfmt --edition 2021 --check src/realtime/server_audio_events.rs` | PASS |
 | `rtk cargo clippy --test realtime_server_audio_events_contract -- -D warnings` | PASS — no issues found |
 | `rtk git diff --check` | PASS |
-| `rtk make check` | PASS — 548 library tests, integration suites (6, 18, 230, 3, 19), 3 doc-tests, Clippy, rustdoc, and Docusaurus |
+| `rtk make check` | PASS — 548 library tests, integration suites (6, 18, 230, 3, 3, 19), 3 doc-tests, Clippy, rustdoc, and Docusaurus |
 
 The first `rtk make check` attempt found the fresh-worktree environment had no
 Docusaurus executable. `rtk make docs-install` installed from the checked-in
