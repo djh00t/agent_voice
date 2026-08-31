@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -169,6 +169,9 @@ static PUBLICATION_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::ne
 static PARENT_HANDOFF_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
 
 #[cfg(all(test, unix))]
+static TEMPORARY_CREATION_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
+
+#[cfg(all(test, unix))]
 fn set_publication_barrier(barrier: Option<Arc<Barrier>>) {
     *PUBLICATION_BARRIER
         .get_or_init(|| Mutex::new(None))
@@ -210,6 +213,27 @@ fn wait_for_parent_handoff() {
     }
 }
 
+#[cfg(all(test, unix))]
+fn set_temporary_creation_barrier(barrier: Option<Arc<Barrier>>) {
+    *TEMPORARY_CREATION_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("temporary creation barrier is not poisoned") = barrier;
+}
+
+#[cfg(all(test, unix))]
+fn wait_for_temporary_creation() {
+    let barrier = TEMPORARY_CREATION_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("temporary creation barrier is not poisoned")
+        .clone();
+    if let Some(barrier) = barrier {
+        barrier.wait();
+        barrier.wait();
+    }
+}
+
 fn write_inner(
     destination: &Path,
     encoded_snapshot: &[u8],
@@ -223,6 +247,8 @@ fn write_inner(
     let parent_directory = open_parent_directory(parent)?;
     ensure_destination_absent(destination)?;
     ensure_destination_absent_at(&parent_directory, destination)?;
+    #[cfg(all(test, unix))]
+    wait_for_temporary_creation();
     let mut temporary = TemporaryFile::create(parent, &parent_directory, destination)?;
 
     if fault == FaultStage::Write {
@@ -396,7 +422,17 @@ fn path_name(path: &Path) -> io::Result<CString> {
 #[cfg(unix)]
 fn open_at(parent: &File, name: &CStr) -> io::Result<File> {
     let flags = no_follow_open_flags()?;
-    let descriptor = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags, 0) };
+    open_at_with_flags(parent, name, flags, 0)
+}
+
+#[cfg(unix)]
+fn open_at_with_flags(
+    parent: &File,
+    name: &CStr,
+    flags: std::os::raw::c_int,
+    mode: std::os::raw::c_uint,
+) -> io::Result<File> {
+    let descriptor = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags, mode) };
     if descriptor < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -425,6 +461,35 @@ fn no_follow_open_flags() -> io::Result<std::os::raw::c_int> {
             "no-follow directory entry access is unavailable on this platform",
         ))
     }
+}
+
+#[cfg(unix)]
+fn temporary_open_flags() -> io::Result<std::os::raw::c_int> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        Ok(0o2 | 0o100 | 0o200 | 0o400000)
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        Ok(0x0002 | 0x0200 | 0x0800 | 0x0100)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    {
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "exclusive no-follow temporary creation is unavailable on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn open_temporary_at(parent: &File, name: &CStr) -> io::Result<File> {
+    open_at_with_flags(parent, name, temporary_open_flags()?, 0o600)
 }
 
 #[cfg(unix)]
@@ -667,18 +732,20 @@ impl TemporaryFile {
             if same_path(&path, destination) {
                 continue;
             }
-            let mut options = OpenOptions::new();
-            options.read(true).write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-
-                options.mode(0o600);
-            }
             let parent_handle = parent_directory
                 .try_clone()
                 .map_err(|_| WriterError::Write)?;
-            match options.open(&path) {
+            #[cfg(unix)]
+            let open_result = {
+                let name = path_name(&path).map_err(|_| WriterError::Write)?;
+                open_temporary_at(&parent_handle, &name)
+            };
+            #[cfg(not(unix))]
+            let open_result: io::Result<File> = Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "exclusive no-follow temporary creation is unavailable on this platform",
+            ));
+            match open_result {
                 Ok(file) => {
                     let mut created = CreatedTemporary::new(path, parent_handle, file);
                     let identity = match created.file().metadata() {
@@ -1317,6 +1384,59 @@ mod tests {
             fs::read(&alias).expect("aliased snapshot remains"),
             SNAPSHOT
         );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn validated_parent_handle_pins_temporary_creation() {
+        let _lock = lock_tests();
+        let directory = TestDirectory::new();
+        let destination = directory.destination("destination.bin");
+        let moved = directory.path.with_file_name(format!(
+            "{}-moved-before-create",
+            directory
+                .path
+                .file_name()
+                .expect("test directory has a name")
+                .to_string_lossy()
+        ));
+        assert!(!moved.exists(), "moved test directory must be unused");
+
+        let barrier = Arc::new(Barrier::new(2));
+        super::set_temporary_creation_barrier(Some(Arc::clone(&barrier)));
+        let writer_destination = destination.clone();
+        let writer =
+            std::thread::spawn(move || AtomicSnapshotWriter::write(&writer_destination, SNAPSHOT));
+
+        barrier.wait();
+        fs::rename(&directory.path, &moved).expect("rename validated parent directory");
+        fs::create_dir(&directory.path).expect("replace parent directory");
+        barrier.wait();
+
+        let result = writer.join().expect("writer thread completes");
+        super::set_temporary_creation_barrier(None);
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            fs::read(moved.join("destination.bin")).expect("published snapshot in pinned parent"),
+            SNAPSHOT
+        );
+        assert!(!directory.path.join("destination.bin").exists());
+        assert!(directory.temporary_entries().is_empty());
+        assert!(
+            fs::read_dir(&directory.path)
+                .expect("replacement parent remains readable")
+                .next()
+                .is_none()
+        );
+
+        fs::remove_dir(&directory.path).expect("remove replacement parent");
+        fs::remove_file(moved.join("destination.bin")).expect("remove published snapshot");
+        fs::remove_dir(&moved).expect("remove moved parent");
     }
 
     #[cfg(any(
