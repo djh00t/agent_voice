@@ -609,6 +609,13 @@ impl TemporaryFile {
             }
             match options.open(&path) {
                 Ok(file) => {
+                    #[cfg(unix)]
+                    if file
+                        .set_permissions(fs::Permissions::from_mode(0o600))
+                        .is_err()
+                    {
+                        return Err(WriterError::Write);
+                    }
                     let identity = match file.metadata() {
                         Ok(identity) => identity,
                         Err(_) => {
