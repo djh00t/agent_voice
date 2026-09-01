@@ -1978,6 +1978,53 @@ mod tests {
         }
     }
 
+    struct OwnerSubmitDatabase {
+        paths: [std::path::PathBuf; 3],
+    }
+
+    impl OwnerSubmitDatabase {
+        fn new() -> Self {
+            let database = std::env::temp_dir().join(format!(
+                "agent_voice_owner_submit_race_{}_{}.db",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            Self {
+                paths: [
+                    database.clone(),
+                    std::path::PathBuf::from(format!("{}-wal", database.display())),
+                    std::path::PathBuf::from(format!("{}-shm", database.display())),
+                ],
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.paths[0]
+        }
+
+        fn cleanup(&self) {
+            for path in &self.paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+
+        fn assert_absent(&self) {
+            for path in &self.paths {
+                assert!(
+                    !path.exists(),
+                    "temporary owner-submit path remains: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    impl Drop for OwnerSubmitDatabase {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
     fn appointment_quote_row_count(store: &PaStore) -> i64 {
         store
             .connection()
@@ -7283,16 +7330,35 @@ mod tests {
         assert_eq!(audit.entity_type(), AuditEntityType::OwnerTask);
     }
 
+    #[test]
+    fn owner_submit_database_cleans_exact_paths_when_panic_unwinds() {
+        let database = OwnerSubmitDatabase::new();
+        let paths = database.paths.clone();
+        for path in &paths {
+            std::fs::write(path, b"owner-submit-cleanup-fixture").expect("create fixture file");
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _database = database;
+            panic!("exercise owner-submit cleanup during unwinding");
+        }));
+        assert!(result.is_err());
+        for path in paths {
+            assert!(
+                !path.exists(),
+                "panic cleanup left temporary path: {}",
+                path.display()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_identical_owner_submits_converge_to_one_event_mapping_and_audit() {
         let now = now();
-        let path = std::env::temp_dir().join(format!(
-            "agent_voice_owner_submit_race_{}_{}.db",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let first_store = PaStore::open(&path, b"service-test-key").expect("first store");
-        let second_store = PaStore::open(&path, b"service-test-key").expect("second store");
+        let database = OwnerSubmitDatabase::new();
+        let first_store = PaStore::open(database.path(), b"service-test-key").expect("first store");
+        let second_store =
+            PaStore::open(database.path(), b"service-test-key").expect("second store");
         let outlook_control = control(now);
         let google_control = control(now);
         let outlook = FakeOutlookCalendar::new(
@@ -7388,7 +7454,7 @@ mod tests {
         assert_eq!(first.owner_task_draft_id(), prepared.owner_task_draft_id());
         assert_eq!(first.state(), "submitted");
 
-        let reopened = PaStore::open(&path, b"service-test-key").expect("reopen store");
+        let reopened = PaStore::open(database.path(), b"service-test-key").expect("reopen store");
         assert_eq!(
             reopened
                 .connection()
@@ -7445,6 +7511,7 @@ mod tests {
             placement.provider_event_id().expect("provider mapping")
         );
         drop(reopened);
-        std::fs::remove_file(path).expect("remove race database");
+        database.cleanup();
+        database.assert_absent();
     }
 }
