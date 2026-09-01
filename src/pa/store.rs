@@ -8323,12 +8323,12 @@ mod tests {
     };
 
     use super::{
-        AuditEntityType, AuditEventType, CURRENT_SCHEMA_VERSION, MAX_APPOINTMENT_QUOTE_SLOTS,
-        MAX_AUDIT_ENTITY_ID_LENGTH, MAX_AUDIT_LIST_LIMIT, MAX_MESSAGE_ID_LENGTH,
-        MAX_MESSAGE_LIST_LIMIT, MAX_MESSAGE_SENDER_LENGTH, MAX_MESSAGE_SUBJECT_LENGTH,
-        MAX_MESSAGE_SUMMARY_LENGTH, MAX_TASK_DURATION_MINUTES, MAX_TASK_ID_LENGTH,
-        MAX_TASK_TITLE_LENGTH, MIGRATIONS, MessageProvider, MessageSummary, MessageTriageState,
-        Migration, NotificationKind, NotificationRecipient, NotificationStatus,
+        AuditEntityType, AuditEventType, BUSY_TIMEOUT, CURRENT_SCHEMA_VERSION,
+        MAX_APPOINTMENT_QUOTE_SLOTS, MAX_AUDIT_ENTITY_ID_LENGTH, MAX_AUDIT_LIST_LIMIT,
+        MAX_MESSAGE_ID_LENGTH, MAX_MESSAGE_LIST_LIMIT, MAX_MESSAGE_SENDER_LENGTH,
+        MAX_MESSAGE_SUBJECT_LENGTH, MAX_MESSAGE_SUMMARY_LENGTH, MAX_TASK_DURATION_MINUTES,
+        MAX_TASK_ID_LENGTH, MAX_TASK_TITLE_LENGTH, MIGRATIONS, MessageProvider, MessageSummary,
+        MessageTriageState, Migration, NotificationKind, NotificationRecipient, NotificationStatus,
         NotificationTemplateData, OAuthCredential, PaStore, ProposalSource, StoreError,
         StoreResult, StoredAppointmentDraft, StoredAppointmentQuote, StoredAppointmentQuoteState,
         StoredMessage, StoredProposal, StoredTask, StoredTaskState, TaskTitle, apply_sqlcipher_key,
@@ -8684,6 +8684,11 @@ END;
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .expect("foreign key setting");
         assert_eq!(foreign_keys, 1);
+        let busy_timeout: i64 = restored
+            .connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy timeout setting");
+        assert_eq!(busy_timeout, BUSY_TIMEOUT.as_millis() as i64);
         assert_eq!(
             restored
                 .connection()
