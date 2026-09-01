@@ -41,6 +41,7 @@ impl AuthorizationCode {
     }
 
     /// Returns the consumed PKCE verifier to the in-crate token-exchange boundary.
+    #[allow(dead_code)]
     pub(crate) fn verifier(&self) -> &str {
         &self.verifier
     }
