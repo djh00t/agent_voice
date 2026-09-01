@@ -8516,6 +8516,55 @@ mod tests {
         ]
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct EntrySnapshot {
+        exists: bool,
+        regular: bool,
+        directory: bool,
+        symlink: bool,
+        bytes: Option<Vec<u8>>,
+    }
+
+    fn adjacent_test_path(path: &Path, suffix: &str) -> PathBuf {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        sidecar.into()
+    }
+
+    fn entry_snapshot(path: &Path) -> EntrySnapshot {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                EntrySnapshot {
+                    exists: true,
+                    regular: file_type.is_file(),
+                    directory: file_type.is_dir(),
+                    symlink: file_type.is_symlink(),
+                    bytes: fs::read(path).ok(),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => EntrySnapshot {
+                exists: false,
+                regular: false,
+                directory: false,
+                symlink: false,
+                bytes: None,
+            },
+            Err(error) => panic!("snapshot restore entry: {error}"),
+        }
+    }
+
+    fn restore_entry_snapshots(path: &Path) -> [EntrySnapshot; 4] {
+        ["", "-wal", "-shm", "-journal"].map(|suffix| {
+            entry_snapshot(if suffix.is_empty() {
+                path.to_path_buf()
+            } else {
+                adjacent_test_path(path, suffix)
+            }
+            .as_path())
+        })
+    }
+
     fn random_replay_nonce() -> String {
         let mut bytes = [0_u8; 24];
         SystemRandom::new()
@@ -8877,6 +8926,54 @@ END;
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .expect("restored journal mode");
         assert_eq!(restored_journal_mode, older_journal_mode);
+    }
+
+    #[test]
+    fn restore_open_existing_preserves_sidecar_free_current_snapshot() {
+        let database = TempDatabase::new();
+        let seeded = PaStore::open(&database.path, DATABASE_KEY).expect("seed current fixture");
+        drop(seeded);
+
+        let before = restore_entry_snapshots(&database.path);
+        assert!(before[0].regular, "database fixture must be a regular file");
+        assert!(before[1..].iter().all(|entry| !entry.exists));
+
+        let restored = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect("sidecar-free current snapshot opens");
+        assert_eq!(
+            restored
+                .connection()
+                .query_row("SELECT count(*) FROM configuration", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("current fixture query"),
+            1
+        );
+        drop(restored);
+
+        assert_eq!(restore_entry_snapshots(&database.path), before);
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_wal_and_shm_sidecars_without_mutation() {
+        for suffix in ["-wal", "-shm"] {
+            let database = TempDatabase::new();
+            let seeded = PaStore::open(&database.path, DATABASE_KEY).expect("seed sidecar fixture");
+            drop(seeded);
+
+            fs::write(adjacent_test_path(&database.path, suffix), b"sidecar fixture")
+                .expect("create sidecar fixture");
+            let before = restore_entry_snapshots(&database.path);
+
+            let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+                .expect_err("restore sidecar must fail closed");
+            assert!(matches!(
+                error,
+                StoreError::NotFound {
+                    resource: "database"
+                }
+            ));
+            assert_eq!(restore_entry_snapshots(&database.path), before);
+        }
     }
 
     #[test]
