@@ -1826,14 +1826,15 @@ mod tests {
     use crate::pa::fakes::{FakeControl, FakeGoogleCalendar, FakeOperation, FakeOutlookCalendar};
     use crate::pa::providers::{
         CalendarAttendee, CalendarChange, CalendarEvent, CalendarReadProvider, CalendarSyncRequest,
-        GoogleCalendarProvider, GoogleProposalDraft, MailAddress, ProviderError, ProviderSession,
-        RetryAfter, TimeRange,
+        GoogleCalendarProvider, GoogleProposalDraft, MailAddress, OwnerEventDraft, ProviderError,
+        ProviderFuture, ProviderSession, RetryAfter, SyncPage, TimeRange,
     };
     use crate::pa::store::{
         AuditEntityType, AuditEventType, MessageProvider, MessageSummary, PaStore, StoreError,
         StoredAppointmentQuoteState,
     };
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
+    use std::sync::{Arc, Barrier};
     use time::{
         Date, Duration, OffsetDateTime, Time, UtcOffset, format_description::well_known::Rfc3339,
     };
@@ -1919,6 +1920,62 @@ mod tests {
             session(),
             session(),
         )
+    }
+
+    #[derive(Clone)]
+    struct OwnerSubmitRendezvous {
+        inner: FakeOutlookCalendar,
+        before_create: Arc<Barrier>,
+    }
+
+    impl OwnerSubmitRendezvous {
+        fn new(inner: FakeOutlookCalendar, before_create: Arc<Barrier>) -> Self {
+            Self {
+                inner,
+                before_create,
+            }
+        }
+    }
+
+    impl CalendarReadProvider for OwnerSubmitRendezvous {
+        fn list_busy<'a>(
+            &'a self,
+            session: &'a ProviderSession,
+            time_range: &'a TimeRange,
+        ) -> ProviderFuture<'a, Vec<BusyInterval>> {
+            self.inner.list_busy(session, time_range)
+        }
+
+        fn sync_calendar<'a>(
+            &'a self,
+            session: &'a ProviderSession,
+            request: &'a CalendarSyncRequest,
+        ) -> ProviderFuture<'a, SyncPage<CalendarChange>> {
+            self.inner.sync_calendar(session, request)
+        }
+    }
+
+    impl super::super::providers::OutlookCalendarProvider for OwnerSubmitRendezvous {
+        fn find_owner_event<'a>(
+            &'a self,
+            session: &'a ProviderSession,
+            draft: &'a OwnerEventDraft,
+        ) -> ProviderFuture<'a, CalendarEvent> {
+            self.inner.find_owner_event(session, draft)
+        }
+
+        fn create_owner_event<'a>(
+            &'a self,
+            session: &'a ProviderSession,
+            draft: &'a OwnerEventDraft,
+        ) -> ProviderFuture<'a, CalendarEvent> {
+            let inner = self.inner.clone();
+            let before_create = Arc::clone(&self.before_create);
+            Box::pin(async move {
+                before_create.wait();
+                inner.create_owner_event(session, draft).await
+            })
+        }
     }
 
     fn appointment_quote_row_count(store: &PaStore) -> i64 {
@@ -7272,11 +7329,9 @@ mod tests {
                 )
                 .expect("prepare")
         };
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let first_barrier = std::sync::Arc::clone(&barrier);
-        let second_barrier = std::sync::Arc::clone(&barrier);
-        let first_outlook = outlook.clone();
-        let second_outlook = outlook.clone();
+        let before_create = Arc::new(Barrier::new(2));
+        let rendezvous = OwnerSubmitRendezvous::new(outlook.clone(), before_create);
+        let second_outlook = rendezvous.clone();
         let first_google = google.clone();
         let second_google = google.clone();
         let first_prepared = prepared.clone();
@@ -7286,10 +7341,9 @@ mod tests {
             let outlook_session = session();
             let google_session = session();
             let verified = owner_verified(now);
-            first_barrier.wait();
             let service = PaService::new(
                 &first_store,
-                &first_outlook,
+                &rendezvous,
                 &outlook_session,
                 &first_google,
                 &google_session,
@@ -7307,7 +7361,6 @@ mod tests {
             let outlook_session = session();
             let google_session = session();
             let verified = owner_verified(now);
-            second_barrier.wait();
             let service = PaService::new(
                 &second_store,
                 &second_outlook,
