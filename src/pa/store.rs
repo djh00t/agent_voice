@@ -1,5 +1,7 @@
 //! SQLCipher-backed persistence boundary for personal-assistant state.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
@@ -2148,7 +2150,7 @@ impl PaStore {
         let key = database_key.as_ref();
         reject_empty_key(key)?;
         let path = path.as_ref();
-        if !path.is_file() || rollback_journal_is_hot(&rollback_journal_path(path)) {
+        if !path.is_file() || rollback_journal_is_hot(&rollback_journal_path(path))? {
             return Err(StoreError::NotFound {
                 resource: "database",
             });
@@ -7024,10 +7026,38 @@ fn rollback_journal_path(path: &Path) -> std::path::PathBuf {
     journal_path.into()
 }
 
-fn rollback_journal_is_hot(path: &Path) -> bool {
-    const JOURNAL_MAGIC: &[u8; 8] = b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7";
+#[cfg(test)]
+thread_local! {
+    static FORCE_ROLLBACK_JOURNAL_READ_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
 
-    std::fs::read(path).is_ok_and(|bytes| bytes.len() > 512 && bytes.starts_with(JOURNAL_MAGIC))
+#[cfg(test)]
+fn force_rollback_journal_read_failure(value: bool) {
+    FORCE_ROLLBACK_JOURNAL_READ_FAILURE.with(|forced| forced.set(value));
+}
+
+fn rollback_journal_is_hot(path: &Path) -> StoreResult<bool> {
+    const JOURNAL_MAGIC: &[u8; 8] = b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7";
+    const ZEROED_HEADER: &[u8; 8] = &[0; 8];
+
+    #[cfg(test)]
+    if FORCE_ROLLBACK_JOURNAL_READ_FAILURE.with(Cell::get) {
+        return Err(StoreError::NotFound {
+            resource: "database",
+        });
+    }
+
+    match std::fs::read(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(StoreError::NotFound {
+            resource: "database",
+        }),
+        Ok(bytes) if bytes.is_empty() || bytes.starts_with(ZEROED_HEADER) => Ok(false),
+        Ok(bytes) if bytes.len() > 512 && bytes.starts_with(JOURNAL_MAGIC) => Ok(true),
+        Ok(_) => Err(StoreError::NotFound {
+            resource: "database",
+        }),
+    }
 }
 
 fn immutable_read_only_uri(path: &Path) -> StoreResult<String> {
@@ -8942,6 +8972,71 @@ END;
                 fs::read(&journal_path).expect("zero-header rollback journal remains"),
             ] == before,
             "restore candidate inspection must preserve zero-header rollback journal bytes"
+        );
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_unreadable_rollback_journal() {
+        let database = TempDatabase::new();
+        let seed =
+            PaStore::open(&database.path, DATABASE_KEY).expect("seed unreadable journal fixture");
+        drop(seed);
+
+        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
+        fs::write(&journal_path, [0_u8; 512]).expect("create unreadable rollback journal");
+        let before = [
+            fs::read(&database.path).expect("snapshot database"),
+            fs::read(&journal_path).expect("snapshot rollback journal"),
+        ];
+
+        super::force_rollback_journal_read_failure(true);
+        let result = PaStore::open_existing(&database.path, DATABASE_KEY);
+        super::force_rollback_journal_read_failure(false);
+
+        assert!(matches!(
+            result,
+            Err(StoreError::NotFound {
+                resource: "database"
+            })
+        ));
+        assert!(
+            [
+                fs::read(&database.path).expect("database remains"),
+                fs::read(&journal_path).expect("rollback journal remains"),
+            ] == before,
+            "restore candidate inspection must preserve unreadable rollback journal bytes"
+        );
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_malformed_rollback_journal() {
+        let database = TempDatabase::new();
+        let seed =
+            PaStore::open(&database.path, DATABASE_KEY).expect("seed malformed journal fixture");
+        drop(seed);
+
+        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
+        fs::write(&journal_path, [0xAA_u8; 512]).expect("create malformed rollback journal");
+        let before = [
+            fs::read(&database.path).expect("snapshot database"),
+            fs::read(&journal_path).expect("snapshot rollback journal"),
+        ];
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("malformed rollback journal must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert!(
+            [
+                fs::read(&database.path).expect("database remains"),
+                fs::read(&journal_path).expect("rollback journal remains"),
+            ] == before,
+            "restore candidate inspection must preserve malformed rollback journal bytes"
         );
     }
 
