@@ -5,10 +5,11 @@
 - **Immutable base:** `683249e59f8b302bbf8dc7a1ba9a1f0ab1d076d4` (`origin/main`)
 - **Branch:** `codex/issue-251-oauth-facade`
 - **Worktree:** `/Users/djh/.codex/worktrees/agent_voice-issue-251-oauth-facade`
-- **Implementation commits:** `5d7cfba99f8d61a4e01cb05aa7f67c845dc07019`, `758ef7f7e263e472e9da6ef74bded9cf85cbc363`, `1501ea6ae959e9065adff2a32d19fb372c3cee71`, `a13383c504902a9380ba67c0b687250512c9c1fd`, `4bd2340dac9b6499f19950824ab34f42fb886745`, `e7a4d970a38c045abcd5aab634914c670bb6d490`
+- **Historical #251 package range (pre-remediation):** `5d7cfba99f8d61a4e01cb05aa7f67c845dc07019`, `758ef7f7e263e472e9da6ef74bded9cf85cbc363`, `1501ea6ae959e9065adff2a32d19fb372c3cee71`, `a13383c504902a9380ba67c0b687250512c9c1fd`, `752960f874c333d6083a7bc6e2df46ff72985d5c`
+- **Final remediated PR range:** #354 commits `4bd2340dac9b6499f19950824ab34f42fb886745` and `e7a4d970a38c045abcd5aab634914c670bb6d490`; #355 report correction `0ff5c4595d82a88cdadfc90965ed0b7ee4a7984d`; #360 is the report-only correction in this file.
 - **Pre-export RED working tree:** uncommitted state derived from the immutable base after adding the module-surface test and only `pub mod oauth;` registration; no facade re-exports or child-module registrations existed in that state, so it has no commit SHA.
 
-## Scope
+## Historical #251 package scope (pre-remediation)
 
 This package owns only `src/pa/oauth.rs`, the OAuth registration hunk in
 `src/pa/mod.rs`, and this report. The facade re-exports the exact reviewed
@@ -17,8 +18,22 @@ modules are registered privately exactly once. The module-surface test reaches
 the typed start, callback, state-store, and opaque authorization-code API
 without executing provider, HTTP, filesystem, credential, or prompt behavior.
 
-No child implementation, child test, provider/client/config code, dependency,
-OAuth value, URL, credential, or live-provider path was changed.
+Within this historical package range, no child implementation, child test,
+provider/client/config code, dependency, OAuth value, URL, credential, or
+live-provider path was changed. This historical three-path statement does not
+describe the final remediated PR.
+
+## Final remediated PR scope
+
+The final PR range includes the historical #251 paths plus every remediation
+owned path: `src/pa/oauth_callback.rs` for the #354 item-level verifier lint
+allowance, the #354 removal hunk in `src/pa/mod.rs`, and this report for the
+#355 RED evidence correction and the #360 scope correction. The final PR
+therefore has four unique changed paths: `src/pa/oauth.rs`, `src/pa/mod.rs`,
+`src/pa/oauth_callback.rs`, and this report. It
+therefore includes a child implementation-file change in
+`src/pa/oauth_callback.rs`; the historical no-child-change statement above is
+not a final-range claim.
 
 ## Lifecycle pickup
 
@@ -31,6 +46,10 @@ tracker or dependency labels were changed.
 
 Each entry records observed output without secrets, credentials, tokens,
 complete query URLs, or provider diagnostics.
+
+The records below are historical #251 package evidence from the
+pre-remediation range. Their three-path scope assertions are not claims about
+the final remediated PR range stated above.
 
 ```json
 [
@@ -181,6 +200,7 @@ did not contain an executable selector.
 
 The package does not claim OAuth consent, credentials, provider/network access,
 deployment, authenticated UAT, production readiness, merge, or approval. CI
-remains pending the delivering PR. The delivering PR must contain exactly
-`Closes #251` plus `Refs #75`, `Refs #59`, `Refs #249`, and `Refs #250`; it must
-not close #75, #74, or #59.
+remains a separate delivering-PR claim. The delivering PR footer is
+`Closes #251`, `Closes #354`, `Closes #355`, and `Closes #360`, with `Refs #75`,
+`Refs #59`, `Refs #249`, `Refs #250`, `Refs #251`, `Refs #354`, `Refs #355`,
+and `Refs #353`; it must not close #75, #74, or #59.
