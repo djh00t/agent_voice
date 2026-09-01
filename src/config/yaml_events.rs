@@ -190,12 +190,6 @@ impl<'input> YamlEventReader<'input> {
     }
 }
 
-pub(super) fn validate_syntax(input: &str) -> Result<()> {
-    let mut reader = YamlEventReader::new(input)?;
-    while reader.next()?.is_some() {}
-    Ok(())
-}
-
 struct EventGuard {
     event: MaybeUninit<yaml_event_t>,
 }
@@ -505,7 +499,14 @@ mod tests {
 
     #[test]
     fn malformed_input_returns_only_the_fixed_redacted_error() {
-        let error = super::validate_syntax("sentinel://secret: [").expect_err("malformed input");
+        let mut reader = YamlEventReader::new("sentinel://secret: [").expect("reader");
+        let error = loop {
+            match reader.next() {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("malformed input must fail"),
+                Err(error) => break error,
+            }
+        };
         assert_eq!(error.to_string(), "config YAML event reader: parse_failed");
         assert!(!error.to_string().contains("sentinel"));
     }
