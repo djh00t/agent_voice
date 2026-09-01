@@ -7138,6 +7138,9 @@ fn immutable_read_only_uri_for_path_bytes(
     if is_windows_path && is_absolute {
         uri.push_str("///");
     }
+    if !is_windows_path && path_bytes.starts_with(b"//") {
+        uri.push_str("//");
+    }
     append_uri_path_bytes(&mut uri, path_bytes);
     uri.push_str("?immutable=1");
     Ok(uri)
@@ -8867,6 +8870,14 @@ END;
         let uri = super::immutable_read_only_uri_for_path_bytes(b"//?/C:/restore.db", true, true)
             .expect("extended drive path is an absolute Windows path");
         assert_eq!(uri, "file:///C:/restore.db?immutable=1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_uri_preserves_unix_double_slash_path_as_uri_path_data() {
+        let uri = super::immutable_read_only_uri_for_path_bytes(b"//tmp/candidate.db", false, true)
+            .expect("Unix double-slash absolute path is valid");
+        assert_eq!(uri, "file:////tmp/candidate.db?immutable=1");
     }
 
     #[test]
