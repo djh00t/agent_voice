@@ -2148,7 +2148,12 @@ impl PaStore {
         let key = database_key.as_ref();
         reject_empty_key(key)?;
         let path = path.as_ref();
-        let immutable_uri = format!("file:{}?immutable=1", path.display());
+        if !path.is_file() || rollback_journal_path(path).is_file() {
+            return Err(StoreError::NotFound {
+                resource: "database",
+            });
+        }
+        let immutable_uri = immutable_read_only_uri(path)?;
         let mut connection = Connection::open_with_flags(
             immutable_uri,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -7013,6 +7018,58 @@ fn reject_empty_key(key: &[u8]) -> StoreResult<()> {
     Ok(())
 }
 
+fn rollback_journal_path(path: &Path) -> std::path::PathBuf {
+    let mut journal_path = path.as_os_str().to_os_string();
+    journal_path.push("-journal");
+    journal_path.into()
+}
+
+fn immutable_read_only_uri(path: &Path) -> StoreResult<String> {
+    let mut uri = String::from("file:");
+
+    #[cfg(unix)]
+    let path_bytes = {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(windows)]
+    let normalized_path = path
+        .to_str()
+        .ok_or(StoreError::NotFound {
+            resource: "database",
+        })?
+        .replace('\\', "/");
+    #[cfg(windows)]
+    let path_bytes = normalized_path.as_bytes();
+    #[cfg(not(any(unix, windows)))]
+    let path_text = path.to_str().ok_or(StoreError::NotFound {
+        resource: "database",
+    })?;
+    #[cfg(not(any(unix, windows)))]
+    let path_bytes = path_text.as_bytes();
+
+    #[cfg(windows)]
+    uri.push_str("///");
+    append_uri_path_bytes(&mut uri, path_bytes);
+    uri.push_str("?immutable=1");
+    Ok(uri)
+}
+
+fn append_uri_path_bytes(uri: &mut String, path_bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    for &byte in path_bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX[(byte >> 4) as usize]));
+            uri.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+}
+
 fn initialize(
     connection: &mut Connection,
     key: &[u8],
@@ -8780,12 +8837,33 @@ END;
     }
 
     #[test]
-    fn restore_open_existing_preserves_hot_rollback_journal() {
-        let database = TempDatabase::new();
-        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed journal fixture");
+    fn restore_open_existing_escapes_reserved_path_characters() {
+        let mut database = TempDatabase::new();
+        database.path = database
+            .path
+            .with_file_name("agent_voice_restore?reserved#percent%.db");
+        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed reserved-path fixture");
         drop(seed);
 
-        let connection = Connection::open(&database.path).expect("open rollback journal fixture");
+        let restored = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect("reserved-path SQLCipher fixture opens");
+        assert_eq!(
+            restored
+                .connection()
+                .query_row("SELECT count(*) FROM configuration", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("reserved-path fixture query"),
+            1
+        );
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_genuine_interrupted_rollback_journal() {
+        let source = TempDatabase::new();
+        let seed = PaStore::open(&source.path, DATABASE_KEY).expect("seed journal fixture");
+        drop(seed);
+
+        let connection = Connection::open(&source.path).expect("open rollback journal fixture");
         apply_sqlcipher_key(&connection, DATABASE_KEY).expect("apply SQLCipher key");
         connection
             .execute_batch(
@@ -8794,25 +8872,36 @@ END;
                  UPDATE configuration SET owner_email = 'restore@example.com' WHERE id = 1;",
             )
             .expect("create rollback journal");
-        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
-        let hot_journal = fs::read(&journal_path).expect("snapshot rollback journal");
+
+        let interrupted = TempDatabase::new();
+        let source_journal_path = PathBuf::from(format!("{}-journal", source.path.display()));
+        let interrupted_journal_path =
+            PathBuf::from(format!("{}-journal", interrupted.path.display()));
+        fs::copy(&source.path, &interrupted.path).expect("copy interrupted database");
+        fs::copy(&source_journal_path, &interrupted_journal_path)
+            .expect("copy interrupted rollback journal");
         connection
             .execute_batch("ROLLBACK;")
             .expect("restore fixture");
         drop(connection);
-        fs::write(&journal_path, &hot_journal).expect("restore hot rollback journal");
 
         let before = [
-            fs::read(&database.path).expect("snapshot database"),
-            fs::read(&journal_path).expect("snapshot rollback journal"),
+            fs::read(&interrupted.path).expect("snapshot interrupted database"),
+            fs::read(&interrupted_journal_path).expect("snapshot interrupted rollback journal"),
         ];
-        let restored = PaStore::open_existing(&database.path, DATABASE_KEY);
-        drop(restored);
+        let error = PaStore::open_existing(&interrupted.path, DATABASE_KEY)
+            .expect_err("interrupted rollback journal must fail closed");
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
 
         assert!(
             [
-                fs::read(&database.path).expect("database remains"),
-                fs::read(&journal_path).expect("rollback journal remains"),
+                fs::read(&interrupted.path).expect("interrupted database remains"),
+                fs::read(&interrupted_journal_path).expect("interrupted rollback journal remains"),
             ] == before,
             "restore candidate inspection must preserve database and rollback journal bytes"
         );
