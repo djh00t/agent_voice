@@ -7,6 +7,7 @@ pub use crate::pa::oauth_start::{
 #[cfg(test)]
 mod tests {
     #[test]
+    #[allow(clippy::type_complexity)]
     fn module_surface() {
         let _: fn(
             crate::config::OAuthProvider,
