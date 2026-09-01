@@ -391,6 +391,53 @@ mod tests {
     }
 
     #[test]
+    fn emits_exact_events_for_anchored_tagged_mappings_and_aliases() {
+        let events = read(
+            "!root &root\nroot: &map !map\n  scalar: &value !scalar \"text\"\n  sequence: &seq !seq [*value]\nalias: *map\n",
+        );
+
+        assert_eq!(
+            events,
+            vec![
+                YamlEvent::StreamStart,
+                YamlEvent::DocumentStart,
+                YamlEvent::MappingStart {
+                    flow: false,
+                    anchored: true,
+                    tagged: true,
+                },
+                scalar(b"root", YamlScalarStyle::Plain),
+                YamlEvent::MappingStart {
+                    flow: false,
+                    anchored: true,
+                    tagged: true,
+                },
+                scalar(b"scalar", YamlScalarStyle::Plain),
+                YamlEvent::Scalar {
+                    value: b"text".to_vec().into_boxed_slice(),
+                    style: YamlScalarStyle::DoubleQuoted,
+                    anchored: true,
+                    tagged: true,
+                },
+                scalar(b"sequence", YamlScalarStyle::Plain),
+                YamlEvent::SequenceStart {
+                    flow: true,
+                    anchored: true,
+                    tagged: true,
+                },
+                YamlEvent::Alias,
+                YamlEvent::SequenceEnd,
+                YamlEvent::MappingEnd,
+                scalar(b"alias", YamlScalarStyle::Plain),
+                YamlEvent::Alias,
+                YamlEvent::MappingEnd,
+                YamlEvent::DocumentEnd,
+                YamlEvent::StreamEnd,
+            ]
+        );
+    }
+
+    #[test]
     fn preserves_scalar_styles_and_redacts_debug_values() {
         let events = read(
             "plain: bare\nsingle: 'one''s'\ndouble: \"comma,#\"\nliteral: |\n  line\nfolded: >\n  words\n",
