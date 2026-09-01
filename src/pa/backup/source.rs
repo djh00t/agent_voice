@@ -817,8 +817,11 @@ mod tests {
         assert_eq!(format!("{verified:?}"), "VerifiedBackupBytes(<redacted>)");
         assert_eq!(verified.to_string(), "verified backup bytes (<redacted>)");
 
-        let error = match super::VerifiedBackupBytes::new(Vec::new(), 7) {
-            Ok(_) => panic!("empty backup bytes must fail closed"),
+        let error = match super::VerifiedBackupBytes::new(
+            b"invalid-encrypted-snapshot-secret-sentinel".to_vec(),
+            0,
+        ) {
+            Ok(_) => panic!("invalid snapshot metadata must fail closed"),
             Err(error) => error,
         };
         assert!(matches!(
@@ -826,6 +829,7 @@ mod tests {
             StoreError::StoredRecordInvalid { resource: "backup" }
         ));
         assert!(!error.to_string().contains("secret-sentinel"));
+        assert!(!format!("{error:?}").contains("secret-sentinel"));
     }
 
     #[test]
