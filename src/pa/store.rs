@@ -2148,7 +2148,7 @@ impl PaStore {
         let key = database_key.as_ref();
         reject_empty_key(key)?;
         let path = path.as_ref();
-        if !path.is_file() || rollback_journal_path(path).is_file() {
+        if !path.is_file() || rollback_journal_is_hot(&rollback_journal_path(path)) {
             return Err(StoreError::NotFound {
                 resource: "database",
             });
@@ -7024,9 +7024,13 @@ fn rollback_journal_path(path: &Path) -> std::path::PathBuf {
     journal_path.into()
 }
 
-fn immutable_read_only_uri(path: &Path) -> StoreResult<String> {
-    let mut uri = String::from("file:");
+fn rollback_journal_is_hot(path: &Path) -> bool {
+    const JOURNAL_MAGIC: &[u8; 8] = b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7";
 
+    std::fs::read(path).is_ok_and(|bytes| bytes.len() > 512 && bytes.starts_with(JOURNAL_MAGIC))
+}
+
+fn immutable_read_only_uri(path: &Path) -> StoreResult<String> {
     #[cfg(unix)]
     let path_bytes = {
         use std::os::unix::ffi::OsStrExt as _;
@@ -7050,10 +7054,29 @@ fn immutable_read_only_uri(path: &Path) -> StoreResult<String> {
     let path_bytes = path_text.as_bytes();
 
     #[cfg(windows)]
-    uri.push_str("///");
+    let is_windows_path = true;
+    #[cfg(not(windows))]
+    let is_windows_path = false;
+
+    Ok(immutable_read_only_uri_for_path_bytes(
+        path_bytes,
+        is_windows_path,
+        path.is_absolute(),
+    ))
+}
+
+fn immutable_read_only_uri_for_path_bytes(
+    path_bytes: &[u8],
+    is_windows_path: bool,
+    is_absolute: bool,
+) -> String {
+    let mut uri = String::from("file:");
+    if is_windows_path && is_absolute {
+        uri.push_str("///");
+    }
     append_uri_path_bytes(&mut uri, path_bytes);
     uri.push_str("?immutable=1");
-    Ok(uri)
+    uri
 }
 
 fn append_uri_path_bytes(uri: &mut String, path_bytes: &[u8]) {
@@ -8858,6 +8881,71 @@ END;
     }
 
     #[test]
+    fn immutable_uri_builder_distinguishes_windows_relative_and_absolute_paths() {
+        assert_eq!(
+            super::immutable_read_only_uri_for_path_bytes(b"relative.db", true, false),
+            "file:relative.db?immutable=1"
+        );
+        assert_eq!(
+            super::immutable_read_only_uri_for_path_bytes(b"C:/restore.db", true, true),
+            "file:///C:/restore.db?immutable=1"
+        );
+    }
+
+    #[test]
+    fn restore_open_existing_preserves_empty_quiescent_rollback_journal() {
+        let database = TempDatabase::new();
+        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed empty journal fixture");
+        drop(seed);
+
+        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
+        fs::write(&journal_path, []).expect("create empty quiescent rollback journal");
+        let before = [
+            fs::read(&database.path).expect("snapshot database"),
+            fs::read(&journal_path).expect("snapshot empty rollback journal"),
+        ];
+
+        let restored = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect("empty quiescent rollback journal opens");
+        drop(restored);
+
+        assert!(
+            [
+                fs::read(&database.path).expect("database remains"),
+                fs::read(&journal_path).expect("empty rollback journal remains"),
+            ] == before,
+            "restore candidate inspection must preserve empty rollback journal bytes"
+        );
+    }
+
+    #[test]
+    fn restore_open_existing_preserves_zero_header_quiescent_rollback_journal() {
+        let database = TempDatabase::new();
+        let seed =
+            PaStore::open(&database.path, DATABASE_KEY).expect("seed zero-header journal fixture");
+        drop(seed);
+
+        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
+        fs::write(&journal_path, [0_u8; 512]).expect("create zero-header rollback journal");
+        let before = [
+            fs::read(&database.path).expect("snapshot database"),
+            fs::read(&journal_path).expect("snapshot zero-header rollback journal"),
+        ];
+
+        let restored = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect("zero-header quiescent rollback journal opens");
+        drop(restored);
+
+        assert!(
+            [
+                fs::read(&database.path).expect("database remains"),
+                fs::read(&journal_path).expect("zero-header rollback journal remains"),
+            ] == before,
+            "restore candidate inspection must preserve zero-header rollback journal bytes"
+        );
+    }
+
+    #[test]
     fn restore_open_existing_rejects_genuine_interrupted_rollback_journal() {
         let source = TempDatabase::new();
         let seed = PaStore::open(&source.path, DATABASE_KEY).expect("seed journal fixture");
@@ -8868,8 +8956,13 @@ END;
         connection
             .execute_batch(
                 "PRAGMA journal_mode = DELETE;
+                 PRAGMA cache_size = 1;
                  BEGIN IMMEDIATE;
-                 UPDATE configuration SET owner_email = 'restore@example.com' WHERE id = 1;",
+                 CREATE TABLE interrupted_fixture (id INTEGER PRIMARY KEY, value BLOB);
+                 INSERT INTO interrupted_fixture VALUES (1, zeroblob(4096));
+                 INSERT INTO interrupted_fixture VALUES (2, zeroblob(4096));
+                 INSERT INTO interrupted_fixture VALUES (3, zeroblob(4096));
+                 INSERT INTO interrupted_fixture VALUES (4, zeroblob(4096));",
             )
             .expect("create rollback journal");
 
@@ -8877,6 +8970,12 @@ END;
         let source_journal_path = PathBuf::from(format!("{}-journal", source.path.display()));
         let interrupted_journal_path =
             PathBuf::from(format!("{}-journal", interrupted.path.display()));
+        let source_journal = fs::read(&source_journal_path).expect("read source rollback journal");
+        assert_eq!(
+            &source_journal[..8],
+            b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7",
+            "fixture must contain a hot rollback journal header"
+        );
         fs::copy(&source.path, &interrupted.path).expect("copy interrupted database");
         fs::copy(&source_journal_path, &interrupted_journal_path)
             .expect("copy interrupted rollback journal");
