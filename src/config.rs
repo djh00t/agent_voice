@@ -42,8 +42,7 @@ impl AppConfig {
             Some(path) => {
                 let raw = fs::read_to_string(path)
                     .with_context(|| format!("failed to read config file {}", path.display()))?;
-                yaml_events::validate_syntax(&raw)?;
-                Self::validate_backup_policy_yaml_lexemes(&raw)?;
+                Self::validate_backup_policy_yaml_events(&raw)?;
                 serde_yaml::from_str(&raw).with_context(|| "failed to parse YAML config")?
             }
             None if require_path => {
@@ -64,195 +63,159 @@ impl AppConfig {
         Ok(config)
     }
 
-    fn validate_backup_policy_yaml_lexemes(raw: &str) -> Result<()> {
-        let mut backup_indent = None;
+    fn validate_backup_policy_yaml_events(raw: &str) -> Result<()> {
+        use yaml_events::{YamlEvent, YamlScalarStyle};
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Role {
+            Root,
+            Backup,
+            Other,
+        }
+        struct Frame {
+            mapping: bool,
+            pending: Option<Box<[u8]>>,
+            role: Role,
+        }
 
-        for line in raw.lines() {
-            let trimmed = line.trim_start_matches([' ', '\t']);
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            let indent = line.len() - trimmed.len();
-
-            if let Some(parent_indent) = backup_indent {
-                if indent <= parent_indent {
-                    backup_indent = None;
-                } else if let Some((field, value)) = Self::backup_yaml_policy_lexeme(trimmed) {
-                    Self::validate_backup_policy_yaml_lexeme(field, value)?;
+        let mut reader = yaml_events::YamlEventReader::new(raw)?;
+        let mut frames: Vec<Frame> = Vec::new();
+        let mut documents = 0;
+        let mut started = false;
+        let mut finished = false;
+        let mut policy_error = None;
+        while let Some(event) = reader.next()? {
+            match event {
+                YamlEvent::StreamStart => {
+                    if started {
+                        bail!("config YAML event reader: invalid_structure");
+                    }
+                    started = true;
                 }
-            }
-
-            if indent == 0 {
-                let Some(value) = Self::backup_yaml_top_level_value(trimmed) else {
-                    continue;
-                };
-                backup_indent = Some(indent);
-                let flow_value = Self::strip_yaml_comment(value).trim();
-                if let Some(entries) = flow_value
-                    .strip_prefix('{')
-                    .and_then(|value| value.strip_suffix('}'))
-                {
-                    for entry in Self::split_yaml_flow_entries(entries) {
-                        if let Some((field, value)) = Self::backup_yaml_policy_lexeme(entry.trim())
+                YamlEvent::StreamEnd => {
+                    if !frames.is_empty() || documents != 1 {
+                        bail!("config YAML event reader: invalid_structure");
+                    }
+                    finished = true;
+                }
+                YamlEvent::DocumentStart => {
+                    documents += 1;
+                    if documents != 1 {
+                        bail!("config YAML event reader: invalid_structure");
+                    }
+                }
+                YamlEvent::DocumentEnd => {
+                    if !frames.is_empty() {
+                        bail!("config YAML event reader: invalid_structure");
+                    }
+                }
+                YamlEvent::Alias => bail!("config YAML event reader: unsupported_alias_or_tag"),
+                YamlEvent::MappingStart {
+                    anchored, tagged, ..
+                } => {
+                    if tagged {
+                        bail!("config YAML event reader: unsupported_alias_or_tag");
+                    }
+                    let role = if let Some(parent) = frames.last_mut() {
+                        let key = parent.pending.take();
+                        if parent.mapping
+                            && parent.role == Role::Root
+                            && key.as_deref() == Some(b"backup")
                         {
-                            Self::validate_backup_policy_yaml_lexeme(field, value)?;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn split_yaml_flow_entries(value: &str) -> Vec<&str> {
-        let mut entries = Vec::new();
-        let mut quote = None;
-        let mut escaped = false;
-        let mut start = 0;
-        let bytes = value.as_bytes();
-        let mut index = 0;
-
-        while index < bytes.len() {
-            let byte = bytes[index];
-            match quote {
-                Some(b'"') => {
-                    if escaped {
-                        escaped = false;
-                    } else if byte == b'\\' {
-                        escaped = true;
-                    } else if byte == b'"' {
-                        quote = None;
-                    }
-                }
-                Some(b'\'') => {
-                    if byte == b'\'' {
-                        if bytes.get(index + 1) == Some(&b'\'') {
-                            index += 2;
-                            continue;
-                        }
-                        quote = None;
-                    }
-                }
-                Some(_) => unreachable!("only YAML quote bytes are tracked"),
-                None => match byte {
-                    b'"' | b'\'' if Self::flow_quote_opens_at_scalar_start(value, start, index) => {
-                        quote = Some(byte)
-                    }
-                    b',' => {
-                        entries.push(&value[start..index]);
-                        start = index + 1;
-                    }
-                    _ => {}
-                },
-            }
-            index += 1;
-        }
-
-        entries.push(&value[start..]);
-        entries
-    }
-
-    fn flow_quote_opens_at_scalar_start(value: &str, start: usize, index: usize) -> bool {
-        let prefix = value[start..index].trim_start();
-        prefix.is_empty()
-            || prefix
-                .rsplit_once(':')
-                .is_some_and(|(_, value)| value.trim().is_empty())
-    }
-
-    fn backup_yaml_top_level_value(line: &str) -> Option<&str> {
-        let key_end = if let Some(rest) = line.strip_prefix("backup") {
-            rest
-        } else if let Some(rest) = line.strip_prefix("'backup'") {
-            rest
-        } else {
-            line.strip_prefix("\"backup\"")?
-        };
-        key_end.trim_start().strip_prefix(':').map(str::trim)
-    }
-
-    fn backup_yaml_policy_lexeme(line: &str) -> Option<(&str, &str)> {
-        let line = line.trim_start();
-        for field in ["retention_days", "max_age_hours"] {
-            let value = line
-                .strip_prefix(field)
-                .or_else(|| {
-                    line.strip_prefix('"')
-                        .and_then(|line| line.strip_prefix(field))
-                        .and_then(|line| line.strip_prefix('"'))
-                })
-                .or_else(|| {
-                    line.strip_prefix('\'')
-                        .and_then(|line| line.strip_prefix(field))
-                        .and_then(|line| line.strip_prefix('\''))
-                });
-            if let Some(value) = value
-                .map(str::trim_start)
-                .and_then(|line| line.strip_prefix(':'))
-            {
-                return Some((field, value));
-            }
-        }
-        None
-    }
-
-    fn strip_yaml_comment(value: &str) -> &str {
-        // This bounded scanner only distinguishes quoted scalars from comments;
-        // it is not intended to parse general YAML.
-        let mut quote = None;
-        let mut escaped = false;
-        let bytes = value.as_bytes();
-        let mut index = 0;
-
-        while index < bytes.len() {
-            let byte = bytes[index];
-            match quote {
-                Some(b'"') => {
-                    if escaped {
-                        escaped = false;
-                    } else if byte == b'\\' {
-                        escaped = true;
-                    } else if byte == b'"' {
-                        quote = None;
-                    }
-                }
-                Some(b'\'') => {
-                    if byte == b'\'' {
-                        if bytes.get(index + 1) == Some(&b'\'') {
-                            index += 1;
+                            Role::Backup
                         } else {
-                            quote = None;
+                            Role::Other
                         }
+                    } else {
+                        if documents == 1 {
+                            Role::Root
+                        } else {
+                            Role::Other
+                        }
+                    };
+                    let _ = anchored;
+                    frames.push(Frame {
+                        mapping: true,
+                        pending: None,
+                        role,
+                    });
+                }
+                YamlEvent::SequenceStart {
+                    anchored, tagged, ..
+                } => {
+                    if tagged {
+                        bail!("config YAML event reader: unsupported_alias_or_tag");
+                    }
+                    if let Some(parent) = frames.last_mut() {
+                        parent.pending.take();
+                    }
+                    let _ = anchored;
+                    frames.push(Frame {
+                        mapping: false,
+                        pending: None,
+                        role: Role::Other,
+                    });
+                }
+                YamlEvent::MappingEnd | YamlEvent::SequenceEnd => {
+                    if frames.pop().is_none() {
+                        bail!("config YAML event reader: invalid_structure");
                     }
                 }
-                Some(_) => unreachable!("only YAML quote bytes are tracked"),
-                None => match byte {
-                    b'"' | b'\'' => quote = Some(byte),
-                    b'#' if index == 0 || bytes[index - 1].is_ascii_whitespace() => {
-                        return &value[..index];
+                YamlEvent::Scalar {
+                    value,
+                    style,
+                    anchored,
+                    tagged,
+                } => {
+                    if tagged {
+                        bail!("config YAML event reader: unsupported_alias_or_tag");
                     }
-                    _ => {}
-                },
+                    let Some(frame) = frames.last_mut() else {
+                        bail!("config YAML event reader: invalid_structure");
+                    };
+                    if !frame.mapping {
+                        continue;
+                    }
+                    if let Some(key) = frame.pending.take() {
+                        if frame.role == Role::Backup
+                            && (key.as_ref() == b"retention_days"
+                                || key.as_ref() == b"max_age_hours")
+                            && style == YamlScalarStyle::Plain
+                        {
+                            let field = if key.as_ref() == b"retention_days" {
+                                "retention_days"
+                            } else {
+                                "max_age_hours"
+                            };
+                            let digits = value
+                                .iter()
+                                .filter(|b| **b != b'_')
+                                .copied()
+                                .collect::<Vec<_>>();
+                            if value
+                                .first()
+                                .is_some_and(|byte| *byte == b'+' || *byte == b'-')
+                                || (value.iter().all(|b| b.is_ascii_digit() || *b == b'_')
+                                    && !value.is_empty()
+                                    && std::str::from_utf8(&digits)
+                                        .ok()
+                                        .and_then(|v| v.parse::<u64>().ok())
+                                        .is_none())
+                            {
+                                policy_error = Some(Self::backup_policy_yaml_error(field));
+                            }
+                        }
+                    } else {
+                        frame.pending = Some(value);
+                    }
+                    let _ = anchored;
+                }
             }
-            index += 1;
         }
-
-        value
-    }
-
-    fn validate_backup_policy_yaml_lexeme(field: &str, value: &str) -> Result<()> {
-        let value = Self::strip_yaml_comment(value).trim();
-        if value.starts_with(['+', '-']) {
-            return Err(Self::backup_policy_yaml_error(field));
+        if !finished {
+            bail!("config YAML event reader: invalid_structure");
         }
-        if value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'_')
-            && !value.is_empty()
-            && value.replace('_', "").parse::<u64>().is_err()
-        {
-            return Err(Self::backup_policy_yaml_error(field));
+        if let Some(error) = policy_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -3956,6 +3919,65 @@ agent_api:
                 .to_string();
             assert_eq!(error, expected);
             assert!(!error.contains(value));
+        }
+    }
+
+    #[test]
+    fn app_config_load_rejects_event_policy_layout_matrix() {
+        for (yaml, expected) in [
+            (
+                "  backup:\n    retention_days: +30\n",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "backup: { 'max_age_hours' : -24 }\n",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+            (
+                "backup:\n  retention_days: 18446744073709551616\n",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "backup: { max_age_hours: 340282366920938463463374607431768211456 }\n",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+        ] {
+            assert_eq!(
+                AppConfig::validate_backup_policy_yaml_events(yaml)
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn app_config_load_rejects_event_policy_comment_quote_matrix() {
+        let yaml =
+            "backup: { temp_dir: foo'bar, retention_days: 30, max_age_hours: +24 } # trailing\n";
+        let error = AppConfig::validate_backup_policy_yaml_events(yaml).unwrap_err();
+        assert_eq!(error.to_string(), "backup.max_age_hours: invalid_max_age");
+        assert!(!error.to_string().contains("foo'bar"));
+    }
+
+    #[test]
+    fn app_config_load_preserves_quoted_policy_lookalike_data() {
+        let yaml = "backup: { temp_dir: \"comma, # text retention_days: +30\", retention_days: 30, max_age_hours: 24 }\n";
+        AppConfig::validate_backup_policy_yaml_events(yaml).unwrap();
+    }
+
+    #[test]
+    fn app_config_load_rejects_event_alias_and_tag_bypass() {
+        for yaml in [
+            "backup: &policy { retention_days: +30 }\ncopy: *policy\n",
+            "backup: !policy { retention_days: +30 }\n",
+        ] {
+            let error = AppConfig::validate_backup_policy_yaml_events(yaml).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "config YAML event reader: unsupported_alias_or_tag"
+            );
+            assert!(!error.to_string().contains("policy"));
         }
     }
 
