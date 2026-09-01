@@ -1,6 +1,7 @@
 //! Personal-assistant domain contracts.
 
 pub mod admin_config;
+pub mod admin_store;
 pub mod auth;
 pub mod availability;
 pub mod crypto;
