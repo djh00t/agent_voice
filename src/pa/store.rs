@@ -7,7 +7,9 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use chrono_tz::Tz;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -2143,15 +2145,12 @@ impl PaStore {
         P: AsRef<Path>,
         K: AsRef<[u8]>,
     {
-        let path = path.as_ref();
-        if !path.exists() {
-            return Err(StoreError::NotFound {
-                resource: "database",
-            });
-        }
         let key = database_key.as_ref();
         reject_empty_key(key)?;
-        let mut connection = Connection::open(path)?;
+        let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|_| StoreError::NotFound {
+            resource: "database",
+        })?;
         initialize(&mut connection, key, false, false)?;
         connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
             row.get::<_, i64>(0)
@@ -8651,13 +8650,21 @@ END;
         let absent = TempDatabase::new();
         let absent_error = PaStore::open_existing(&absent.path, DATABASE_KEY)
             .expect_err("an absent restore database must not be created");
-        assert!(matches!(
-            absent_error,
-            StoreError::NotFound {
-                resource: "database"
-            }
-        ));
         assert!(!absent.path.exists(), "absent restore database was created");
+        assert!(!absent_error.to_string().contains("agent_voice_pa_store_"));
+
+        let removed = TempDatabase::new();
+        let removed_store =
+            PaStore::open(&removed.path, DATABASE_KEY).expect("seed removable store");
+        drop(removed_store);
+        remove_database_files(&removed.path);
+        let removed_error = PaStore::open_existing(&removed.path, DATABASE_KEY)
+            .expect_err("a removed restore database must not be recreated");
+        assert!(
+            !removed.path.exists(),
+            "removed restore database was recreated"
+        );
+        assert!(!removed_error.to_string().contains("agent_voice_pa_store_"));
 
         let current = TempDatabase::new();
         let seeded = PaStore::open(&current.path, DATABASE_KEY).expect("seed current fixture");
