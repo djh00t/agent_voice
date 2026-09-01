@@ -8087,6 +8087,68 @@ pub const HTTP_IDEMPOTENCY_RESERVATION_SECONDS: i64 = 300;
 /// Maximum cached response body size for an HTTP idempotency record.
 pub const MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// A validated, byte-preserving HTTP idempotency response.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HttpIdempotencyResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+impl HttpIdempotencyResponse {
+    /// Constructs a response with a bounded status and JSON body.
+    pub fn new(status: u16, body: impl Into<Vec<u8>>) -> StoreResult<Self> {
+        let body = body.into();
+        if !(200..=599).contains(&status)
+            || body.is_empty()
+            || body.len() > MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES
+        {
+            return Err(StoreError::InvalidInput {
+                field: "http idempotency response",
+            });
+        }
+
+        let text = std::str::from_utf8(&body).map_err(|_| StoreError::InvalidInput {
+            field: "http idempotency response",
+        })?;
+        let mut deserializer = serde_json::Deserializer::from_str(text);
+        serde::de::IgnoredAny::deserialize(&mut deserializer).map_err(|_| {
+            StoreError::InvalidInput {
+                field: "http idempotency response",
+            }
+        })?;
+        deserializer.end().map_err(|_| StoreError::InvalidInput {
+            field: "http idempotency response",
+        })?;
+
+        Ok(Self { status, body })
+    }
+
+    /// Returns the original HTTP status.
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Returns the fixed response content type.
+    pub fn content_type(&self) -> &'static str {
+        "application/json"
+    }
+
+    /// Returns the exact validated response bytes.
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+impl fmt::Debug for HttpIdempotencyResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpIdempotencyResponse")
+            .field("status", &self.status)
+            .field("body", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Validates the bounded ASCII grammar used for an HTTP idempotency scope.
 #[allow(dead_code)]
 pub(crate) fn validate_http_idempotency_scope(value: &str) -> StoreResult<()> {
@@ -21629,6 +21691,112 @@ END;
         assert!(super::validate_http_idempotency_key(&key_boundary).is_ok());
 
         assert!(super::validate_http_idempotency_fingerprint(VALID_HTTP_FINGERPRINT).is_ok());
+    }
+
+    #[test]
+    fn http_idempotency_response_new_accepts_valid_json() {
+        let body = br#"{"ok":true,"items":[1,2]}"#.to_vec();
+        let response =
+            super::HttpIdempotencyResponse::new(201, body.clone()).expect("valid response");
+
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.content_type(), "application/json");
+        assert_eq!(response.body(), body.as_slice());
+        assert_eq!(response, response.clone());
+    }
+
+    #[test]
+    fn http_idempotency_response_boundary_matrix() {
+        let shortest = b"0".to_vec();
+        for status in [200, 599] {
+            let response = super::HttpIdempotencyResponse::new(status, shortest.clone())
+                .expect("status boundary is accepted");
+            assert_eq!(response.status(), status);
+            assert_eq!(response.body(), shortest.as_slice());
+        }
+        for status in [199, 600] {
+            assert!(super::HttpIdempotencyResponse::new(status, shortest.clone()).is_err());
+        }
+
+        assert!(super::HttpIdempotencyResponse::new(200, Vec::new()).is_err());
+
+        let mut exact_limit = Vec::with_capacity(super::MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES);
+        exact_limit.push(b'"');
+        exact_limit.extend(std::iter::repeat_n(
+            b'a',
+            super::MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES - 2,
+        ));
+        exact_limit.push(b'"');
+        assert_eq!(
+            exact_limit.len(),
+            super::MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES
+        );
+        let response = super::HttpIdempotencyResponse::new(200, exact_limit.clone())
+            .expect("exact byte limit is accepted");
+        assert_eq!(response.body(), exact_limit.as_slice());
+
+        let mut over_limit = exact_limit;
+        over_limit.insert(1, b'a');
+        assert_eq!(
+            over_limit.len(),
+            super::MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES + 1
+        );
+        assert!(super::HttpIdempotencyResponse::new(200, over_limit).is_err());
+    }
+
+    #[test]
+    fn http_idempotency_response_preserves_exact_bytes() {
+        let body = b" {\"z\":1e+2,\"message\":\"caf\xc3\xa9\",\"a\":[true,null]} \n".to_vec();
+        let response =
+            super::HttpIdempotencyResponse::new(202, body.clone()).expect("valid response");
+
+        assert_eq!(response.status(), 202);
+        assert_eq!(response.content_type(), "application/json");
+        assert_eq!(response.body(), body.as_slice());
+    }
+
+    #[test]
+    fn http_idempotency_response_rejects_invalid_utf8_and_json() {
+        let invalid_bodies = [
+            vec![0x7b, 0xff, 0x7d],
+            br#"{"ok":}"#.to_vec(),
+            b"{".to_vec(),
+            b"0x".to_vec(),
+            b" ".to_vec(),
+        ];
+
+        for body in invalid_bodies {
+            assert!(super::HttpIdempotencyResponse::new(200, body).is_err());
+        }
+    }
+
+    #[test]
+    fn http_idempotency_response_debug_is_redacted() {
+        let response = super::HttpIdempotencyResponse::new(
+            418,
+            br#"{"debug":"debug-body-sentinel-7d1b"} "#.to_vec(),
+        )
+        .expect("valid response");
+        let debug = format!("{response:?}");
+
+        assert!(debug.contains("HttpIdempotencyResponse"));
+        assert!(debug.contains("418"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("debug-body-sentinel-7d1b"));
+    }
+
+    #[test]
+    fn http_idempotency_response_errors_are_redacted() {
+        let error = super::HttpIdempotencyResponse::new(
+            199,
+            br#"{"secret":"error-body-sentinel-7d1b"}"#.to_vec(),
+        )
+        .expect_err("invalid status");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+
+        assert!(!display.contains("error-body-sentinel-7d1b"));
+        assert!(!debug.contains("error-body-sentinel-7d1b"));
     }
 
     #[test]
