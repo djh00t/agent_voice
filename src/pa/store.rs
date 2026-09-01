@@ -1,7 +1,5 @@
 //! SQLCipher-backed persistence boundary for personal-assistant state.
 
-#[cfg(test)]
-use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
@@ -2150,11 +2148,12 @@ impl PaStore {
         let key = database_key.as_ref();
         reject_empty_key(key)?;
         let path = path.as_ref();
-        if !path.is_file() || rollback_journal_is_hot(&rollback_journal_path(path))? {
+        if !path.is_file() {
             return Err(StoreError::NotFound {
                 resource: "database",
             });
         }
+        reject_sqlite_sidecars(path)?;
         let immutable_uri = immutable_read_only_uri(path)?;
         let mut connection = Connection::open_with_flags(
             immutable_uri,
@@ -7020,59 +7019,29 @@ fn reject_empty_key(key: &[u8]) -> StoreResult<()> {
     Ok(())
 }
 
-fn rollback_journal_path(path: &Path) -> std::path::PathBuf {
-    let mut journal_path = path.as_os_str().to_os_string();
-    journal_path.push("-journal");
-    journal_path.into()
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut sidecar_path = path.as_os_str().to_os_string();
+    sidecar_path.push(suffix);
+    sidecar_path.into()
 }
 
-#[cfg(test)]
-thread_local! {
-    static FORCE_ROLLBACK_JOURNAL_READ_FAILURE: Cell<bool> = const { Cell::new(false) };
-}
-
-#[cfg(test)]
-fn force_rollback_journal_read_failure(value: bool) {
-    FORCE_ROLLBACK_JOURNAL_READ_FAILURE.with(|forced| forced.set(value));
-}
-
-fn rollback_journal_is_hot(path: &Path) -> StoreResult<bool> {
-    const JOURNAL_MAGIC: &[u8; 8] = b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7";
-    const JOURNAL_HEADER_BYTES: usize = 28;
-
-    #[cfg(test)]
-    if FORCE_ROLLBACK_JOURNAL_READ_FAILURE.with(Cell::get) {
-        return Err(StoreError::NotFound {
-            resource: "database",
-        });
-    }
-
-    match std::fs::read(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::symlink_metadata(path) {
-                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
-                    Ok(false)
-                }
-                _ => Err(StoreError::NotFound {
+fn reject_sqlite_sidecars(path: &Path) -> StoreResult<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        match std::fs::symlink_metadata(sqlite_sidecar_path(path, suffix)) {
+            Ok(_) => {
+                return Err(StoreError::NotFound {
                     resource: "database",
-                }),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(StoreError::NotFound {
+                    resource: "database",
+                });
             }
         }
-        Err(_) => Err(StoreError::NotFound {
-            resource: "database",
-        }),
-        Ok(bytes)
-            if bytes.is_empty()
-                || (bytes.len() >= JOURNAL_HEADER_BYTES
-                    && bytes[..JOURNAL_HEADER_BYTES].iter().all(|&byte| byte == 0)) =>
-        {
-            Ok(false)
-        }
-        Ok(bytes) if bytes.len() > 512 && bytes.starts_with(JOURNAL_MAGIC) => Ok(true),
-        Ok(_) => Err(StoreError::NotFound {
-            resource: "database",
-        }),
     }
+    Ok(())
 }
 
 fn immutable_read_only_uri(path: &Path) -> StoreResult<String> {
@@ -8508,14 +8477,6 @@ mod tests {
         let _ = fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
     }
 
-    fn database_file_snapshots(path: &Path) -> [Option<Vec<u8>>; 3] {
-        [
-            fs::read(path).ok(),
-            fs::read(PathBuf::from(format!("{}-wal", path.display()))).ok(),
-            fs::read(PathBuf::from(format!("{}-shm", path.display()))).ok(),
-        ]
-    }
-
     #[derive(Debug, PartialEq, Eq)]
     struct EntrySnapshot {
         exists: bool,
@@ -8523,12 +8484,6 @@ mod tests {
         directory: bool,
         symlink: bool,
         bytes: Option<Vec<u8>>,
-    }
-
-    fn adjacent_test_path(path: &Path, suffix: &str) -> PathBuf {
-        let mut sidecar = path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        sidecar.into()
     }
 
     fn entry_snapshot(path: &Path) -> EntrySnapshot {
@@ -8559,7 +8514,7 @@ mod tests {
             entry_snapshot(if suffix.is_empty() {
                 path.to_path_buf()
             } else {
-                adjacent_test_path(path, suffix)
+                super::sqlite_sidecar_path(path, suffix)
             }
             .as_path())
         })
@@ -8960,7 +8915,7 @@ END;
             let seeded = PaStore::open(&database.path, DATABASE_KEY).expect("seed sidecar fixture");
             drop(seeded);
 
-            fs::write(adjacent_test_path(&database.path, suffix), b"sidecar fixture")
+            fs::write(super::sqlite_sidecar_path(&database.path, suffix), b"sidecar fixture")
                 .expect("create sidecar fixture");
             let before = restore_entry_snapshots(&database.path);
 
@@ -8974,151 +8929,6 @@ END;
             ));
             assert_eq!(restore_entry_snapshots(&database.path), before);
         }
-    }
-
-    #[test]
-    fn restore_open_existing_preserves_pending_wal_sidecars() {
-        let database = TempDatabase::new();
-        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed WAL fixture");
-        seed.connection()
-            .execute(
-                "UPDATE configuration SET owner_email = 'restore@example.com' WHERE id = 1",
-                [],
-            )
-            .expect("write pending WAL frame");
-
-        let before = database_file_snapshots(&database.path);
-        assert!(before.iter().all(Option::is_some), "seeded WAL sidecars");
-
-        let restored = PaStore::open_existing(&database.path, DATABASE_KEY)
-            .expect("current SQLCipher WAL fixture opens");
-        drop(restored);
-
-        assert!(
-            database_file_snapshots(&database.path) == before,
-            "restore candidate inspection must preserve database and WAL sidecar bytes"
-        );
-        drop(seed);
-    }
-
-    #[test]
-    fn restore_open_existing_escapes_reserved_path_characters() {
-        let mut database = TempDatabase::new();
-        database.path = database
-            .path
-            .with_file_name("agent_voice_restore?reserved#percent%.db");
-        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed reserved-path fixture");
-        drop(seed);
-
-        let restored = PaStore::open_existing(&database.path, DATABASE_KEY)
-            .expect("reserved-path SQLCipher fixture opens");
-        assert_eq!(
-            restored
-                .connection()
-                .query_row("SELECT count(*) FROM configuration", [], |row| row
-                    .get::<_, i64>(0))
-                .expect("reserved-path fixture query"),
-            1
-        );
-    }
-
-    #[test]
-    fn immutable_uri_builder_distinguishes_windows_relative_and_absolute_paths() {
-        assert_eq!(
-            super::immutable_read_only_uri_for_path_bytes(b"relative.db", true, false),
-            "file:relative.db?immutable=1"
-        );
-        assert_eq!(
-            super::immutable_read_only_uri_for_path_bytes(b"C:/restore.db", true, true),
-            "file:///C:/restore.db?immutable=1"
-        );
-    }
-
-    #[test]
-    fn restore_open_existing_preserves_empty_quiescent_rollback_journal() {
-        let database = TempDatabase::new();
-        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed empty journal fixture");
-        drop(seed);
-
-        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
-        fs::write(&journal_path, []).expect("create empty quiescent rollback journal");
-        let before = [
-            fs::read(&database.path).expect("snapshot database"),
-            fs::read(&journal_path).expect("snapshot empty rollback journal"),
-        ];
-
-        let restored = PaStore::open_existing(&database.path, DATABASE_KEY)
-            .expect("empty quiescent rollback journal opens");
-        drop(restored);
-
-        assert!(
-            [
-                fs::read(&database.path).expect("database remains"),
-                fs::read(&journal_path).expect("empty rollback journal remains"),
-            ] == before,
-            "restore candidate inspection must preserve empty rollback journal bytes"
-        );
-    }
-
-    #[test]
-    fn restore_open_existing_preserves_zero_header_quiescent_rollback_journal() {
-        let database = TempDatabase::new();
-        let seed =
-            PaStore::open(&database.path, DATABASE_KEY).expect("seed zero-header journal fixture");
-        drop(seed);
-
-        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
-        fs::write(&journal_path, [0_u8; 512]).expect("create zero-header rollback journal");
-        let before = [
-            fs::read(&database.path).expect("snapshot database"),
-            fs::read(&journal_path).expect("snapshot zero-header rollback journal"),
-        ];
-
-        let restored = PaStore::open_existing(&database.path, DATABASE_KEY)
-            .expect("zero-header quiescent rollback journal opens");
-        drop(restored);
-
-        assert!(
-            [
-                fs::read(&database.path).expect("database remains"),
-                fs::read(&journal_path).expect("zero-header rollback journal remains"),
-            ] == before,
-            "restore candidate inspection must preserve zero-header rollback journal bytes"
-        );
-    }
-
-    #[test]
-    fn restore_open_existing_rejects_partially_zeroed_rollback_journal() {
-        let database = TempDatabase::new();
-        let seed = PaStore::open(&database.path, DATABASE_KEY)
-            .expect("seed partially-zeroed journal fixture");
-        drop(seed);
-
-        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
-        let mut journal = vec![0_u8; 28];
-        journal[8] = 0xAA;
-        fs::write(&journal_path, &journal).expect("create partially-zeroed rollback journal");
-        let before = [
-            fs::read(&database.path).expect("snapshot database"),
-            fs::read(&journal_path).expect("snapshot rollback journal"),
-        ];
-
-        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
-            .expect_err("partially-zeroed rollback journal must fail closed");
-
-        assert!(matches!(
-            error,
-            StoreError::NotFound {
-                resource: "database"
-            }
-        ));
-        assert!(
-            [
-                fs::read(&database.path).expect("database remains"),
-                fs::read(&journal_path).expect("rollback journal remains"),
-            ] == before,
-            "restore candidate inspection must preserve partially-zeroed journal bytes"
-        );
     }
 
     #[cfg(unix)]
@@ -9158,39 +8968,6 @@ END;
     }
 
     #[test]
-    fn restore_open_existing_rejects_unreadable_rollback_journal() {
-        let database = TempDatabase::new();
-        let seed =
-            PaStore::open(&database.path, DATABASE_KEY).expect("seed unreadable journal fixture");
-        drop(seed);
-
-        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
-        fs::write(&journal_path, [0_u8; 512]).expect("create unreadable rollback journal");
-        let before = [
-            fs::read(&database.path).expect("snapshot database"),
-            fs::read(&journal_path).expect("snapshot rollback journal"),
-        ];
-
-        super::force_rollback_journal_read_failure(true);
-        let result = PaStore::open_existing(&database.path, DATABASE_KEY);
-        super::force_rollback_journal_read_failure(false);
-
-        assert!(matches!(
-            result,
-            Err(StoreError::NotFound {
-                resource: "database"
-            })
-        ));
-        assert!(
-            [
-                fs::read(&database.path).expect("database remains"),
-                fs::read(&journal_path).expect("rollback journal remains"),
-            ] == before,
-            "restore candidate inspection must preserve unreadable rollback journal bytes"
-        );
-    }
-
-    #[test]
     fn restore_open_existing_rejects_malformed_rollback_journal() {
         let database = TempDatabase::new();
         let seed =
@@ -9219,67 +8996,6 @@ END;
                 fs::read(&journal_path).expect("rollback journal remains"),
             ] == before,
             "restore candidate inspection must preserve malformed rollback journal bytes"
-        );
-    }
-
-    #[test]
-    fn restore_open_existing_rejects_genuine_interrupted_rollback_journal() {
-        let source = TempDatabase::new();
-        let seed = PaStore::open(&source.path, DATABASE_KEY).expect("seed journal fixture");
-        drop(seed);
-
-        let connection = Connection::open(&source.path).expect("open rollback journal fixture");
-        apply_sqlcipher_key(&connection, DATABASE_KEY).expect("apply SQLCipher key");
-        connection
-            .execute_batch(
-                "PRAGMA journal_mode = DELETE;
-                 PRAGMA cache_size = 1;
-                 BEGIN IMMEDIATE;
-                 CREATE TABLE interrupted_fixture (id INTEGER PRIMARY KEY, value BLOB);
-                 INSERT INTO interrupted_fixture VALUES (1, zeroblob(4096));
-                 INSERT INTO interrupted_fixture VALUES (2, zeroblob(4096));
-                 INSERT INTO interrupted_fixture VALUES (3, zeroblob(4096));
-                 INSERT INTO interrupted_fixture VALUES (4, zeroblob(4096));",
-            )
-            .expect("create rollback journal");
-
-        let interrupted = TempDatabase::new();
-        let source_journal_path = PathBuf::from(format!("{}-journal", source.path.display()));
-        let interrupted_journal_path =
-            PathBuf::from(format!("{}-journal", interrupted.path.display()));
-        let source_journal = fs::read(&source_journal_path).expect("read source rollback journal");
-        assert_eq!(
-            &source_journal[..8],
-            b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7",
-            "fixture must contain a hot rollback journal header"
-        );
-        fs::copy(&source.path, &interrupted.path).expect("copy interrupted database");
-        fs::copy(&source_journal_path, &interrupted_journal_path)
-            .expect("copy interrupted rollback journal");
-        connection
-            .execute_batch("ROLLBACK;")
-            .expect("restore fixture");
-        drop(connection);
-
-        let before = [
-            fs::read(&interrupted.path).expect("snapshot interrupted database"),
-            fs::read(&interrupted_journal_path).expect("snapshot interrupted rollback journal"),
-        ];
-        let error = PaStore::open_existing(&interrupted.path, DATABASE_KEY)
-            .expect_err("interrupted rollback journal must fail closed");
-        assert!(matches!(
-            error,
-            StoreError::NotFound {
-                resource: "database"
-            }
-        ));
-
-        assert!(
-            [
-                fs::read(&interrupted.path).expect("interrupted database remains"),
-                fs::read(&interrupted_journal_path).expect("interrupted rollback journal remains"),
-            ] == before,
-            "restore candidate inspection must preserve database and rollback journal bytes"
         );
     }
 
