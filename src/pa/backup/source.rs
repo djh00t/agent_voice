@@ -357,7 +357,7 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(all(test, unix))]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
 
     use ring::rand::{SecureRandom, SystemRandom};
@@ -659,7 +659,7 @@ mod tests {
         assert_eq!(attempt.parent(), Some(destination.directory.as_path()));
         assert_ne!(attempt, destination.path);
 
-        let missing = destination.sibling("missing-root");
+        let missing = destination.sibling("missing-secret-workspace-root");
         let error = match super::LifecycleWorkspace::from_private_root(&missing) {
             Ok(_) => panic!("missing root must fail closed"),
             Err(error) => error,
@@ -668,6 +668,31 @@ mod tests {
             error,
             StoreError::StoredRecordInvalid { resource: "backup" }
         ));
+        assert!(!error.to_string().contains("secret-workspace-root"));
+
+        let not_directory = destination.sibling("not-a-directory");
+        fs::write(&not_directory, b"not a workspace root").expect("create non-directory root");
+        let error = match super::LifecycleWorkspace::from_private_root(&not_directory) {
+            Ok(_) => panic!("non-directory root must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            StoreError::StoredRecordInvalid { resource: "backup" }
+        ));
+        fs::remove_file(&not_directory).expect("remove non-directory root");
+
+        let symlink_root = destination.sibling("workspace-root-symlink");
+        symlink(&destination.directory, &symlink_root).expect("create workspace root symlink");
+        let error = match super::LifecycleWorkspace::from_private_root(&symlink_root) {
+            Ok(_) => panic!("symlink root must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            StoreError::StoredRecordInvalid { resource: "backup" }
+        ));
+        fs::remove_file(&symlink_root).expect("remove workspace root symlink");
 
         fs::set_permissions(&destination.directory, fs::Permissions::from_mode(0o777))
             .expect("make root unsafe");
