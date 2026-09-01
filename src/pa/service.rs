@@ -1825,8 +1825,9 @@ mod tests {
     };
     use crate::pa::fakes::{FakeControl, FakeGoogleCalendar, FakeOperation, FakeOutlookCalendar};
     use crate::pa::providers::{
-        CalendarAttendee, CalendarChange, CalendarEvent, GoogleCalendarProvider,
-        GoogleProposalDraft, MailAddress, ProviderError, ProviderSession, RetryAfter, TimeRange,
+        CalendarAttendee, CalendarChange, CalendarEvent, CalendarReadProvider, CalendarSyncRequest,
+        GoogleCalendarProvider, GoogleProposalDraft, MailAddress, ProviderError, ProviderSession,
+        RetryAfter, TimeRange,
     };
     use crate::pa::store::{
         AuditEntityType, AuditEventType, MessageProvider, MessageSummary, PaStore, StoreError,
@@ -7024,5 +7025,373 @@ mod tests {
                 .expect("create count"),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn submit_owner_task_provider_failure_leaves_placement_prepared() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+        );
+        let verified = owner_verified(now);
+        let prepared = service
+            .prepare_owner_task(
+                owner_task_draft("owner-submit-provider-failure"),
+                Some("voice:owner-submit-provider-failure"),
+                now + Duration::hours(1),
+                "UTC",
+                "owner-submit-provider-failure-operation",
+                &verified,
+                "+61415850000",
+                now,
+            )
+            .expect("prepare");
+        outlook_control
+            .queue_failure(FakeOperation::CalendarOwnerFind, ProviderError::NotFound)
+            .expect("queue initial find result");
+        outlook_control
+            .queue_failure(FakeOperation::CalendarOwnerFind, ProviderError::Unavailable)
+            .expect("queue recovery find failure");
+        outlook_control
+            .queue_failure(
+                FakeOperation::CalendarOwnerCreate,
+                ProviderError::Unavailable,
+            )
+            .expect("queue create failure");
+
+        let error = service
+            .submit_owner_task(&prepared, &verified, "+61415850000", now)
+            .await
+            .expect_err("provider create and recovery failures must fail closed");
+        assert_eq!(error.to_string(), "outlook calendar operation failed");
+        assert_eq!(format!("{error:?}"), "OutlookCalendar");
+        assert!(matches!(
+            error,
+            ServiceError::OutlookCalendar(ProviderError::Unavailable)
+        ));
+
+        let placement = store
+            .load_owner_task_placement(prepared.owner_task_draft_id())
+            .expect("placement");
+        assert!(!placement.is_submitted());
+        assert!(placement.provider_event_id().is_none());
+        assert!(
+            store
+                .list_audit_events(None, 10)
+                .expect("audits")
+                .is_empty()
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerFind)
+                .expect("find count"),
+            2
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count"),
+            1
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count"),
+            1
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerCreate)
+                .expect("create count"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_owner_task_rejects_semantic_audit_conflict_without_provider_calls() {
+        let now = now();
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let (store, outlook, google, outlook_session, google_session) =
+            fixture(&outlook_control, &google_control, Vec::new(), Vec::new());
+        let service = PaService::new(
+            &store,
+            &outlook,
+            &outlook_session,
+            &google,
+            &google_session,
+            &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+        );
+        let verified = owner_verified(now);
+        let prepared = service
+            .prepare_owner_task(
+                owner_task_draft("owner-submit-audit-conflict"),
+                Some("voice:owner-submit-audit-conflict"),
+                now + Duration::hours(1),
+                "UTC",
+                "owner-submit-audit-conflict-operation",
+                &verified,
+                "+61415850000",
+                now,
+            )
+            .expect("prepare");
+        service
+            .submit_owner_task(&prepared, &verified, "+61415850000", now)
+            .await
+            .expect("initial submit");
+        let audit_key = format!("pa-owner-task-submitted-{}", prepared.owner_task_draft_id());
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER audit_events_append_only_update")
+            .expect("disable audit update trigger");
+        store
+            .connection()
+            .execute(
+                "UPDATE audit_events SET event_type = 'request_submitted'
+                 WHERE idempotency_key = ?1",
+                [&audit_key],
+            )
+            .expect("corrupt audit semantics");
+
+        let find_count = outlook_control
+            .invocation_count(FakeOperation::CalendarOwnerFind)
+            .expect("find count before retry");
+        let create_count = outlook_control
+            .invocation_count(FakeOperation::CalendarOwnerCreate)
+            .expect("create count before retry");
+        let outlook_busy_count = outlook_control
+            .invocation_count(FakeOperation::CalendarBusy)
+            .expect("outlook busy count before retry");
+        let google_busy_count = google_control
+            .invocation_count(FakeOperation::CalendarBusy)
+            .expect("google busy count before retry");
+
+        let error = service
+            .submit_owner_task(
+                &prepared,
+                &verified,
+                "+61415850000",
+                now + Duration::seconds(1),
+            )
+            .await
+            .expect_err("semantic audit conflict must fail closed");
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::Conflict {
+                resource: "owner task audit"
+            })
+        ));
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerFind)
+                .expect("find count after retry"),
+            find_count
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarOwnerCreate)
+                .expect("create count after retry"),
+            create_count
+        );
+        assert_eq!(
+            outlook_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("outlook busy count after retry"),
+            outlook_busy_count
+        );
+        assert_eq!(
+            google_control
+                .invocation_count(FakeOperation::CalendarBusy)
+                .expect("google busy count after retry"),
+            google_busy_count
+        );
+        let placement = store
+            .load_owner_task_placement(prepared.owner_task_draft_id())
+            .expect("placement");
+        assert!(placement.is_submitted());
+        assert_eq!(store.list_audit_events(None, 10).expect("audits").len(), 1);
+        let audit = store
+            .load_audit_event_by_idempotency_key(audit_key)
+            .expect("conflicting audit");
+        assert_eq!(audit.event_type(), AuditEventType::RequestSubmitted);
+        assert_eq!(audit.entity_type(), AuditEntityType::OwnerTask);
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_owner_submits_converge_to_one_event_mapping_and_audit() {
+        let now = now();
+        let path = std::env::temp_dir().join(format!(
+            "agent_voice_owner_submit_race_{}_{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let first_store = PaStore::open(&path, b"service-test-key").expect("first store");
+        let second_store = PaStore::open(&path, b"service-test-key").expect("second store");
+        let outlook_control = control(now);
+        let google_control = control(now);
+        let outlook = FakeOutlookCalendar::new(
+            &outlook_control,
+            Vec::<BusyInterval>::new(),
+            Vec::<CalendarChange>::new(),
+        );
+        let google = FakeGoogleCalendar::new(
+            &google_control,
+            Vec::<BusyInterval>::new(),
+            Vec::<CalendarChange>::new(),
+        );
+        let prepared = {
+            let outlook_session = session();
+            let google_session = session();
+            let service = PaService::new(
+                &first_store,
+                &outlook,
+                &outlook_session,
+                &google,
+                &google_session,
+                &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            );
+            service
+                .prepare_owner_task(
+                    owner_task_draft("owner-submit-race"),
+                    Some("voice:owner-submit-race"),
+                    now + Duration::hours(1),
+                    "UTC",
+                    "owner-submit-race-operation",
+                    &owner_verified(now),
+                    "+61415850000",
+                    now,
+                )
+                .expect("prepare")
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_barrier = std::sync::Arc::clone(&barrier);
+        let second_barrier = std::sync::Arc::clone(&barrier);
+        let first_outlook = outlook.clone();
+        let second_outlook = outlook.clone();
+        let first_google = google.clone();
+        let second_google = google.clone();
+        let first_prepared = prepared.clone();
+        let second_prepared = prepared.clone();
+        let first_handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().expect("first runtime");
+            let outlook_session = session();
+            let google_session = session();
+            let verified = owner_verified(now);
+            first_barrier.wait();
+            let service = PaService::new(
+                &first_store,
+                &first_outlook,
+                &outlook_session,
+                &first_google,
+                &google_session,
+                &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            );
+            runtime.block_on(service.submit_owner_task(
+                &first_prepared,
+                &verified,
+                "+61415850000",
+                now,
+            ))
+        });
+        let second_handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().expect("second runtime");
+            let outlook_session = session();
+            let google_session = session();
+            let verified = owner_verified(now);
+            second_barrier.wait();
+            let service = PaService::new(
+                &second_store,
+                &second_outlook,
+                &outlook_session,
+                &second_google,
+                &google_session,
+                &AvailabilityPolicy::for_timezone("UTC").expect("policy"),
+            );
+            runtime.block_on(service.submit_owner_task(
+                &second_prepared,
+                &verified,
+                "+61415850000",
+                now + Duration::seconds(1),
+            ))
+        });
+        let first = first_handle
+            .join()
+            .expect("first submit thread")
+            .expect("first submit");
+        let second = second_handle
+            .join()
+            .expect("second submit thread")
+            .expect("second submit");
+        assert_eq!(first, second);
+        assert_eq!(first.owner_task_draft_id(), prepared.owner_task_draft_id());
+        assert_eq!(first.state(), "submitted");
+
+        let reopened = PaStore::open(&path, b"service-test-key").expect("reopen store");
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row("SELECT count(*) FROM owner_task_drafts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("draft count"),
+            1
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row("SELECT count(*) FROM owner_task_placements", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("placement count"),
+            1
+        );
+        let placement = reopened
+            .load_owner_task_placement(prepared.owner_task_draft_id())
+            .expect("placement");
+        assert!(placement.is_submitted());
+        let audits = reopened.list_audit_events(None, 10).expect("audits");
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].event_type(), AuditEventType::OwnerTaskSubmitted);
+        assert_eq!(audits[0].entity_type(), AuditEntityType::OwnerTask);
+        assert_eq!(
+            audits[0].entity_id(),
+            prepared.owner_task_draft_id().to_string()
+        );
+
+        let sync_range = TimeRange::new(
+            DateTime::<Utc>::from_timestamp(now.unix_timestamp(), now.nanosecond())
+                .expect("sync start"),
+            DateTime::<Utc>::from_timestamp(
+                (now + Duration::hours(2)).unix_timestamp(),
+                (now + Duration::hours(2)).nanosecond(),
+            )
+            .expect("sync end"),
+        )
+        .expect("sync range");
+        let sync_request = CalendarSyncRequest::new(sync_range, None, 10).expect("sync request");
+        let sync_session = session();
+        let page = outlook
+            .sync_calendar(&sync_session, &sync_request)
+            .await
+            .expect("outlook sync");
+        assert_eq!(page.items().len(), 1);
+        assert_eq!(
+            page.items()[0]
+                .event()
+                .expect("owner event")
+                .provider_event_id(),
+            placement.provider_event_id().expect("provider mapping")
+        );
+        drop(reopened);
+        std::fs::remove_file(path).expect("remove race database");
     }
 }
