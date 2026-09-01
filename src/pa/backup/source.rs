@@ -51,7 +51,7 @@ impl PaStore {
     /// trust boundary. Unsupported platforms fail closed until they have an
     /// equivalent capability and identity check. The later snapshot writer
     /// owns final encoded-snapshot fsync and rename behavior.
-    pub fn backup_to_path<P, K>(&self, destination: P, database_key: K) -> StoreResult<()>
+    pub(crate) fn backup_to_path<P, K>(&self, destination: P, database_key: K) -> StoreResult<()>
     where
         P: AsRef<Path>,
         K: AsRef<[u8]>,
