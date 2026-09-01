@@ -15,6 +15,28 @@ const ATTEMPT_FILE_PREFIX: &str = ".agent-voice-backup-attempt-";
 const ATTEMPT_COLLISION_LIMIT: usize = 32;
 static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Crate-private root for transient artifacts owned by the PA lifecycle.
+///
+/// Construction never creates a directory or chooses a system temporary path:
+/// deployment supplies the already-isolated lifecycle mount.
+pub(crate) struct LifecycleWorkspace {
+    root: PathBuf,
+}
+
+impl LifecycleWorkspace {
+    pub(crate) fn from_private_root(root: impl AsRef<Path>) -> StoreResult<Self> {
+        let root = root.as_ref();
+        validate_workspace_root(root)?;
+        Ok(Self {
+            root: root.to_owned(),
+        })
+    }
+
+    fn allocate_attempt_path(&self) -> StoreResult<PathBuf> {
+        opaque_sibling_attempt_path(&self.root)
+    }
+}
+
 impl PaStore {
     /// Copies the live SQLCipher database to a new caller-selected attempt path.
     ///
@@ -272,6 +294,23 @@ fn trusted_attempt_parent(destination: &Path) -> StoreResult<&Path> {
 
 #[cfg(not(unix))]
 fn trusted_attempt_parent(_destination: &Path) -> StoreResult<&Path> {
+    Err(backup_error())
+}
+
+#[cfg(unix)]
+fn validate_workspace_root(root: &Path) -> StoreResult<()> {
+    let metadata = fs::symlink_metadata(root).map_err(|_| backup_error())?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(backup_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_workspace_root(_root: &Path) -> StoreResult<()> {
     Err(backup_error())
 }
 
@@ -607,6 +646,42 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn lifecycle_workspace_requires_an_existing_private_root() {
+        let destination = TempDestination::new("lifecycle-root");
+        let workspace = super::LifecycleWorkspace::from_private_root(&destination.directory)
+            .expect("private fixture directory is a workspace root");
+        let attempt = workspace
+            .allocate_attempt_path()
+            .expect("allocate opaque workspace attempt");
+        assert_eq!(attempt.parent(), Some(destination.directory.as_path()));
+        assert_ne!(attempt, destination.path);
+
+        let missing = destination.sibling("missing-root");
+        let error = match super::LifecycleWorkspace::from_private_root(&missing) {
+            Ok(_) => panic!("missing root must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            StoreError::StoredRecordInvalid { resource: "backup" }
+        ));
+
+        fs::set_permissions(&destination.directory, fs::Permissions::from_mode(0o777))
+            .expect("make root unsafe");
+        let unsafe_error =
+            match super::LifecycleWorkspace::from_private_root(&destination.directory) {
+                Ok(_) => panic!("writable root must fail closed"),
+                Err(error) => error,
+            };
+        fs::set_permissions(&destination.directory, fs::Permissions::from_mode(0o700))
+            .expect("restore fixture permissions");
+        assert!(matches!(
+            unsafe_error,
+            StoreError::StoredRecordInvalid { resource: "backup" }
+        ));
     }
 
     #[test]
