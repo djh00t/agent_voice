@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 #[cfg(unix)]
@@ -17,6 +18,51 @@ use crate::pa::store::{PaStore, StoreError, StoreResult};
 const ATTEMPT_FILE_PREFIX: &str = ".agent-voice-backup-attempt-";
 const ATTEMPT_COLLISION_LIMIT: usize = 32;
 static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Opaque, source-validated encrypted backup bytes for later snapshot encoding.
+///
+/// The value has no filesystem or cleanup capability and its diagnostics never
+/// interpolate encrypted content, key material, or caller input.
+pub(crate) struct VerifiedBackupBytes {
+    bytes: Vec<u8>,
+    schema_version: i64,
+}
+
+impl VerifiedBackupBytes {
+    fn new(bytes: Vec<u8>, schema_version: i64) -> StoreResult<Self> {
+        if bytes.is_empty() || schema_version <= 0 {
+            return Err(backup_error());
+        }
+        Ok(Self {
+            bytes,
+            schema_version,
+        })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn schema_version(&self) -> i64 {
+        self.schema_version
+    }
+
+    pub(crate) fn byte_len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+}
+
+impl fmt::Debug for VerifiedBackupBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedBackupBytes(<redacted>)")
+    }
+}
+
+impl fmt::Display for VerifiedBackupBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("verified backup bytes (<redacted>)")
+    }
+}
 
 /// Crate-private root for transient artifacts owned by the PA lifecycle.
 ///
@@ -757,6 +803,29 @@ mod tests {
     fn lifecycle_workspace_requires_service_owner() {
         assert!(super::workspace_owner_matches_effective_uid(42, 42));
         assert!(!super::workspace_owner_matches_effective_uid(42, 41));
+    }
+
+    #[test]
+    fn verified_backup_bytes_are_opaque_and_carry_fixed_snapshot_metadata() {
+        let bytes = b"encrypted-snapshot-secret-sentinel".to_vec();
+        let verified = super::VerifiedBackupBytes::new(bytes.clone(), 7)
+            .expect("construct verified opaque backup bytes");
+
+        assert_eq!(verified.bytes(), bytes.as_slice());
+        assert_eq!(verified.schema_version(), 7);
+        assert_eq!(verified.byte_len(), bytes.len() as u64);
+        assert_eq!(format!("{verified:?}"), "VerifiedBackupBytes(<redacted>)");
+        assert_eq!(verified.to_string(), "verified backup bytes (<redacted>)");
+
+        let error = match super::VerifiedBackupBytes::new(Vec::new(), 7) {
+            Ok(_) => panic!("empty backup bytes must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            StoreError::StoredRecordInvalid { resource: "backup" }
+        ));
+        assert!(!error.to_string().contains("secret-sentinel"));
     }
 
     #[test]
