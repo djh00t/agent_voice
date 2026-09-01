@@ -2147,8 +2147,13 @@ impl PaStore {
     {
         let key = database_key.as_ref();
         reject_empty_key(key)?;
-        let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|_| StoreError::NotFound {
+        let path = path.as_ref();
+        let immutable_uri = format!("file:{}?immutable=1", path.display());
+        let mut connection = Connection::open_with_flags(
+            immutable_uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|_| StoreError::NotFound {
             resource: "database",
         })?;
         initialize(&mut connection, key, false, false)?;
@@ -8373,8 +8378,17 @@ mod tests {
 
     fn remove_database_files(path: &Path) {
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(PathBuf::from(format!("{}-journal", path.display())));
         let _ = fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
         let _ = fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+    }
+
+    fn database_file_snapshots(path: &Path) -> [Option<Vec<u8>>; 3] {
+        [
+            fs::read(path).ok(),
+            fs::read(PathBuf::from(format!("{}-wal", path.display()))).ok(),
+            fs::read(PathBuf::from(format!("{}-shm", path.display()))).ok(),
+        ]
     }
 
     fn random_replay_nonce() -> String {
@@ -8738,6 +8752,70 @@ END;
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .expect("restored journal mode");
         assert_eq!(restored_journal_mode, older_journal_mode);
+    }
+
+    #[test]
+    fn restore_open_existing_preserves_pending_wal_sidecars() {
+        let database = TempDatabase::new();
+        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed WAL fixture");
+        seed.connection()
+            .execute(
+                "UPDATE configuration SET owner_email = 'restore@example.com' WHERE id = 1",
+                [],
+            )
+            .expect("write pending WAL frame");
+
+        let before = database_file_snapshots(&database.path);
+        assert!(before.iter().all(Option::is_some), "seeded WAL sidecars");
+
+        let restored = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect("current SQLCipher WAL fixture opens");
+        drop(restored);
+
+        assert!(
+            database_file_snapshots(&database.path) == before,
+            "restore candidate inspection must preserve database and WAL sidecar bytes"
+        );
+        drop(seed);
+    }
+
+    #[test]
+    fn restore_open_existing_preserves_hot_rollback_journal() {
+        let database = TempDatabase::new();
+        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed journal fixture");
+        drop(seed);
+
+        let connection = Connection::open(&database.path).expect("open rollback journal fixture");
+        apply_sqlcipher_key(&connection, DATABASE_KEY).expect("apply SQLCipher key");
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = DELETE;
+                 BEGIN IMMEDIATE;
+                 UPDATE configuration SET owner_email = 'restore@example.com' WHERE id = 1;",
+            )
+            .expect("create rollback journal");
+        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
+        let hot_journal = fs::read(&journal_path).expect("snapshot rollback journal");
+        connection
+            .execute_batch("ROLLBACK;")
+            .expect("restore fixture");
+        drop(connection);
+        fs::write(&journal_path, &hot_journal).expect("restore hot rollback journal");
+
+        let before = [
+            fs::read(&database.path).expect("snapshot database"),
+            fs::read(&journal_path).expect("snapshot rollback journal"),
+        ];
+        let restored = PaStore::open_existing(&database.path, DATABASE_KEY);
+        drop(restored);
+
+        assert!(
+            [
+                fs::read(&database.path).expect("database remains"),
+                fs::read(&journal_path).expect("rollback journal remains"),
+            ] == before,
+            "restore candidate inspection must preserve database and rollback journal bytes"
+        );
     }
 
     #[test]
