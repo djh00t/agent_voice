@@ -2,10 +2,11 @@
 
 - **Issue:** #251
 - **Package:** `task-8b3`
-- **Base:** `683249e59f8b302bbf8dc7a1ba9a1f0ab1d076d4` (`origin/main`)
+- **Immutable base:** `683249e59f8b302bbf8dc7a1ba9a1f0ab1d076d4` (`origin/main`)
 - **Branch:** `codex/issue-251-oauth-facade`
 - **Worktree:** `/Users/djh/.codex/worktrees/agent_voice-issue-251-oauth-facade`
-- **Implementation commits:** `5d7cfba99f8d61a4e01cb05aa7f67c845dc07019`, `758ef7f7e263e472e9da6ef74bded9cf85cbc363`, `1501ea6ae959e9065adff2a32d19fb372c3cee71`, `a13383c504902a9380ba67c0b687250512c9c1fd`
+- **Implementation commits:** `5d7cfba99f8d61a4e01cb05aa7f67c845dc07019`, `758ef7f7e263e472e9da6ef74bded9cf85cbc363`, `1501ea6ae959e9065adff2a32d19fb372c3cee71`, `a13383c504902a9380ba67c0b687250512c9c1fd`, `4bd2340dac9b6499f19950824ab34f42fb886745`, `e7a4d970a38c045abcd5aab634914c670bb6d490`
+- **Pre-export RED working tree:** uncommitted state derived from the immutable base after adding the module-surface test and only `pub mod oauth;` registration; no facade re-exports or child-module registrations existed in that state, so it has no commit SHA.
 
 ## Scope
 
@@ -38,10 +39,11 @@ complete query URLs, or provider diagnostics.
     "kind": "RED",
     "selector_or_scope": "pa::oauth::tests::module_surface",
     "command_or_check": "rtk cargo test --lib pa::oauth::tests::module_surface -- --exact",
-    "expected": "nonzero missing-facade failure before exports exist",
+    "expected": "nonzero E0405/E0425/E0433 missing-facade compile failure after pa::oauth registration but before facade re-exports",
     "exit_code": 101,
-    "observed": "the discovered selector failed with unresolved pa::oauth exports for the start, callback, state-store, and opaque-code symbols",
+    "observed": "the discovered selector failed with 16 E0405/E0425/E0433 diagnostics for unresolved pa::oauth start, callback, state-store, and opaque-code symbols; it did not filter to zero tests",
     "commit": "683249e59f8b302bbf8dc7a1ba9a1f0ab1d076d4",
+    "working_tree": "uncommitted pre-export state described in package metadata; the immutable base itself contained neither the registration nor an executable selector",
     "timestamp_utc": "2026-09-01T01:39:00Z"
   },
   {
@@ -159,8 +161,10 @@ complete query URLs, or provider diagnostics.
 
 The initial selector run before `pa::oauth` registration returned 0 passed and
 579 filtered tests; it was discarded as invalid zero-test evidence under the
-issue contract. The valid RED above was captured after registration existed but
-before facade exports were added.
+issue contract. The valid RED above was captured in the explicitly named
+uncommitted pre-export working tree after registration existed but before
+facade exports were added. The immutable base predates that registration and
+did not contain an executable selector.
 
 ## Acceptance mapping
 
