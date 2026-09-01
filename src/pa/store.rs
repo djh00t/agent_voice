@@ -7052,12 +7052,28 @@ fn immutable_read_only_uri(path: &Path) -> StoreResult<String> {
         path.as_os_str().as_bytes()
     };
     #[cfg(windows)]
-    let normalized_path = path
-        .to_str()
-        .ok_or(StoreError::NotFound {
+    let normalized_path = {
+        let path_text = path.to_str().ok_or(StoreError::NotFound {
             resource: "database",
-        })?
-        .replace('\\', "/");
+        })?;
+        let path_bytes = path_text.as_bytes();
+        if path_bytes.get(1) == Some(&b':')
+            && !matches!(path_bytes.get(2), Some(b'/') | Some(b'\\'))
+        {
+            return Err(StoreError::NotFound {
+                resource: "database",
+            });
+        }
+        path.canonicalize()
+            .map_err(|_| StoreError::NotFound {
+                resource: "database",
+            })?
+            .to_str()
+            .ok_or(StoreError::NotFound {
+                resource: "database",
+            })?
+            .replace('\\', "/")
+    };
     #[cfg(windows)]
     let path_bytes = normalized_path.as_bytes();
     #[cfg(not(any(unix, windows)))]
@@ -7075,22 +7091,56 @@ fn immutable_read_only_uri(path: &Path) -> StoreResult<String> {
     Ok(immutable_read_only_uri_for_path_bytes(
         path_bytes,
         is_windows_path,
-        path.is_absolute(),
-    ))
+        {
+            #[cfg(windows)]
+            {
+                true
+            }
+            #[cfg(not(windows))]
+            {
+                path.is_absolute()
+            }
+        },
+    )?)
 }
 
 fn immutable_read_only_uri_for_path_bytes(
     path_bytes: &[u8],
     is_windows_path: bool,
     is_absolute: bool,
-) -> String {
+) -> StoreResult<String> {
+    if is_windows_path && !is_absolute {
+        return Err(StoreError::NotFound {
+            resource: "database",
+        });
+    }
+    let path_bytes = if is_windows_path && path_bytes.starts_with(b"//?/") {
+        let drive_path = &path_bytes[4..];
+        if drive_path.len() < 3
+            || !drive_path[0].is_ascii_alphabetic()
+            || drive_path[1] != b':'
+            || drive_path[2] != b'/'
+        {
+            return Err(StoreError::NotFound {
+                resource: "database",
+            });
+        }
+        drive_path
+    } else {
+        path_bytes
+    };
+    if is_windows_path && (path_bytes.starts_with(b"//") || path_bytes.starts_with(b"\\\\")) {
+        return Err(StoreError::NotFound {
+            resource: "database",
+        });
+    }
     let mut uri = String::from("file:");
     if is_windows_path && is_absolute {
         uri.push_str("///");
     }
     append_uri_path_bytes(&mut uri, path_bytes);
     uri.push_str("?immutable=1");
-    uri
+    Ok(uri)
 }
 
 fn append_uri_path_bytes(uri: &mut String, path_bytes: &[u8]) {
@@ -8785,6 +8835,38 @@ END;
     fn empty_database_key_is_rejected() {
         let error = PaStore::open_in_memory([]).expect_err("empty key must fail");
         assert!(error.to_string().contains("database key"));
+    }
+
+    #[test]
+    fn immutable_uri_rejects_non_absolute_windows_path() {
+        let error = super::immutable_read_only_uri_for_path_bytes(b"C:restore.db", true, false)
+            .expect_err("drive-relative Windows paths must fail closed");
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+    }
+
+    #[test]
+    fn immutable_uri_rejects_unc_windows_path() {
+        let error =
+            super::immutable_read_only_uri_for_path_bytes(b"//server/share/restore.db", true, true)
+                .expect_err("UNC Windows paths must fail closed");
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+    }
+
+    #[test]
+    fn immutable_uri_normalizes_extended_absolute_drive_path() {
+        let uri = super::immutable_read_only_uri_for_path_bytes(b"//?/C:/restore.db", true, true)
+            .expect("extended drive path is an absolute Windows path");
+        assert_eq!(uri, "file:///C:/restore.db?immutable=1");
     }
 
     #[test]
