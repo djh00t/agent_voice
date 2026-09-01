@@ -7088,20 +7088,16 @@ fn immutable_read_only_uri(path: &Path) -> StoreResult<String> {
     #[cfg(not(windows))]
     let is_windows_path = false;
 
-    Ok(immutable_read_only_uri_for_path_bytes(
-        path_bytes,
-        is_windows_path,
+    immutable_read_only_uri_for_path_bytes(path_bytes, is_windows_path, {
+        #[cfg(windows)]
         {
-            #[cfg(windows)]
-            {
-                true
-            }
-            #[cfg(not(windows))]
-            {
-                path.is_absolute()
-            }
-        },
-    )?)
+            true
+        }
+        #[cfg(not(windows))]
+        {
+            path.is_absolute()
+        }
+    })
 }
 
 fn immutable_read_only_uri_for_path_bytes(
