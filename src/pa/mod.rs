@@ -7,7 +7,6 @@ pub mod crypto;
 pub mod domain;
 pub mod http;
 pub mod oauth;
-#[allow(dead_code)]
 mod oauth_callback;
 mod oauth_start;
 pub mod providers;
