@@ -7038,7 +7038,7 @@ fn force_rollback_journal_read_failure(value: bool) {
 
 fn rollback_journal_is_hot(path: &Path) -> StoreResult<bool> {
     const JOURNAL_MAGIC: &[u8; 8] = b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7";
-    const ZEROED_HEADER: &[u8; 8] = &[0; 8];
+    const JOURNAL_HEADER_BYTES: usize = 28;
 
     #[cfg(test)]
     if FORCE_ROLLBACK_JOURNAL_READ_FAILURE.with(Cell::get) {
@@ -7048,11 +7048,26 @@ fn rollback_journal_is_hot(path: &Path) -> StoreResult<bool> {
     }
 
     match std::fs::read(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(false)
+                }
+                _ => Err(StoreError::NotFound {
+                    resource: "database",
+                }),
+            }
+        }
         Err(_) => Err(StoreError::NotFound {
             resource: "database",
         }),
-        Ok(bytes) if bytes.is_empty() || bytes.starts_with(ZEROED_HEADER) => Ok(false),
+        Ok(bytes)
+            if bytes.is_empty()
+                || (bytes.len() >= JOURNAL_HEADER_BYTES
+                    && bytes[..JOURNAL_HEADER_BYTES].iter().all(|&byte| byte == 0)) =>
+        {
+            Ok(false)
+        }
         Ok(bytes) if bytes.len() > 512 && bytes.starts_with(JOURNAL_MAGIC) => Ok(true),
         Ok(_) => Err(StoreError::NotFound {
             resource: "database",
@@ -8972,6 +8987,76 @@ END;
                 fs::read(&journal_path).expect("zero-header rollback journal remains"),
             ] == before,
             "restore candidate inspection must preserve zero-header rollback journal bytes"
+        );
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_partially_zeroed_rollback_journal() {
+        let database = TempDatabase::new();
+        let seed = PaStore::open(&database.path, DATABASE_KEY)
+            .expect("seed partially-zeroed journal fixture");
+        drop(seed);
+
+        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
+        let mut journal = vec![0_u8; 28];
+        journal[8] = 0xAA;
+        fs::write(&journal_path, &journal).expect("create partially-zeroed rollback journal");
+        let before = [
+            fs::read(&database.path).expect("snapshot database"),
+            fs::read(&journal_path).expect("snapshot rollback journal"),
+        ];
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("partially-zeroed rollback journal must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert!(
+            [
+                fs::read(&database.path).expect("database remains"),
+                fs::read(&journal_path).expect("rollback journal remains"),
+            ] == before,
+            "restore candidate inspection must preserve partially-zeroed journal bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_open_existing_rejects_dangling_rollback_journal_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let database = TempDatabase::new();
+        let seed =
+            PaStore::open(&database.path, DATABASE_KEY).expect("seed dangling-journal fixture");
+        drop(seed);
+
+        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
+        symlink("missing-journal-target", &journal_path).expect("create dangling journal symlink");
+        let database_before = fs::read(&database.path).expect("snapshot database");
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("dangling rollback journal symlink must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert_eq!(
+            fs::read(&database.path).expect("database remains"),
+            database_before
+        );
+        assert!(
+            fs::symlink_metadata(&journal_path)
+                .expect("journal symlink remains")
+                .file_type()
+                .is_symlink(),
+            "restore candidate inspection must preserve dangling journal entry"
         );
     }
 
