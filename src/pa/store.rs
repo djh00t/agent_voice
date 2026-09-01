@@ -8472,9 +8472,11 @@ mod tests {
 
     fn remove_database_files(path: &Path) {
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(PathBuf::from(format!("{}-journal", path.display())));
-        let _ = fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
-        let _ = fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let sidecar = super::sqlite_sidecar_path(path, suffix);
+            let _ = fs::remove_file(&sidecar);
+            let _ = fs::remove_dir(&sidecar);
+        }
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -8511,12 +8513,14 @@ mod tests {
 
     fn restore_entry_snapshots(path: &Path) -> [EntrySnapshot; 4] {
         ["", "-wal", "-shm", "-journal"].map(|suffix| {
-            entry_snapshot(if suffix.is_empty() {
-                path.to_path_buf()
-            } else {
-                super::sqlite_sidecar_path(path, suffix)
-            }
-            .as_path())
+            entry_snapshot(
+                if suffix.is_empty() {
+                    path.to_path_buf()
+                } else {
+                    super::sqlite_sidecar_path(path, suffix)
+                }
+                .as_path(),
+            )
         })
     }
 
@@ -8915,8 +8919,11 @@ END;
             let seeded = PaStore::open(&database.path, DATABASE_KEY).expect("seed sidecar fixture");
             drop(seeded);
 
-            fs::write(super::sqlite_sidecar_path(&database.path, suffix), b"sidecar fixture")
-                .expect("create sidecar fixture");
+            fs::write(
+                super::sqlite_sidecar_path(&database.path, suffix),
+                b"sidecar fixture",
+            )
+            .expect("create sidecar fixture");
             let before = restore_entry_snapshots(&database.path);
 
             let error = PaStore::open_existing(&database.path, DATABASE_KEY)
@@ -8933,7 +8940,7 @@ END;
 
     #[cfg(unix)]
     #[test]
-    fn restore_open_existing_rejects_dangling_rollback_journal_symlink() {
+    fn restore_open_existing_rejects_dangling_journal_sidecar_without_mutation() {
         use std::os::unix::fs::symlink;
 
         let database = TempDatabase::new();
@@ -8941,12 +8948,12 @@ END;
             PaStore::open(&database.path, DATABASE_KEY).expect("seed dangling-journal fixture");
         drop(seed);
 
-        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
+        let journal_path = super::sqlite_sidecar_path(&database.path, "-journal");
         symlink("missing-journal-target", &journal_path).expect("create dangling journal symlink");
-        let database_before = fs::read(&database.path).expect("snapshot database");
+        let before = restore_entry_snapshots(&database.path);
 
         let error = PaStore::open_existing(&database.path, DATABASE_KEY)
-            .expect_err("dangling rollback journal symlink must fail closed");
+            .expect_err("dangling journal sidecar must fail closed");
 
         assert!(matches!(
             error,
@@ -8954,35 +8961,71 @@ END;
                 resource: "database"
             }
         ));
-        assert_eq!(
-            fs::read(&database.path).expect("database remains"),
-            database_before
-        );
+        assert_eq!(restore_entry_snapshots(&database.path), before);
+        assert!(before[3].symlink, "fixture must contain a dangling symlink");
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_empty_journal_sidecar_without_mutation() {
+        let database = TempDatabase::new();
+        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed journal fixture");
+        drop(seed);
+
+        let journal_path = super::sqlite_sidecar_path(&database.path, "-journal");
+        fs::write(&journal_path, []).expect("create empty journal sidecar");
+        let before = restore_entry_snapshots(&database.path);
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("empty journal sidecar must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert_eq!(restore_entry_snapshots(&database.path), before);
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_directory_journal_sidecar_without_mutation() {
+        let database = TempDatabase::new();
+        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed journal fixture");
+        drop(seed);
+
+        let journal_path = super::sqlite_sidecar_path(&database.path, "-journal");
+        fs::create_dir(&journal_path).expect("create directory journal sidecar");
+        let before = restore_entry_snapshots(&database.path);
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("directory journal sidecar must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert_eq!(restore_entry_snapshots(&database.path), before);
         assert!(
-            fs::symlink_metadata(&journal_path)
-                .expect("journal symlink remains")
-                .file_type()
-                .is_symlink(),
-            "restore candidate inspection must preserve dangling journal entry"
+            before[3].directory,
+            "fixture must contain a directory entry"
         );
     }
 
     #[test]
-    fn restore_open_existing_rejects_malformed_rollback_journal() {
+    fn restore_open_existing_rejects_malformed_journal_sidecar_without_mutation() {
         let database = TempDatabase::new();
         let seed =
             PaStore::open(&database.path, DATABASE_KEY).expect("seed malformed journal fixture");
         drop(seed);
 
-        let journal_path = PathBuf::from(format!("{}-journal", database.path.display()));
+        let journal_path = super::sqlite_sidecar_path(&database.path, "-journal");
         fs::write(&journal_path, [0xAA_u8; 512]).expect("create malformed rollback journal");
-        let before = [
-            fs::read(&database.path).expect("snapshot database"),
-            fs::read(&journal_path).expect("snapshot rollback journal"),
-        ];
+        let before = restore_entry_snapshots(&database.path);
 
         let error = PaStore::open_existing(&database.path, DATABASE_KEY)
-            .expect_err("malformed rollback journal must fail closed");
+            .expect_err("malformed journal sidecar must fail closed");
 
         assert!(matches!(
             error,
@@ -8990,13 +9033,7 @@ END;
                 resource: "database"
             }
         ));
-        assert!(
-            [
-                fs::read(&database.path).expect("database remains"),
-                fs::read(&journal_path).expect("rollback journal remains"),
-            ] == before,
-            "restore candidate inspection must preserve malformed rollback journal bytes"
-        );
+        assert_eq!(restore_entry_snapshots(&database.path), before);
     }
 
     #[test]
