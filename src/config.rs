@@ -1,5 +1,8 @@
 //! Runtime configuration loading for SIP, OpenAI, behavior, and accounting.
 
+#[path = "config/yaml_events.rs"]
+mod yaml_events;
+
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -27,6 +30,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub accounting: AccountingConfig,
     #[serde(default)]
+    pub backup: BackupConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
 }
 
@@ -37,20 +42,196 @@ impl AppConfig {
             Some(path) => {
                 let raw = fs::read_to_string(path)
                     .with_context(|| format!("failed to read config file {}", path.display()))?;
-                serde_yaml::from_str(&raw).with_context(|| "failed to parse YAML config")?
+                Self::validate_backup_policy_yaml_events(&raw)?;
+                serde_yaml::from_str(&raw).map_err(|error: serde_yaml::Error| {
+                    if error.to_string().starts_with("backup: invalid_type") {
+                        anyhow::anyhow!("backup: invalid_type")
+                    } else {
+                        anyhow::anyhow!("failed to parse YAML config")
+                    }
+                })?
             }
             None if require_path => {
                 bail!("configuration file path was required but not provided");
             }
             None => Self::default(),
         };
-        config.apply_env_overrides_from_map(&std::env::vars().collect());
+        let env = std::env::vars().collect();
+        config.apply_env_overrides_from_map(&env)?;
+        let mut backup = config.backup.clone();
+        backup.normalize_and_validate()?;
+        config.backup = backup;
         let mut oauth = config.agent_api.oauth.clone();
         oauth.normalize_and_validate()?;
         config.agent_api.oauth = oauth;
         config.sync_legacy_openai_sections();
         config.validate()?;
         Ok(config)
+    }
+
+    fn validate_backup_policy_yaml_events(raw: &str) -> Result<()> {
+        use yaml_events::{YamlEvent, YamlScalarStyle};
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Role {
+            Root,
+            Backup,
+            Other,
+        }
+        struct Frame {
+            mapping: bool,
+            pending: Option<Box<[u8]>>,
+            role: Role,
+        }
+
+        let mut reader = yaml_events::YamlEventReader::new(raw)?;
+        let mut frames: Vec<Frame> = Vec::new();
+        let mut documents = 0;
+        let mut started = false;
+        let mut finished = false;
+        let mut policy_error = None;
+        while let Some(event) = reader.next()? {
+            match event {
+                YamlEvent::StreamStart => {
+                    if started {
+                        bail!("config YAML event reader: invalid_structure");
+                    }
+                    started = true;
+                }
+                YamlEvent::StreamEnd => {
+                    if !frames.is_empty() || documents != 1 {
+                        bail!("config YAML event reader: invalid_structure");
+                    }
+                    finished = true;
+                }
+                YamlEvent::DocumentStart => {
+                    documents += 1;
+                    if documents != 1 {
+                        bail!("config YAML event reader: invalid_structure");
+                    }
+                }
+                YamlEvent::DocumentEnd => {
+                    if !frames.is_empty() {
+                        bail!("config YAML event reader: invalid_structure");
+                    }
+                }
+                YamlEvent::Alias => bail!("config YAML event reader: unsupported_alias_or_tag"),
+                YamlEvent::MappingStart {
+                    anchored, tagged, ..
+                } => {
+                    if tagged {
+                        bail!("config YAML event reader: unsupported_alias_or_tag");
+                    }
+                    let role = if let Some(parent) = frames.last_mut() {
+                        let key = parent.pending.take();
+                        if parent.mapping
+                            && parent.role == Role::Root
+                            && key.as_deref() == Some(b"backup")
+                        {
+                            Role::Backup
+                        } else {
+                            Role::Other
+                        }
+                    } else {
+                        if documents == 1 {
+                            Role::Root
+                        } else {
+                            Role::Other
+                        }
+                    };
+                    let _ = anchored;
+                    frames.push(Frame {
+                        mapping: true,
+                        pending: None,
+                        role,
+                    });
+                }
+                YamlEvent::SequenceStart {
+                    anchored, tagged, ..
+                } => {
+                    if tagged {
+                        bail!("config YAML event reader: unsupported_alias_or_tag");
+                    }
+                    if let Some(parent) = frames.last_mut() {
+                        parent.pending.take();
+                    }
+                    let _ = anchored;
+                    frames.push(Frame {
+                        mapping: false,
+                        pending: None,
+                        role: Role::Other,
+                    });
+                }
+                YamlEvent::MappingEnd | YamlEvent::SequenceEnd => {
+                    if frames.pop().is_none() {
+                        bail!("config YAML event reader: invalid_structure");
+                    }
+                }
+                YamlEvent::Scalar {
+                    value,
+                    style,
+                    anchored,
+                    tagged,
+                } => {
+                    if tagged {
+                        bail!("config YAML event reader: unsupported_alias_or_tag");
+                    }
+                    let Some(frame) = frames.last_mut() else {
+                        bail!("config YAML event reader: invalid_structure");
+                    };
+                    if !frame.mapping {
+                        continue;
+                    }
+                    if let Some(key) = frame.pending.take() {
+                        if frame.role == Role::Backup
+                            && (key.as_ref() == b"retention_days"
+                                || key.as_ref() == b"max_age_hours")
+                            && style == YamlScalarStyle::Plain
+                        {
+                            let field = if key.as_ref() == b"retention_days" {
+                                "retention_days"
+                            } else {
+                                "max_age_hours"
+                            };
+                            let digits = value
+                                .iter()
+                                .filter(|b| **b != b'_')
+                                .copied()
+                                .collect::<Vec<_>>();
+                            if value
+                                .first()
+                                .is_some_and(|byte| *byte == b'+' || *byte == b'-')
+                                || (value.iter().all(|b| b.is_ascii_digit() || *b == b'_')
+                                    && !value.is_empty()
+                                    && std::str::from_utf8(&digits)
+                                        .ok()
+                                        .and_then(|v| v.parse::<u64>().ok())
+                                        .is_none())
+                            {
+                                policy_error = Some(Self::backup_policy_yaml_error(field));
+                            }
+                        }
+                    } else {
+                        frame.pending = Some(value);
+                    }
+                    let _ = anchored;
+                }
+            }
+        }
+        if !finished {
+            bail!("config YAML event reader: invalid_structure");
+        }
+        if let Some(error) = policy_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn backup_policy_yaml_error(field: &str) -> anyhow::Error {
+        match field {
+            "retention_days" => backup_error(field, "invalid_retention"),
+            "max_age_hours" => backup_error(field, "invalid_max_age"),
+            _ => unreachable!("only backup policy fields reach this helper"),
+        }
     }
 
     /// Returns the first conventional config file path that exists on disk.
@@ -63,7 +244,10 @@ impl AppConfig {
         .find(|candidate| candidate.exists())
     }
 
-    fn apply_env_overrides_from_map(&mut self, env: &std::collections::HashMap<String, String>) {
+    fn apply_env_overrides_from_map(
+        &mut self,
+        env: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
         apply_string(env, "SIP_USERNAME", &mut self.sip.username);
         apply_string(env, "SIP_PASSWORD", &mut self.sip.password);
         apply_string(env, "SIP_HOST", &mut self.sip.host);
@@ -396,6 +580,8 @@ impl AppConfig {
             &mut self.accounting.refresh_pricing_on_startup,
         );
         apply_string(env, "AGENT_VOICE_LOG_LEVEL", &mut self.logging.level);
+        self.backup.apply_env_overrides_from_map(env)?;
+        Ok(())
     }
 
     fn sync_legacy_openai_sections(&mut self) {
@@ -491,6 +677,566 @@ impl AppConfig {
         }
         config
     }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+/// Validated destination and freshness policy for encrypted backups.
+pub struct BackupConfig {
+    #[serde(default = "default_backup_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default = "default_backup_prefix")]
+    pub prefix: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "default_backup_retention_days")]
+    pub retention_days: u16,
+    #[serde(default = "default_backup_temp_dir")]
+    pub temp_dir: PathBuf,
+    #[serde(default = "default_backup_max_age_hours")]
+    pub max_age_hours: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupConfigFields {
+    #[serde(default)]
+    enabled: Option<serde_yaml::Value>,
+    #[serde(default)]
+    bucket: Option<serde_yaml::Value>,
+    #[serde(default)]
+    prefix: Option<serde_yaml::Value>,
+    #[serde(default)]
+    region: Option<serde_yaml::Value>,
+    #[serde(default)]
+    endpoint: Option<serde_yaml::Value>,
+    #[serde(default)]
+    retention_days: Option<serde_yaml::Value>,
+    #[serde(default)]
+    temp_dir: Option<serde_yaml::Value>,
+    #[serde(default)]
+    max_age_hours: Option<serde_yaml::Value>,
+}
+
+impl<'de> Deserialize<'de> for BackupConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        if value.as_mapping().is_none() {
+            return Err(serde::de::Error::custom("backup: invalid_type"));
+        }
+        if value.as_mapping().is_some_and(|mapping| {
+            mapping
+                .keys()
+                .any(|key| key.as_str().is_some_and(is_secret_shaped_backup_field))
+        }) {
+            return Err(serde::de::Error::custom("backup: secret_field_rejected"));
+        }
+
+        let fields: BackupConfigFields = serde_yaml::from_value(value.clone())
+            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let enabled = parse_backup_yaml_enabled(
+            fields
+                .enabled
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "enabled")),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let bucket = parse_backup_yaml_string(
+            fields
+                .bucket
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "bucket")),
+            "bucket",
+            "invalid_bucket",
+            String::new(),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let prefix = parse_backup_yaml_string(
+            fields
+                .prefix
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "prefix")),
+            "prefix",
+            "invalid_prefix",
+            default_backup_prefix(),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let region = parse_backup_yaml_string(
+            fields
+                .region
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "region")),
+            "region",
+            "invalid_region",
+            String::new(),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let endpoint = parse_backup_yaml_endpoint(
+            fields
+                .endpoint
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "endpoint")),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let retention_days = parse_backup_yaml_retention(
+            fields
+                .retention_days
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "retention_days")),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let temp_dir = parse_backup_yaml_temp_dir(
+            fields
+                .temp_dir
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "temp_dir")),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let max_age_hours = parse_backup_yaml_max_age(
+            fields
+                .max_age_hours
+                .as_ref()
+                .or_else(|| backup_yaml_field(&value, "max_age_hours")),
+        )
+        .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        Ok(Self {
+            enabled,
+            bucket,
+            prefix,
+            region,
+            endpoint,
+            retention_days,
+            temp_dir,
+            max_age_hours,
+        })
+    }
+}
+
+fn backup_yaml_field<'a>(
+    value: &'a serde_yaml::Value,
+    field: &str,
+) -> Option<&'a serde_yaml::Value> {
+    let key = serde_yaml::Value::String(field.to_string());
+    value.as_mapping()?.get(&key)
+}
+
+fn parse_backup_yaml_enabled(value: Option<&serde_yaml::Value>) -> Result<bool> {
+    match value {
+        Some(value) => serde_yaml::from_value::<bool>(value.clone())
+            .map_err(|_| backup_error("enabled", "missing_required")),
+        None => Ok(default_backup_enabled()),
+    }
+}
+
+fn parse_backup_yaml_string(
+    value: Option<&serde_yaml::Value>,
+    field: &str,
+    code: &str,
+    default: String,
+) -> Result<String> {
+    match value {
+        Some(value) => {
+            serde_yaml::from_value::<String>(value.clone()).map_err(|_| backup_error(field, code))
+        }
+        None => Ok(default),
+    }
+}
+
+fn parse_backup_yaml_endpoint(value: Option<&serde_yaml::Value>) -> Result<Option<String>> {
+    match value {
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => serde_yaml::from_value::<String>(value.clone())
+            .map(Some)
+            .map_err(|_| backup_error("endpoint", "invalid_endpoint")),
+        None => Ok(None),
+    }
+}
+
+fn parse_backup_yaml_temp_dir(value: Option<&serde_yaml::Value>) -> Result<PathBuf> {
+    match value {
+        Some(value) => serde_yaml::from_value::<String>(value.clone())
+            .map(PathBuf::from)
+            .map_err(|_| backup_error("temp_dir", "invalid_temp_dir")),
+        None => Ok(default_backup_temp_dir()),
+    }
+}
+
+fn parse_backup_yaml_retention(value: Option<&serde_yaml::Value>) -> Result<u16> {
+    let parsed = match value {
+        Some(value) => serde_yaml::from_value::<u64>(value.clone())
+            .map_err(|_| backup_error("retention_days", "invalid_retention"))?,
+        None => u64::from(default_backup_retention_days()),
+    };
+    if (1..=3650).contains(&parsed) {
+        Ok(parsed as u16)
+    } else {
+        Err(backup_error("retention_days", "invalid_retention"))
+    }
+}
+
+fn parse_backup_yaml_max_age(value: Option<&serde_yaml::Value>) -> Result<u32> {
+    let parsed = match value {
+        Some(value) => serde_yaml::from_value::<u64>(value.clone())
+            .map_err(|_| backup_error("max_age_hours", "invalid_max_age"))?,
+        None => u64::from(default_backup_max_age_hours()),
+    };
+    if (1..=168).contains(&parsed) {
+        Ok(parsed as u32)
+    } else {
+        Err(backup_error("max_age_hours", "invalid_max_age"))
+    }
+}
+
+fn is_secret_shaped_backup_field(field: &str) -> bool {
+    let normalized = field.to_ascii_lowercase().replace(['-', '.'], "_");
+    // Keep this classification closed to credential-shaped names and known
+    // compound variants; ordinary unknown keys must retain serde's generic error.
+    let exact_secret_fields = matches!(
+        normalized.as_str(),
+        "access_token"
+            | "credentials"
+            | "master_key"
+            | "raw_key"
+            | "raw_secret"
+            | "secret"
+            | "secret_access_key"
+            | "secret_key"
+    );
+    let segments = normalized.split('_').collect::<Vec<_>>();
+    exact_secret_fields
+        || segments
+            .windows(2)
+            .any(|pair| matches!(pair, ["master", "key"] | ["raw", "secret"]))
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_backup_enabled(),
+            bucket: String::new(),
+            prefix: default_backup_prefix(),
+            region: String::new(),
+            endpoint: None,
+            retention_days: default_backup_retention_days(),
+            temp_dir: default_backup_temp_dir(),
+            max_age_hours: default_backup_max_age_hours(),
+        }
+    }
+}
+
+impl fmt::Debug for BackupConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let marker = |value: &str| {
+            if value.is_empty() {
+                "absent"
+            } else {
+                "[REDACTED]"
+            }
+        };
+        formatter
+            .debug_struct("BackupConfig")
+            .field("enabled", &self.enabled)
+            .field("bucket", &marker(&self.bucket))
+            .field("prefix", &marker(&self.prefix))
+            .field("region", &marker(&self.region))
+            .field(
+                "endpoint",
+                &self
+                    .endpoint
+                    .as_ref()
+                    .map(|_| "[REDACTED]")
+                    .unwrap_or("absent"),
+            )
+            .field("retention_days", &self.retention_days)
+            .field(
+                "temp_dir",
+                &if self.temp_dir.as_os_str().is_empty() {
+                    "absent"
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .field("max_age_hours", &self.max_age_hours)
+            .finish()
+    }
+}
+
+impl BackupConfig {
+    fn apply_env_overrides_from_map(
+        &mut self,
+        env: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let mut updated = self.clone();
+        if let Some(value) = env.get("BACKUP_ENABLED") {
+            let value = normalize_env_value(value);
+            updated.enabled = parse_backup_bool(value)?;
+        }
+        if let Some(value) = env.get("BACKUP_BUCKET") {
+            updated.bucket = require_backup_env_value("bucket", value)?;
+        }
+        if let Some(value) = env.get("BACKUP_PREFIX") {
+            updated.prefix = require_backup_env_value("prefix", value)?;
+        }
+        if let Some(value) = env.get("BACKUP_REGION") {
+            updated.region = require_backup_env_value("region", value)?;
+        }
+        if let Some(value) = env.get("BACKUP_ENDPOINT") {
+            updated.endpoint = Some(require_backup_env_value("endpoint", value)?);
+        }
+        if let Some(value) = env.get("BACKUP_RETENTION_DAYS") {
+            updated.retention_days = parse_backup_retention(value)?;
+        }
+        if let Some(value) = env.get("BACKUP_TEMP_DIR") {
+            updated.temp_dir = PathBuf::from(require_backup_env_value("temp_dir", value)?);
+        }
+        if let Some(value) = env.get("BACKUP_MAX_AGE_HOURS") {
+            updated.max_age_hours = parse_backup_max_age(value)?;
+        }
+        *self = updated;
+        Ok(())
+    }
+
+    fn normalize_and_validate(&mut self) -> Result<()> {
+        self.normalize_and_validate_with_loopback(false)
+    }
+
+    #[cfg(test)]
+    fn normalize_and_validate_for_test(&mut self) -> Result<()> {
+        self.normalize_and_validate_with_loopback(true)
+    }
+
+    fn normalize_and_validate_with_loopback(&mut self, allow_loopback_http: bool) -> Result<()> {
+        let normalized = self.clone();
+        normalized.validate(allow_loopback_http)?;
+        *self = normalized;
+        Ok(())
+    }
+
+    fn validate(&self, allow_loopback_http: bool) -> Result<()> {
+        if self.bucket.is_empty() {
+            if self.enabled {
+                return Err(backup_error("bucket", "missing_required"));
+            }
+        } else {
+            validate_backup_bucket(&self.bucket)?;
+        }
+
+        if self.region.is_empty() {
+            if self.enabled {
+                return Err(backup_error("region", "missing_required"));
+            }
+        } else {
+            validate_backup_region(&self.region)?;
+        }
+
+        validate_backup_prefix(&self.prefix)?;
+        validate_backup_endpoint(self.endpoint.as_deref(), allow_loopback_http)?;
+        if !(1..=3650).contains(&self.retention_days) {
+            return Err(backup_error("retention_days", "invalid_retention"));
+        }
+        if !(1..=168).contains(&self.max_age_hours) {
+            return Err(backup_error("max_age_hours", "invalid_max_age"));
+        }
+        validate_backup_temp_dir(&self.temp_dir)
+    }
+}
+
+fn backup_error(field: &str, code: &str) -> anyhow::Error {
+    anyhow::anyhow!("backup.{field}: {code}")
+}
+
+fn require_backup_env_value(field: &str, value: &str) -> Result<String> {
+    let normalized = normalize_env_value(value);
+    if normalized.trim().is_empty() {
+        return Err(backup_error(field, &format!("invalid_{field}")));
+    }
+    Ok(normalized.to_string())
+}
+
+fn parse_backup_bool(value: &str) -> Result<bool> {
+    parse_bool(value).ok_or_else(|| backup_error("enabled", "missing_required"))
+}
+
+fn parse_backup_retention(value: &str) -> Result<u16> {
+    let parsed = parse_backup_number("retention_days", "invalid_retention", value)?;
+    if (1..=3650).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(backup_error("retention_days", "invalid_retention"))
+    }
+}
+
+fn parse_backup_max_age(value: &str) -> Result<u32> {
+    let parsed = parse_backup_number("max_age_hours", "invalid_max_age", value)?;
+    if (1..=168).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(backup_error("max_age_hours", "invalid_max_age"))
+    }
+}
+
+fn parse_backup_number<T>(field: &str, code: &str, value: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+{
+    let normalized = normalize_env_value(value);
+    if normalized.is_empty() || !normalized.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(backup_error(field, code));
+    }
+    normalized
+        .parse::<T>()
+        .map_err(|_| backup_error(field, code))
+}
+
+fn validate_backup_bucket(bucket: &str) -> Result<()> {
+    let bytes = bucket.as_bytes();
+    if !(3..=63).contains(&bytes.len())
+        || !bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+        })
+        || !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        || bucket.contains("..")
+        || bucket.contains("-.")
+        || bucket.contains(".-")
+        || is_ipv4_shaped(bucket)
+    {
+        return Err(backup_error("bucket", "invalid_bucket"));
+    }
+    Ok(())
+}
+
+fn is_ipv4_shaped(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts.iter().all(|part| {
+            !part.is_empty() && part.len() <= 3 && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn validate_backup_region(region: &str) -> Result<()> {
+    let bytes = region.as_bytes();
+    if !(1..=63).contains(&bytes.len())
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        || !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err(backup_error("region", "invalid_region"));
+    }
+    Ok(())
+}
+
+fn validate_backup_prefix(prefix: &str) -> Result<()> {
+    let bytes = prefix.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 256
+        || prefix.starts_with('/')
+        || prefix.ends_with('/')
+        || prefix.contains("//")
+        || prefix.contains('\\')
+        || prefix.contains('?')
+        || prefix.contains('#')
+        || bytes.iter().any(|byte| byte.is_ascii_control())
+    {
+        return Err(backup_error("prefix", "invalid_prefix"));
+    }
+    for component in prefix.split('/') {
+        if component == "."
+            || component == ".."
+            || component.is_empty()
+            || !component.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~')
+            })
+        {
+            return Err(backup_error("prefix", "invalid_prefix"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_backup_endpoint(endpoint: Option<&str>, allow_loopback_http: bool) -> Result<()> {
+    let Some(endpoint) = endpoint else {
+        return Ok(());
+    };
+    let url =
+        reqwest::Url::parse(endpoint).map_err(|_| backup_error("endpoint", "invalid_endpoint"))?;
+    let host = url
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| backup_error("endpoint", "invalid_endpoint"))?;
+    let authority_has_userinfo = endpoint
+        .split_once("://")
+        .and_then(|(_, remainder)| remainder.split('/').next())
+        .is_some_and(|authority| authority.contains('@'));
+    if authority_has_userinfo
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(backup_error("endpoint", "invalid_endpoint"));
+    }
+
+    match url.scheme() {
+        "https" => {
+            if url.port().is_some_and(|port| port != 443) || !is_dns_host(host) {
+                return Err(backup_error("endpoint", "invalid_endpoint"));
+            }
+        }
+        "http" if allow_loopback_http && is_exact_loopback_host(host) => {}
+        _ => return Err(backup_error("endpoint", "invalid_endpoint")),
+    }
+    Ok(())
+}
+
+fn is_dns_host(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() || host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+fn is_exact_loopback_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn validate_backup_temp_dir(path: &Path) -> Result<()> {
+    let value = path
+        .to_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| backup_error("temp_dir", "invalid_temp_dir"))?;
+    if value.bytes().any(|byte| byte.is_ascii_control())
+        || path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(backup_error("temp_dir", "invalid_temp_dir"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1857,6 +2603,26 @@ const fn default_refresh_pricing_on_startup() -> bool {
     true
 }
 
+const fn default_backup_enabled() -> bool {
+    false
+}
+
+fn default_backup_prefix() -> String {
+    "backups".to_string()
+}
+
+const fn default_backup_retention_days() -> u16 {
+    30
+}
+
+fn default_backup_temp_dir() -> PathBuf {
+    PathBuf::from("./backup-tmp")
+}
+
+const fn default_backup_max_age_hours() -> u32 {
+    24
+}
+
 fn default_incoming_greeting_text() -> String {
     "Welcome".to_string()
 }
@@ -2274,7 +3040,7 @@ mod tests {
             ),
         ]);
 
-        config.apply_env_overrides_from_map(&env);
+        config.apply_env_overrides_from_map(&env).unwrap();
 
         assert_eq!(config.sip.username, "alice");
         assert_eq!(config.sip.password, "secret");
@@ -2330,7 +3096,7 @@ mod tests {
             ("INCOMING_ANSWER_DELAY_MS".to_string(), "'2000'".to_string()),
         ]);
 
-        config.apply_env_overrides_from_map(&env);
+        config.apply_env_overrides_from_map(&env).unwrap();
 
         assert_eq!(config.sip.username, "alice");
         assert_eq!(config.openai.api_key(), "sk-test");
@@ -2365,7 +3131,7 @@ mod tests {
             ),
         ]);
 
-        config.apply_env_overrides_from_map(&env);
+        config.apply_env_overrides_from_map(&env).unwrap();
 
         assert_eq!(config.speech.stt_provider, SpeechProvider::SherpaOnnx);
         assert_eq!(config.speech.tts_provider, SpeechProvider::SherpaOnnx);
@@ -2388,7 +3154,7 @@ mod tests {
             ("OPENAI_VOICE_NAME".to_string(), "alloy".to_string()),
         ]);
 
-        config.apply_env_overrides_from_map(&env);
+        config.apply_env_overrides_from_map(&env).unwrap();
 
         assert_eq!(config.llm.provider, LlmProvider::None);
         assert_eq!(config.voice.provider, VoiceProvider::OpenAi);
@@ -2421,7 +3187,7 @@ model: gpt-realtime-2.1
                 "gpt-realtime-2.1".to_string(),
             ),
         ]);
-        config.apply_env_overrides_from_map(&env);
+        config.apply_env_overrides_from_map(&env).unwrap();
         let serialized = serde_yaml::to_value(&config.voice.openai).unwrap();
         assert_eq!(serialized["transport"], "realtime");
         assert_eq!(config.voice.openai.model, "gpt-realtime-2.1");
@@ -2995,5 +3761,801 @@ agent_api:
         for placeholder in placeholders {
             assert_eq!(example.matches(placeholder).count(), 1);
         }
+    }
+
+    #[test]
+    fn backup_config_contract() {
+        let mut backup = BackupConfig {
+            enabled: true,
+            bucket: "agent-voice-test".to_string(),
+            prefix: "snapshots/pa".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("https://s3.example.test/".to_string()),
+            retention_days: 30,
+            temp_dir: PathBuf::from("./backup-tmp"),
+            max_age_hours: 24,
+        };
+
+        backup.normalize_and_validate().unwrap();
+        let round_trip: BackupConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&backup).unwrap()).unwrap();
+        assert_eq!(round_trip, backup);
+    }
+
+    #[test]
+    fn backup_config_defaults_disabled_and_safe() {
+        let mut backup = BackupConfig::default();
+
+        assert!(!backup.enabled);
+        assert!(backup.bucket.is_empty());
+        assert_eq!(backup.prefix, "backups");
+        assert!(backup.region.is_empty());
+        assert_eq!(backup.endpoint, None);
+        assert_eq!(backup.retention_days, 30);
+        assert_eq!(backup.temp_dir, PathBuf::from("./backup-tmp"));
+        assert_eq!(backup.max_age_hours, 24);
+        backup.normalize_and_validate().unwrap();
+        assert_eq!(AppConfig::default().backup, backup);
+    }
+
+    #[test]
+    fn backup_config_env_overrides_are_strict_and_normalized() {
+        let mut backup = BackupConfig::default();
+        let env = HashMap::from([
+            ("BACKUP_ENABLED".to_string(), " 'true' ".to_string()),
+            (
+                "BACKUP_BUCKET".to_string(),
+                " agent-voice-test ".to_string(),
+            ),
+            ("BACKUP_PREFIX".to_string(), " 'snapshots/pa' ".to_string()),
+            ("BACKUP_REGION".to_string(), "us-east-1".to_string()),
+            (
+                "BACKUP_ENDPOINT".to_string(),
+                "https://s3.example.test/".to_string(),
+            ),
+            ("BACKUP_RETENTION_DAYS".to_string(), "30".to_string()),
+            ("BACKUP_TEMP_DIR".to_string(), "./backup-tmp".to_string()),
+            ("BACKUP_MAX_AGE_HOURS".to_string(), "24".to_string()),
+        ]);
+
+        backup.apply_env_overrides_from_map(&env).unwrap();
+        assert!(backup.enabled);
+        assert_eq!(backup.bucket, "agent-voice-test");
+        assert_eq!(backup.prefix, "snapshots/pa");
+        assert_eq!(backup.endpoint.as_deref(), Some("https://s3.example.test/"));
+        backup.normalize_and_validate().unwrap();
+
+        let before = backup.clone();
+        let invalid = HashMap::from([("BACKUP_RETENTION_DAYS".to_string(), "0".to_string())]);
+        assert!(backup.apply_env_overrides_from_map(&invalid).is_err());
+        assert_eq!(backup, before);
+    }
+
+    #[test]
+    fn backup_config_enabled_override_rejects_blank_and_malformed() {
+        let expected = BackupConfig::default();
+        for value in ["", "maybe"] {
+            let mut backup = expected.clone();
+            let env = HashMap::from([("BACKUP_ENABLED".to_string(), value.to_string())]);
+
+            let error = backup
+                .apply_env_overrides_from_map(&env)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "backup.enabled: missing_required");
+            assert_eq!(backup, expected);
+        }
+    }
+
+    #[test]
+    fn backup_config_rejects_secret_shaped_unknown_yaml_fields() {
+        for field in ["master_key", "raw_secret"] {
+            let yaml =
+                format!("enabled: true\nbucket: agent-voice-test\n{field}: do-not-log-this\n");
+            let error = serde_yaml::from_str::<BackupConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "backup: secret_field_rejected");
+            assert!(!error.contains("do-not-log-this"));
+        }
+    }
+
+    #[test]
+    fn backup_config_rejects_common_secret_shaped_unknown_yaml_fields() {
+        for field in [
+            "secret_key",
+            "secret_access_key",
+            "access_token",
+            "credentials",
+        ] {
+            let yaml =
+                format!("enabled: true\nbucket: agent-voice-test\n{field}: do-not-log-this\n");
+            let error = serde_yaml::from_str::<BackupConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "backup: secret_field_rejected");
+            assert!(!error.contains("do-not-log-this"));
+        }
+
+        for field in ["object_key", "monkey"] {
+            let yaml =
+                format!("enabled: true\nbucket: agent-voice-test\n{field}: do-not-log-this\n");
+            let error = serde_yaml::from_str::<BackupConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("unknown field `{field}`")));
+            assert!(!error.contains("do-not-log-this"));
+        }
+    }
+
+    #[test]
+    fn backup_config_yaml_container_errors_are_frozen_and_redacted() {
+        for yaml in ["do-not-log-this", "[do-not-log-this]", "null"] {
+            let error = serde_yaml::from_str::<BackupConfig>(yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "backup: invalid_type");
+            assert!(!error.contains("do-not-log-this"));
+        }
+
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+
+        for value in ["do-not-log-this", "[do-not-log-this]", "null"] {
+            let yaml = replace_backup_yaml_mapping(&base_yaml, &format!("backup: {value}"));
+            let path = std::env::temp_dir().join(format!(
+                "agent-voice-backup-invalid-type-{}-{}.yaml",
+                std::process::id(),
+                value.len()
+            ));
+            fs::write(&path, yaml).unwrap();
+            let result = AppConfig::load(Some(&path), false);
+            fs::remove_file(&path).unwrap();
+            let error = result.unwrap_err().to_string();
+            assert_eq!(error, "backup: invalid_type");
+            assert!(!error.contains("do-not-log-this"));
+        }
+    }
+
+    #[test]
+    fn backup_config_preserves_mapping_deserialization() {
+        let backup: BackupConfig = serde_yaml::from_str(
+            "enabled: false\nprefix: backups\nretention_days: 30\nmax_age_hours: 24\n",
+        )
+        .unwrap();
+        assert!(!backup.enabled);
+        assert_eq!(backup.prefix, "backups");
+        assert_eq!(backup.retention_days, 30);
+        assert_eq!(backup.max_age_hours, 24);
+    }
+
+    #[test]
+    fn backup_config_yaml_policy_errors_are_frozen_and_redacted() {
+        for (field, value, expected) in [
+            (
+                "retention_days",
+                "0",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "retention_days",
+                "65536",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "retention_days",
+                "do-not-log-this",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                "0",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+            (
+                "max_age_hours",
+                "4294967296",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+            (
+                "max_age_hours",
+                "do-not-log-this",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+        ] {
+            let yaml = format!("enabled: true\nbucket: agent-voice-test\n{field}: {value}\n");
+            let error = serde_yaml::from_str::<BackupConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, expected);
+            assert!(!error.contains(value));
+        }
+    }
+
+    #[test]
+    fn app_config_load_rejects_event_policy_layout_matrix() {
+        for (yaml, expected) in [
+            (
+                "  backup:\n    retention_days: +30\n",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "backup: { 'max_age_hours' : -24 }\n",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+            (
+                "backup:\n  retention_days: 18446744073709551616\n",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "backup: { max_age_hours: 340282366920938463463374607431768211456 }\n",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+        ] {
+            assert_eq!(
+                AppConfig::validate_backup_policy_yaml_events(yaml)
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn app_config_load_rejects_event_policy_comment_quote_matrix() {
+        let yaml =
+            "backup: { temp_dir: foo'bar, retention_days: 30, max_age_hours: +24 } # trailing\n";
+        let error = AppConfig::validate_backup_policy_yaml_events(yaml).unwrap_err();
+        assert_eq!(error.to_string(), "backup.max_age_hours: invalid_max_age");
+        assert!(!error.to_string().contains("foo'bar"));
+    }
+
+    #[test]
+    fn app_config_load_preserves_quoted_policy_lookalike_data() {
+        let yaml = "backup: { temp_dir: \"comma, # text retention_days: +30\", retention_days: 30, max_age_hours: 24 }\n";
+        AppConfig::validate_backup_policy_yaml_events(yaml).unwrap();
+    }
+
+    #[test]
+    fn app_config_load_rejects_event_alias_and_tag_bypass() {
+        for yaml in [
+            "backup: &policy { retention_days: +30 }\ncopy: *policy\n",
+            "backup: !policy { retention_days: +30 }\n",
+        ] {
+            let error = AppConfig::validate_backup_policy_yaml_events(yaml).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "config YAML event reader: unsupported_alias_or_tag"
+            );
+            assert!(!error.to_string().contains("policy"));
+        }
+    }
+
+    #[test]
+    fn app_config_load_rejects_signed_and_oversized_backup_policy_literals() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+
+        for (field, literal, expected) in [
+            (
+                "retention_days",
+                "+30",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                "+24",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+            (
+                "retention_days",
+                "18446744073709551616",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                "340282366920938463463374607431768211456",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+        ] {
+            let yaml = base_yaml.replacen(
+                &format!(
+                    "{field}: {}",
+                    if field == "retention_days" { 30 } else { 24 }
+                ),
+                &format!("{field}: {literal}"),
+                1,
+            );
+            let path = std::env::temp_dir().join(format!(
+                "agent-voice-backup-policy-{}-{}.yaml",
+                std::process::id(),
+                field
+            ));
+            fs::write(&path, yaml).unwrap();
+
+            let result = AppConfig::load(Some(&path), false);
+            fs::remove_file(&path).unwrap();
+            assert!(result.is_err());
+            let error = result.err().unwrap().to_string();
+
+            assert_eq!(error, expected);
+            assert!(!error.contains(literal));
+        }
+    }
+
+    fn replace_backup_yaml_mapping(raw: &str, mapping: &str) -> String {
+        let mut result = String::new();
+        let mut skipping_backup = false;
+        let mut found_backup = false;
+        for line in raw.lines() {
+            if !skipping_backup && line == "backup:" {
+                result.push_str(mapping);
+                result.push('\n');
+                skipping_backup = true;
+                found_backup = true;
+                continue;
+            }
+            if skipping_backup && !line.starts_with([' ', '\t']) {
+                skipping_backup = false;
+            }
+            if !skipping_backup {
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+        assert!(
+            found_backup,
+            "serialized AppConfig must contain backup mapping"
+        );
+        result
+    }
+
+    fn assert_backup_policy_load_error(
+        yaml: String,
+        expected: &str,
+        literal: &str,
+        mapping_kind: &str,
+    ) {
+        let path = std::env::temp_dir().join(format!(
+            "agent-voice-backup-policy-single-quoted-{}-{}-{}.yaml",
+            std::process::id(),
+            mapping_kind,
+            literal.len()
+        ));
+        fs::write(&path, yaml).unwrap();
+        let result = AppConfig::load(Some(&path), false);
+        fs::remove_file(&path).unwrap();
+        let error = result.unwrap_err().to_string();
+        assert_eq!(error, expected);
+        assert!(!error.contains(literal));
+    }
+
+    #[test]
+    fn app_config_load_rejects_single_quoted_block_policy_literals() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+
+        for (field, default, literal, expected) in [
+            (
+                "retention_days",
+                30,
+                "+30",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                24,
+                "+24",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+            (
+                "retention_days",
+                30,
+                "18446744073709551616",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                24,
+                "340282366920938463463374607431768211456",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+        ] {
+            let yaml = base_yaml.replacen(
+                &format!("{field}: {default}"),
+                &format!("'{field}' : {literal}"),
+                1,
+            );
+            assert_ne!(yaml, base_yaml);
+            assert_backup_policy_load_error(yaml, expected, literal, "block");
+        }
+    }
+
+    #[test]
+    fn app_config_load_rejects_single_quoted_flow_policy_literals() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+
+        for (field, literal, expected) in [
+            (
+                "retention_days",
+                "+30",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                "+24",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+            (
+                "retention_days",
+                "18446744073709551616",
+                "backup.retention_days: invalid_retention",
+            ),
+            (
+                "max_age_hours",
+                "340282366920938463463374607431768211456",
+                "backup.max_age_hours: invalid_max_age",
+            ),
+        ] {
+            let yaml = replace_backup_yaml_mapping(
+                &base_yaml,
+                &format!("backup: {{ '{field}' : {literal} }}"),
+            );
+            assert_backup_policy_load_error(yaml, expected, literal, "flow");
+        }
+    }
+
+    #[test]
+    fn app_config_load_rejects_flow_policy_literal_followed_by_comment() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml =
+            replace_backup_yaml_mapping(&base_yaml, "backup: { retention_days: +30 } # policy");
+
+        assert_backup_policy_load_error(
+            yaml,
+            "backup.retention_days: invalid_retention",
+            "+30",
+            "flow-comment",
+        );
+    }
+
+    #[test]
+    fn app_config_load_rejects_signed_policy_after_quoted_hash() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml = replace_backup_yaml_mapping(
+            &base_yaml,
+            "backup: { temp_dir: \"backup#tmp\", retention_days: +30 } # policy",
+        );
+
+        assert_backup_policy_load_error(
+            yaml,
+            "backup.retention_days: invalid_retention",
+            "+30",
+            "flow-quoted-hash-comment",
+        );
+    }
+
+    #[test]
+    fn app_config_load_rejects_flow_policy_literal_after_doubled_single_quote() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml = replace_backup_yaml_mapping(
+            &base_yaml,
+            "backup: { temp_dir: 'foo'', x', retention_days: +30 }",
+        );
+
+        assert_backup_policy_load_error(
+            yaml,
+            "backup.retention_days: invalid_retention",
+            "+30",
+            "flow-doubled-single-quote",
+        );
+    }
+
+    #[test]
+    fn app_config_load_rejects_flow_policy_literal_after_plain_apostrophe() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml = replace_backup_yaml_mapping(
+            &base_yaml,
+            "backup: { temp_dir: foo'bar, retention_days: +30 }",
+        );
+
+        assert_backup_policy_load_error(
+            yaml,
+            "backup.retention_days: invalid_retention",
+            "+30",
+            "flow-plain-apostrophe",
+        );
+    }
+
+    #[test]
+    fn app_config_load_accepts_flow_comma_inside_quoted_scalar() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml = replace_backup_yaml_mapping(
+            &base_yaml,
+            "backup: { temp_dir: \"foo, retention_days: +30\", retention_days: 30 }",
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "agent-voice-backup-policy-quoted-comma-{}.yaml",
+            std::process::id()
+        ));
+        fs::write(&path, yaml).unwrap();
+        let result = AppConfig::load(Some(&path), false);
+        fs::remove_file(&path).unwrap();
+        assert!(
+            result.is_ok(),
+            "quoted comma should remain scalar data: {result:?}"
+        );
+    }
+
+    #[test]
+    fn app_config_load_rejects_flow_policy_literal_after_unseparated_plain_hash() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml = replace_backup_yaml_mapping(
+            &base_yaml,
+            "backup: { temp_dir: backup#tmp, retention_days: +30 } # policy",
+        );
+
+        assert_backup_policy_load_error(
+            yaml,
+            "backup.retention_days: invalid_retention",
+            "+30",
+            "flow-unseparated-plain-hash",
+        );
+    }
+
+    #[test]
+    fn app_config_load_rejects_flow_policy_literal_after_quoted_top_level_backup_key() {
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+
+        for (quote, mapping_kind) in [
+            ("'", "single-quoted-top-level"),
+            ("\"", "double-quoted-top-level"),
+        ] {
+            let yaml = replace_backup_yaml_mapping(
+                &base_yaml,
+                &format!("{quote}backup{quote}: {{ retention_days: +30 }} # policy"),
+            );
+            assert_backup_policy_load_error(
+                yaml,
+                "backup.retention_days: invalid_retention",
+                "+30",
+                mapping_kind,
+            );
+        }
+    }
+
+    #[test]
+    fn backup_config_yaml_enabled_type_errors_are_frozen_and_redacted() {
+        for value in ["do-not-log-enabled-sentinel", "1", "null"] {
+            let yaml = format!("enabled: {value}\nbucket: agent-voice-test\n");
+            let error = serde_yaml::from_str::<BackupConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "backup.enabled: missing_required");
+            assert!(!error.contains(value));
+        }
+    }
+
+    #[test]
+    fn backup_config_yaml_scalar_type_errors_are_frozen_and_redacted() {
+        for (field, expected) in [
+            ("bucket", "backup.bucket: invalid_bucket"),
+            ("prefix", "backup.prefix: invalid_prefix"),
+            ("region", "backup.region: invalid_region"),
+            ("endpoint", "backup.endpoint: invalid_endpoint"),
+            ("temp_dir", "backup.temp_dir: invalid_temp_dir"),
+        ] {
+            let sentinel = format!("do-not-log-{field}-sentinel");
+            let yaml = format!("{field}: [{sentinel}]\n");
+            let error = serde_yaml::from_str::<BackupConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, expected);
+            assert!(!error.contains(&sentinel));
+        }
+    }
+
+    #[test]
+    fn backup_config_rejects_empty_endpoint_userinfo() {
+        let mut backup = BackupConfig {
+            enabled: true,
+            bucket: "agent-voice-test".to_string(),
+            prefix: "snapshots/pa".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("https://@s3.example.test/".to_string()),
+            retention_days: 30,
+            temp_dir: PathBuf::from("./backup-tmp"),
+            max_age_hours: 24,
+        };
+
+        let error = backup.normalize_and_validate().unwrap_err().to_string();
+        assert_eq!(error, "backup.endpoint: invalid_endpoint");
+    }
+
+    #[test]
+    fn backup_config_rejects_required_negative_fixtures() {
+        let mut backup = BackupConfig {
+            enabled: true,
+            bucket: "agent-voice-test".to_string(),
+            prefix: "snapshots/\0pa".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("https://s3.example.test/".to_string()),
+            retention_days: 30,
+            temp_dir: PathBuf::from("./backup-tmp"),
+            max_age_hours: 24,
+        };
+        let error = backup.normalize_and_validate().unwrap_err().to_string();
+        assert_eq!(error, "backup.prefix: invalid_prefix");
+        assert!(!error.contains('\0'));
+
+        backup.prefix = "snapshots/pa".to_string();
+        backup.endpoint = Some("https://s3.example.test/?query=sentinel".to_string());
+        let error = backup.normalize_and_validate().unwrap_err().to_string();
+        assert_eq!(error, "backup.endpoint: invalid_endpoint");
+        assert!(!error.contains("sentinel"));
+
+        for value in ["0", "4294967296"] {
+            let env = HashMap::from([("BACKUP_MAX_AGE_HOURS".to_string(), value.to_string())]);
+            let error = backup
+                .apply_env_overrides_from_map(&env)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "backup.max_age_hours: invalid_max_age");
+            assert!(!error.contains(value));
+        }
+    }
+
+    #[test]
+    fn backup_config_rejects_destination_escape_and_secrets() {
+        let invalid_values = [
+            ("bucket", "Agent-Voice-Test"),
+            ("bucket", "192.168.1.1"),
+            ("region", "us east 1"),
+            ("prefix", "/snapshots/pa"),
+            ("prefix", "snapshots/../pa"),
+            ("prefix", "snapshots//pa"),
+            ("endpoint", "http://s3.example.test/"),
+            ("endpoint", "https://user:password@s3.example.test/"),
+            ("temp_dir", "../backup-tmp"),
+        ];
+
+        for (field, value) in invalid_values {
+            let mut backup = BackupConfig {
+                enabled: true,
+                bucket: "agent-voice-test".to_string(),
+                prefix: "snapshots/pa".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some("https://s3.example.test/".to_string()),
+                retention_days: 30,
+                temp_dir: PathBuf::from("./backup-tmp"),
+                max_age_hours: 24,
+            };
+            match field {
+                "bucket" => backup.bucket = value.to_string(),
+                "region" => backup.region = value.to_string(),
+                "prefix" => backup.prefix = value.to_string(),
+                "endpoint" => backup.endpoint = Some(value.to_string()),
+                "temp_dir" => backup.temp_dir = PathBuf::from(value),
+                _ => unreachable!(),
+            }
+            let error = backup.normalize_and_validate().unwrap_err().to_string();
+            assert!(
+                error.contains("invalid_") || error.contains("missing_required"),
+                "unexpected error for {field}: {error}"
+            );
+            assert!(!error.contains(value));
+        }
+
+        let unknown = serde_yaml::from_str::<BackupConfig>(
+            "enabled: true\nbucket: agent-voice-test\nmaster_key: do-not-log-this\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!unknown.contains("do-not-log-this"));
+
+        let backup = BackupConfig {
+            enabled: true,
+            bucket: "sentinel-bucket".to_string(),
+            prefix: "sentinel-prefix".to_string(),
+            region: "sentinel-region".to_string(),
+            endpoint: Some("https://sentinel.example.test/".to_string()),
+            temp_dir: PathBuf::from("sentinel-temp-dir"),
+            ..BackupConfig::default()
+        };
+        let debug = format!("{backup:?}");
+        for sentinel in [
+            "sentinel-bucket",
+            "sentinel-prefix",
+            "sentinel-region",
+            "sentinel.example.test",
+            "sentinel-temp-dir",
+        ] {
+            assert!(!debug.contains(sentinel));
+        }
+    }
+
+    #[test]
+    fn backup_config_snapshot_and_runtime_handoffs() {
+        let mut backup: BackupConfig = serde_yaml::from_str(
+            "enabled: true\nbucket: agent-voice-test\nprefix: snapshots/pa\nregion: us-east-1\nendpoint: http://127.0.0.1:8089/\nretention_days: 30\ntemp_dir: ./backup-tmp\nmax_age_hours: 24\n",
+        )
+        .unwrap();
+        assert!(backup.normalize_and_validate_for_test().is_ok());
+        assert!(backup.normalize_and_validate().is_err());
+
+        let mut blank = BackupConfig {
+            enabled: true,
+            ..BackupConfig::default()
+        };
+        assert!(blank.normalize_and_validate().is_err());
+        assert!(AppConfig::default().backup.normalize_and_validate().is_ok());
+
+        let example = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/agent_voice.example.yaml"
+        ));
+        let yaml: serde_yaml::Value = serde_yaml::from_str(example).unwrap();
+        let example_backup = &yaml["backup"];
+        assert_eq!(example_backup["enabled"], false);
+        assert_eq!(example_backup["bucket"], "");
+        assert_eq!(example_backup["prefix"], "backups");
+        assert_eq!(example_backup["region"], "");
+        assert_eq!(example_backup["endpoint"], serde_yaml::Value::Null);
+        assert_eq!(example_backup["retention_days"], 30);
+        assert_eq!(example_backup["temp_dir"], "./backup-tmp");
+        assert_eq!(example_backup["max_age_hours"], 24);
     }
 }

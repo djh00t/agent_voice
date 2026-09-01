@@ -7,7 +7,9 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use chrono_tz::Tz;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -29,6 +31,7 @@ pub const MAX_AUDIT_LIST_LIMIT: usize = 100;
 
 /// Maximum UTF-8 byte length accepted for message machine identifiers.
 pub const MAX_MESSAGE_ID_LENGTH: usize = 256;
+const MAX_PROVIDER_CURSOR_LENGTH: usize = MAX_MESSAGE_ID_LENGTH;
 /// Maximum UTF-8 byte length accepted for a structured message summary.
 pub const MAX_MESSAGE_SUMMARY_LENGTH: usize = 4096;
 /// Maximum UTF-8 byte length accepted for an extracted message subject.
@@ -642,7 +645,7 @@ impl fmt::Debug for StoredTask {
     }
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 14;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 15;
 const BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 struct Migration {
@@ -704,8 +707,12 @@ const MIGRATIONS: &[Migration] = &[
         apply: apply_schema_v13,
     },
     Migration {
-        version: CURRENT_SCHEMA_VERSION,
+        version: 14,
         apply: apply_schema_v14,
+    },
+    Migration {
+        version: CURRENT_SCHEMA_VERSION,
+        apply: apply_schema_v15,
     },
 ];
 
@@ -2127,7 +2134,38 @@ impl PaStore {
         let key = database_key.as_ref();
         reject_empty_key(key)?;
         let mut connection = Connection::open(path)?;
-        initialize(&mut connection, key, true)?;
+        initialize(&mut connection, key, true, true)?;
+        Ok(Self { connection })
+    }
+
+    /// Opens an existing encrypted file-backed store without running migrations.
+    #[allow(dead_code)]
+    pub(crate) fn open_existing<P, K>(path: P, database_key: K) -> StoreResult<Self>
+    where
+        P: AsRef<Path>,
+        K: AsRef<[u8]>,
+    {
+        let key = database_key.as_ref();
+        reject_empty_key(key)?;
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Err(StoreError::NotFound {
+                resource: "database",
+            });
+        }
+        reject_sqlite_sidecars(path)?;
+        let immutable_uri = immutable_read_only_uri(path)?;
+        let mut connection = Connection::open_with_flags(
+            immutable_uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|_| StoreError::NotFound {
+            resource: "database",
+        })?;
+        initialize(&mut connection, key, false, false)?;
+        connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
         Ok(Self { connection })
     }
 
@@ -2139,7 +2177,7 @@ impl PaStore {
         let key = database_key.as_ref();
         reject_empty_key(key)?;
         let mut connection = Connection::open_in_memory()?;
-        initialize(&mut connection, key, false)?;
+        initialize(&mut connection, key, false, true)?;
         Ok(Self { connection })
     }
 
@@ -2222,6 +2260,92 @@ impl PaStore {
                 scopes,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Atomically updates OAuth tokens while preserving an omitted refresh token.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_oauth_tokens(
+        &self,
+        cipher: &TokenCipher,
+        provider: &str,
+        account_id: &str,
+        access_token: &str,
+        refresh_token: Option<&str>,
+        expires_at: DateTime<Utc>,
+        scopes: &[String],
+    ) -> StoreResult<()> {
+        let provider = validate_oauth_identity(provider.to_owned(), "provider")?;
+        let account_id = validate_oauth_identity(account_id.to_owned(), "account_id")?;
+        if access_token.trim().is_empty() {
+            return Err(StoreError::InvalidInput {
+                field: "access_token",
+            });
+        }
+        if let Some(refresh_token) = refresh_token
+            && refresh_token.trim().is_empty()
+        {
+            return Err(StoreError::InvalidInput {
+                field: "refresh_token",
+            });
+        }
+        let scopes = normalize_scopes(scopes.to_vec())?;
+        let expires_at = expires_at.to_rfc3339_opts(SecondsFormat::AutoSi, true);
+        let scopes = serde_json::to_string(&scopes).map_err(|_| StoreError::StoredValueInvalid)?;
+
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let access_context = oauth_context(&provider, &account_id, "access");
+        let access_ciphertext = cipher
+            .encrypt(access_token, access_context.as_bytes())
+            .map_err(StoreError::Crypto)
+            .and_then(|envelope| serialize_envelope(&envelope))?;
+        let refresh_ciphertext = match refresh_token {
+            Some(refresh_token) => {
+                let refresh_context = oauth_context(&provider, &account_id, "refresh");
+                Some(
+                    cipher
+                        .encrypt(refresh_token, refresh_context.as_bytes())
+                        .map_err(StoreError::Crypto)
+                        .and_then(|envelope| serialize_envelope(&envelope))?,
+                )
+            }
+            None => transaction
+                .query_row(
+                    "SELECT refresh_token_ciphertext FROM oauth_credentials
+                     WHERE provider = ?1 AND account_id = ?2",
+                    params![&provider, &account_id],
+                    |row| row.get::<_, Option<Vec<u8>>>(0),
+                )
+                .optional()?
+                .flatten(),
+        };
+
+        transaction.execute(
+            "INSERT INTO oauth_credentials (
+                 provider, account_id, access_token_ciphertext,
+                 refresh_token_ciphertext, expires_at, scopes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(provider, account_id) DO UPDATE SET
+                 access_token_ciphertext = excluded.access_token_ciphertext,
+                 refresh_token_ciphertext = CASE
+                     WHEN excluded.refresh_token_ciphertext IS NULL
+                     THEN oauth_credentials.refresh_token_ciphertext
+                     ELSE excluded.refresh_token_ciphertext
+                 END,
+                 expires_at = excluded.expires_at,
+                 scopes = excluded.scopes,
+                 updated_at = CURRENT_TIMESTAMP",
+            params![
+                provider,
+                account_id,
+                access_ciphertext,
+                refresh_ciphertext,
+                expires_at,
+                scopes,
+            ],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2317,76 +2441,119 @@ impl PaStore {
         Ok(())
     }
 
-    /// Atomically upserts a provider cursor under its stable stream ID.
-    pub fn save_provider_cursor(
-        &self,
-        stream_id: impl AsRef<str>,
-        expected_cursor: Option<&str>,
-        cursor: impl AsRef<str>,
-    ) -> StoreResult<()> {
-        let stream_id = validate_non_empty(stream_id.as_ref().to_owned(), "stream_id")?;
-        let cursor = validate_non_empty(cursor.as_ref().to_owned(), "cursor")?;
-        match expected_cursor {
-            None => {
-                let inserted = self.connection.execute(
-                    "INSERT INTO provider_cursors(provider, cursor) VALUES (?1, ?2)
-                     ON CONFLICT(provider) DO NOTHING",
-                    params![stream_id, cursor],
-                )?;
-                if inserted == 0 {
-                    return Err(StoreError::CursorConflict {
-                        resource: "provider cursor",
-                    });
-                }
-            }
-            Some(expected_cursor) => {
-                let expected_cursor =
-                    validate_non_empty(expected_cursor.to_owned(), "expected_cursor")?;
-                let updated = self.connection.execute(
-                    "UPDATE provider_cursors
-                     SET cursor = ?1,
-                         updated_at = CASE WHEN cursor = ?1 THEN updated_at ELSE CURRENT_TIMESTAMP END
-                     WHERE provider = ?2 AND cursor = ?3",
-                    params![cursor, stream_id, expected_cursor],
-                )?;
-                if updated == 0 {
-                    return Err(StoreError::CursorConflict {
-                        resource: "provider cursor",
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Returns a provider cursor by stable stream ID.
-    pub fn load_provider_cursor(&self, stream_id: impl AsRef<str>) -> StoreResult<String> {
-        let stream_id = validate_non_empty(stream_id.as_ref().to_owned(), "stream_id")?;
-        self.connection
+    /// Loads the opaque cursor for one validated provider stream.
+    ///
+    /// Both an absent row and a present nullable cursor are represented as
+    /// `None`; an invalid stored value fails closed as a redacted corruption
+    /// error.
+    pub fn load_provider_cursor(&self, stream_id: impl AsRef<str>) -> StoreResult<Option<String>> {
+        let stream_id =
+            validate_provider_stream_identifier(stream_id.as_ref().to_owned(), "stream_id")?;
+        let cursor = self
+            .connection
             .query_row(
                 "SELECT cursor FROM provider_cursors WHERE provider = ?1",
-                params![stream_id],
+                params![&stream_id],
                 |row| row.get::<_, Option<String>>(0),
             )
-            .optional()?
-            .flatten()
-            .ok_or(StoreError::NotFound {
-                resource: "provider cursor",
-            })
+            .optional()
+            .map_err(provider_cursor_sqlite_error)?;
+        match cursor {
+            None | Some(None) => Ok(None),
+            Some(Some(cursor)) => validate_provider_cursor_identifier(cursor, "cursor")
+                .map(Some)
+                .map_err(|_| stored_record_invalid("provider cursor")),
+        }
     }
 
-    /// Deletes a provider cursor by stable stream ID.
-    pub fn delete_provider_cursor(&self, stream_id: impl AsRef<str>) -> StoreResult<()> {
-        let stream_id = validate_non_empty(stream_id.as_ref().to_owned(), "stream_id")?;
-        let deleted = self.connection.execute(
-            "DELETE FROM provider_cursors WHERE provider = ?1",
-            params![stream_id],
-        )?;
-        if deleted == 0 {
-            return Err(StoreError::NotFound {
-                resource: "provider cursor",
-            });
+    /// Atomically compares and advances one opaque provider cursor.
+    ///
+    /// Validation completes before the immediate transaction begins. The
+    /// transaction fences concurrent store handles, while equal retries avoid
+    /// touching the row timestamp and stale callers receive a redacted
+    /// conflict without mutation.
+    pub fn advance_provider_cursor(
+        &self,
+        stream_id: &str,
+        expected: Option<&str>,
+        next: &str,
+    ) -> StoreResult<()> {
+        let stream_id = validate_provider_stream_identifier(stream_id.to_owned(), "stream_id")?;
+        let expected = expected
+            .map(|value| validate_provider_cursor_identifier(value.to_owned(), "expected"))
+            .transpose()?;
+        let next = validate_provider_cursor_identifier(next.to_owned(), "next")?;
+
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .map_err(provider_cursor_sqlite_error)?;
+        let current = load_provider_cursor_row(&transaction, &stream_id)?;
+        let current = match current {
+            None => None,
+            Some(None) => Some(None),
+            Some(Some(cursor)) => Some(Some(
+                validate_provider_cursor_identifier(cursor, "cursor")
+                    .map_err(|_| stored_record_invalid("provider cursor"))?,
+            )),
+        };
+
+        match current {
+            None => {
+                if expected.is_some() {
+                    return Err(StoreError::CursorConflict {
+                        resource: "provider cursor",
+                    });
+                }
+                let inserted = transaction
+                    .execute(
+                        "INSERT INTO provider_cursors(provider, cursor) VALUES (?1, ?2)
+                         ON CONFLICT(provider) DO NOTHING",
+                        params![&stream_id, &next],
+                    )
+                    .map_err(provider_cursor_sqlite_error)?;
+                if inserted != 1 {
+                    return Err(StoreError::CursorConflict {
+                        resource: "provider cursor",
+                    });
+                }
+            }
+            Some(current) => {
+                if expected.as_deref() != current.as_deref() {
+                    return Err(StoreError::CursorConflict {
+                        resource: "provider cursor",
+                    });
+                }
+                if current.as_deref() == Some(next.as_str()) {
+                    transaction.commit().map_err(provider_cursor_sqlite_error)?;
+                    return Ok(());
+                }
+
+                let updated = match current {
+                    Some(current) => transaction
+                        .execute(
+                            "UPDATE provider_cursors
+                             SET cursor = ?1, updated_at = CURRENT_TIMESTAMP
+                             WHERE provider = ?2 AND cursor = ?3",
+                            params![&next, &stream_id, &current],
+                        )
+                        .map_err(provider_cursor_sqlite_error)?,
+                    None => transaction
+                        .execute(
+                            "UPDATE provider_cursors
+                             SET cursor = ?1, updated_at = CURRENT_TIMESTAMP
+                             WHERE provider = ?2 AND cursor IS NULL",
+                            params![&next, &stream_id],
+                        )
+                        .map_err(provider_cursor_sqlite_error)?,
+                };
+                if updated != 1 {
+                    return Err(StoreError::CursorConflict {
+                        resource: "provider cursor",
+                    });
+                }
+            }
         }
+        transaction.commit().map_err(provider_cursor_sqlite_error)?;
         Ok(())
     }
 
@@ -6657,8 +6824,31 @@ fn parse_message_timestamp_text(value: String) -> StoreResult<String> {
 }
 
 fn validate_message_identifier(value: String, field: &'static str) -> StoreResult<String> {
+    validate_machine_identifier_with_limit(value, field, MAX_MESSAGE_ID_LENGTH)
+}
+
+fn validate_provider_cursor_identifier(value: String, field: &'static str) -> StoreResult<String> {
+    if value.trim().is_empty()
+        || value.len() > MAX_PROVIDER_CURSOR_LENGTH
+        || !value.is_ascii()
+        || value.chars().any(char::is_control)
+    {
+        return Err(StoreError::InvalidInput { field });
+    }
+    Ok(value)
+}
+
+fn validate_provider_stream_identifier(value: String, field: &'static str) -> StoreResult<String> {
+    validate_machine_identifier_with_limit(value, field, MAX_PROVIDER_CURSOR_LENGTH)
+}
+
+fn validate_machine_identifier_with_limit(
+    value: String,
+    field: &'static str,
+    maximum_length: usize,
+) -> StoreResult<String> {
     if value.is_empty()
-        || value.len() > MAX_MESSAGE_ID_LENGTH
+        || value.len() > maximum_length
         || value.chars().any(char::is_whitespace)
         || value.chars().any(char::is_control)
         || !value
@@ -6668,6 +6858,24 @@ fn validate_message_identifier(value: String, field: &'static str) -> StoreResul
         return Err(StoreError::InvalidInput { field });
     }
     Ok(value)
+}
+
+fn load_provider_cursor_row(
+    transaction: &Transaction<'_>,
+    stream_id: &str,
+) -> StoreResult<Option<Option<String>>> {
+    transaction
+        .query_row(
+            "SELECT cursor FROM provider_cursors WHERE provider = ?1",
+            params![stream_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(provider_cursor_sqlite_error)
+}
+
+fn provider_cursor_sqlite_error(_: rusqlite::Error) -> StoreError {
+    StoreError::Sqlite(rusqlite::Error::InvalidQuery)
 }
 
 fn validate_task_identifier(value: String, field: &'static str) -> StoreResult<String> {
@@ -6811,7 +7019,149 @@ fn reject_empty_key(key: &[u8]) -> StoreResult<()> {
     Ok(())
 }
 
-fn initialize(connection: &mut Connection, key: &[u8], file_store: bool) -> StoreResult<()> {
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut sidecar_path = path.as_os_str().to_os_string();
+    sidecar_path.push(suffix);
+    sidecar_path.into()
+}
+
+fn reject_sqlite_sidecars(path: &Path) -> StoreResult<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        match std::fs::symlink_metadata(sqlite_sidecar_path(path, suffix)) {
+            Ok(_) => {
+                return Err(StoreError::NotFound {
+                    resource: "database",
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(StoreError::NotFound {
+                    resource: "database",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn immutable_read_only_uri(path: &Path) -> StoreResult<String> {
+    #[cfg(unix)]
+    let path_bytes = {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(windows)]
+    let normalized_path = {
+        let path_text = path.to_str().ok_or(StoreError::NotFound {
+            resource: "database",
+        })?;
+        let path_bytes = path_text.as_bytes();
+        if path_bytes.get(1) == Some(&b':')
+            && !matches!(path_bytes.get(2), Some(b'/') | Some(b'\\'))
+        {
+            return Err(StoreError::NotFound {
+                resource: "database",
+            });
+        }
+        path.canonicalize()
+            .map_err(|_| StoreError::NotFound {
+                resource: "database",
+            })?
+            .to_str()
+            .ok_or(StoreError::NotFound {
+                resource: "database",
+            })?
+            .replace('\\', "/")
+    };
+    #[cfg(windows)]
+    let path_bytes = normalized_path.as_bytes();
+    #[cfg(not(any(unix, windows)))]
+    let path_text = path.to_str().ok_or(StoreError::NotFound {
+        resource: "database",
+    })?;
+    #[cfg(not(any(unix, windows)))]
+    let path_bytes = path_text.as_bytes();
+
+    #[cfg(windows)]
+    let is_windows_path = true;
+    #[cfg(not(windows))]
+    let is_windows_path = false;
+
+    immutable_read_only_uri_for_path_bytes(path_bytes, is_windows_path, {
+        #[cfg(windows)]
+        {
+            true
+        }
+        #[cfg(not(windows))]
+        {
+            path.is_absolute()
+        }
+    })
+}
+
+fn immutable_read_only_uri_for_path_bytes(
+    path_bytes: &[u8],
+    is_windows_path: bool,
+    is_absolute: bool,
+) -> StoreResult<String> {
+    if is_windows_path && !is_absolute {
+        return Err(StoreError::NotFound {
+            resource: "database",
+        });
+    }
+    let path_bytes = if is_windows_path && path_bytes.starts_with(b"//?/") {
+        let drive_path = &path_bytes[4..];
+        if drive_path.len() < 3
+            || !drive_path[0].is_ascii_alphabetic()
+            || drive_path[1] != b':'
+            || drive_path[2] != b'/'
+        {
+            return Err(StoreError::NotFound {
+                resource: "database",
+            });
+        }
+        drive_path
+    } else {
+        path_bytes
+    };
+    if is_windows_path && (path_bytes.starts_with(b"//") || path_bytes.starts_with(b"\\\\")) {
+        return Err(StoreError::NotFound {
+            resource: "database",
+        });
+    }
+    let mut uri = String::from("file:");
+    if is_windows_path && is_absolute {
+        uri.push_str("///");
+    }
+    if !is_windows_path && path_bytes.starts_with(b"//") {
+        uri.push_str("//");
+    }
+    append_uri_path_bytes(&mut uri, path_bytes);
+    uri.push_str("?immutable=1");
+    Ok(uri)
+}
+
+fn append_uri_path_bytes(uri: &mut String, path_bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    for &byte in path_bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX[(byte >> 4) as usize]));
+            uri.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+}
+
+fn initialize(
+    connection: &mut Connection,
+    key: &[u8],
+    file_store: bool,
+    migrate: bool,
+) -> StoreResult<()> {
     apply_sqlcipher_key(connection, key)?;
     verify_sqlcipher(connection)?;
     connection.pragma_update(None, "recursive_triggers", true)?;
@@ -6828,7 +7178,10 @@ fn initialize(connection: &mut Connection, key: &[u8], file_store: bool) -> Stor
         }
     }
 
-    run_migrations(connection)
+    if migrate {
+        run_migrations(connection)?;
+    }
+    Ok(())
 }
 
 fn apply_sqlcipher_key(connection: &Connection, key: &[u8]) -> StoreResult<()> {
@@ -7903,6 +8256,36 @@ CREATE INDEX IF NOT EXISTS idx_http_idempotency_records_lease_until
     Ok(())
 }
 
+fn apply_schema_v15(transaction: &Transaction<'_>) -> StoreResult<()> {
+    transaction.execute_batch(
+        r#"
+CREATE TABLE backup_operation_attempts (
+    id INTEGER PRIMARY KEY,
+    attempt_key TEXT NOT NULL UNIQUE,
+    operation TEXT NOT NULL CHECK (
+      operation IN ('snapshot_create', 'upload', 'restore_verify', 'retention')
+    ),
+    state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    error_code TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    CHECK (
+      (state = 'running' AND completed_at IS NULL AND error_code IS NULL)
+      OR
+      (state = 'succeeded' AND completed_at IS NOT NULL AND error_code IS NULL)
+      OR
+      (state = 'failed' AND completed_at IS NOT NULL AND error_code IS NOT NULL)
+    )
+);
+CREATE INDEX idx_backup_operation_attempts_operation_started
+    ON backup_operation_attempts(operation, started_at DESC, id DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Fixed scope for HTTP idempotency records.
 pub const HTTP_IDEMPOTENCY_SCOPE: &str = "pa-http-v1";
 /// Maximum byte length accepted for an HTTP idempotency scope.
@@ -7915,6 +8298,68 @@ pub const MAX_HTTP_IDEMPOTENCY_FINGERPRINT_LENGTH: usize = 64;
 pub const HTTP_IDEMPOTENCY_RESERVATION_SECONDS: i64 = 300;
 /// Maximum cached response body size for an HTTP idempotency record.
 pub const MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// A validated, byte-preserving HTTP idempotency response.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HttpIdempotencyResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+impl HttpIdempotencyResponse {
+    /// Constructs a response with a bounded status and JSON body.
+    pub fn new(status: u16, body: impl Into<Vec<u8>>) -> StoreResult<Self> {
+        let body = body.into();
+        if !(200..=599).contains(&status)
+            || body.is_empty()
+            || body.len() > MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES
+        {
+            return Err(StoreError::InvalidInput {
+                field: "http idempotency response",
+            });
+        }
+
+        let text = std::str::from_utf8(&body).map_err(|_| StoreError::InvalidInput {
+            field: "http idempotency response",
+        })?;
+        let mut deserializer = serde_json::Deserializer::from_str(text);
+        serde::de::IgnoredAny::deserialize(&mut deserializer).map_err(|_| {
+            StoreError::InvalidInput {
+                field: "http idempotency response",
+            }
+        })?;
+        deserializer.end().map_err(|_| StoreError::InvalidInput {
+            field: "http idempotency response",
+        })?;
+
+        Ok(Self { status, body })
+    }
+
+    /// Returns the original HTTP status.
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Returns the fixed response content type.
+    pub fn content_type(&self) -> &'static str {
+        "application/json"
+    }
+
+    /// Returns the exact validated response bytes.
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+impl fmt::Debug for HttpIdempotencyResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpIdempotencyResponse")
+            .field("status", &self.status)
+            .field("body", &"<redacted>")
+            .finish()
+    }
+}
 
 /// Validates the bounded ASCII grammar used for an HTTP idempotency scope.
 #[allow(dead_code)]
@@ -8026,12 +8471,12 @@ mod tests {
     };
 
     use super::{
-        AuditEntityType, AuditEventType, CURRENT_SCHEMA_VERSION, MAX_APPOINTMENT_QUOTE_SLOTS,
-        MAX_AUDIT_ENTITY_ID_LENGTH, MAX_AUDIT_LIST_LIMIT, MAX_MESSAGE_ID_LENGTH,
-        MAX_MESSAGE_LIST_LIMIT, MAX_MESSAGE_SENDER_LENGTH, MAX_MESSAGE_SUBJECT_LENGTH,
-        MAX_MESSAGE_SUMMARY_LENGTH, MAX_TASK_DURATION_MINUTES, MAX_TASK_ID_LENGTH,
-        MAX_TASK_TITLE_LENGTH, MIGRATIONS, MessageProvider, MessageSummary, MessageTriageState,
-        Migration, NotificationKind, NotificationRecipient, NotificationStatus,
+        AuditEntityType, AuditEventType, BUSY_TIMEOUT, CURRENT_SCHEMA_VERSION,
+        MAX_APPOINTMENT_QUOTE_SLOTS, MAX_AUDIT_ENTITY_ID_LENGTH, MAX_AUDIT_LIST_LIMIT,
+        MAX_MESSAGE_ID_LENGTH, MAX_MESSAGE_LIST_LIMIT, MAX_MESSAGE_SENDER_LENGTH,
+        MAX_MESSAGE_SUBJECT_LENGTH, MAX_MESSAGE_SUMMARY_LENGTH, MAX_TASK_DURATION_MINUTES,
+        MAX_TASK_ID_LENGTH, MAX_TASK_TITLE_LENGTH, MIGRATIONS, MessageProvider, MessageSummary,
+        MessageTriageState, Migration, NotificationKind, NotificationRecipient, NotificationStatus,
         NotificationTemplateData, OAuthCredential, PaStore, ProposalSource, StoreError,
         StoreResult, StoredAppointmentDraft, StoredAppointmentQuote, StoredAppointmentQuoteState,
         StoredMessage, StoredProposal, StoredTask, StoredTaskState, TaskTitle, apply_sqlcipher_key,
@@ -8043,6 +8488,12 @@ mod tests {
     const DATABASE_KEY: &[u8] = b"task-4a-test-key";
     const VALID_HTTP_FINGERPRINT: &str =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const STREAM_A: &str = "microsoft.mail:account-a";
+    const STREAM_B: &str = "google.mail:account-a";
+    const FIRST_CURSOR: &str = "cursor-a-1";
+    const NEXT_CURSOR: &str = "cursor-a-2";
+    const STALE_CURSOR: &str = "cursor-a-0";
+    const REDACTION_SENTINEL: &str = "cursor-secret-sentinel-9c-a";
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct TempDatabase {
@@ -8070,8 +8521,56 @@ mod tests {
 
     fn remove_database_files(path: &Path) {
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
-        let _ = fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let sidecar = super::sqlite_sidecar_path(path, suffix);
+            let _ = fs::remove_file(&sidecar);
+            let _ = fs::remove_dir(&sidecar);
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct EntrySnapshot {
+        exists: bool,
+        regular: bool,
+        directory: bool,
+        symlink: bool,
+        bytes: Option<Vec<u8>>,
+    }
+
+    fn entry_snapshot(path: &Path) -> EntrySnapshot {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                EntrySnapshot {
+                    exists: true,
+                    regular: file_type.is_file(),
+                    directory: file_type.is_dir(),
+                    symlink: file_type.is_symlink(),
+                    bytes: fs::read(path).ok(),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => EntrySnapshot {
+                exists: false,
+                regular: false,
+                directory: false,
+                symlink: false,
+                bytes: None,
+            },
+            Err(error) => panic!("snapshot restore entry: {error}"),
+        }
+    }
+
+    fn restore_entry_snapshots(path: &Path) -> [EntrySnapshot; 4] {
+        ["", "-wal", "-shm", "-journal"].map(|suffix| {
+            entry_snapshot(
+                if suffix.is_empty() {
+                    path.to_path_buf()
+                } else {
+                    super::sqlite_sidecar_path(path, suffix)
+                }
+                .as_path(),
+            )
+        })
     }
 
     fn random_replay_nonce() -> String {
@@ -8335,6 +8834,295 @@ END;
     fn empty_database_key_is_rejected() {
         let error = PaStore::open_in_memory([]).expect_err("empty key must fail");
         assert!(error.to_string().contains("database key"));
+    }
+
+    #[test]
+    fn immutable_uri_rejects_non_absolute_windows_path() {
+        let error = super::immutable_read_only_uri_for_path_bytes(b"C:restore.db", true, false)
+            .expect_err("drive-relative Windows paths must fail closed");
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+    }
+
+    #[test]
+    fn immutable_uri_rejects_unc_windows_path() {
+        let error =
+            super::immutable_read_only_uri_for_path_bytes(b"//server/share/restore.db", true, true)
+                .expect_err("UNC Windows paths must fail closed");
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+    }
+
+    #[test]
+    fn immutable_uri_normalizes_extended_absolute_drive_path() {
+        let uri = super::immutable_read_only_uri_for_path_bytes(b"//?/C:/restore.db", true, true)
+            .expect("extended drive path is an absolute Windows path");
+        assert_eq!(uri, "file:///C:/restore.db?immutable=1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_uri_preserves_unix_double_slash_path_as_uri_path_data() {
+        let uri = super::immutable_read_only_uri_for_path_bytes(b"//tmp/candidate.db", false, true)
+            .expect("Unix double-slash absolute path is valid");
+        assert_eq!(uri, "file:////tmp/candidate.db?immutable=1");
+    }
+
+    #[test]
+    fn restore_open_existing_contract() {
+        assert_eq!(
+            MIGRATIONS.last().map(|migration| migration.version),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+
+        let absent = TempDatabase::new();
+        let absent_error = PaStore::open_existing(&absent.path, DATABASE_KEY)
+            .expect_err("an absent restore database must not be created");
+        assert!(!absent.path.exists(), "absent restore database was created");
+        assert!(!absent_error.to_string().contains("agent_voice_pa_store_"));
+
+        let removed = TempDatabase::new();
+        let removed_store =
+            PaStore::open(&removed.path, DATABASE_KEY).expect("seed removable store");
+        drop(removed_store);
+        remove_database_files(&removed.path);
+        let removed_error = PaStore::open_existing(&removed.path, DATABASE_KEY)
+            .expect_err("a removed restore database must not be recreated");
+        assert!(
+            !removed.path.exists(),
+            "removed restore database was recreated"
+        );
+        assert!(!removed_error.to_string().contains("agent_voice_pa_store_"));
+
+        let current = TempDatabase::new();
+        let seeded = PaStore::open(&current.path, DATABASE_KEY).expect("seed current fixture");
+        let schema_version: i64 = seeded
+            .connection()
+            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("current schema version");
+        assert_eq!(schema_version, CURRENT_SCHEMA_VERSION);
+        drop(seeded);
+
+        let restored = PaStore::open_existing(&current.path, DATABASE_KEY)
+            .expect("current SQLCipher fixture opens without migration");
+        let foreign_keys: i64 = restored
+            .connection()
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign key setting");
+        assert_eq!(foreign_keys, 1);
+        let busy_timeout: i64 = restored
+            .connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy timeout setting");
+        assert_eq!(busy_timeout, BUSY_TIMEOUT.as_millis() as i64);
+        assert_eq!(
+            restored
+                .connection()
+                .query_row("SELECT count(*) FROM configuration", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("current fixture query"),
+            1
+        );
+        drop(restored);
+
+        let wrong_key = b"restore-open-existing-wrong-key";
+        let wrong_key_error = PaStore::open_existing(&current.path, wrong_key)
+            .expect_err("wrong restore key must fail");
+        assert!(
+            !wrong_key_error
+                .to_string()
+                .contains("restore-open-existing-wrong-key")
+        );
+
+        let older = TempDatabase::new();
+        let mut older_connection = Connection::open(&older.path).expect("open older fixture");
+        apply_sqlcipher_key(&older_connection, DATABASE_KEY).expect("apply SQLCipher key");
+        verify_sqlcipher(&older_connection).expect("verify SQLCipher");
+        let older_schema_version = CURRENT_SCHEMA_VERSION - 1;
+        run_migrations_with(
+            &mut older_connection,
+            &MIGRATIONS[..older_schema_version as usize],
+        )
+        .expect("apply older schema");
+        let older_journal_mode: String = older_connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("older journal mode");
+        drop(older_connection);
+
+        let older_restored = PaStore::open_existing(&older.path, DATABASE_KEY)
+            .expect("older schema opens without migration");
+        let older_version: i64 = older_restored
+            .connection()
+            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("older schema version");
+        assert_eq!(older_version, older_schema_version);
+        assert_ne!(older_version, CURRENT_SCHEMA_VERSION);
+        let restored_journal_mode: String = older_restored
+            .connection()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("restored journal mode");
+        assert_eq!(restored_journal_mode, older_journal_mode);
+    }
+
+    #[test]
+    fn restore_open_existing_preserves_sidecar_free_current_snapshot() {
+        let database = TempDatabase::new();
+        let seeded = PaStore::open(&database.path, DATABASE_KEY).expect("seed current fixture");
+        drop(seeded);
+
+        let before = restore_entry_snapshots(&database.path);
+        assert!(before[0].regular, "database fixture must be a regular file");
+        assert!(before[1..].iter().all(|entry| !entry.exists));
+
+        let restored = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect("sidecar-free current snapshot opens");
+        assert_eq!(
+            restored
+                .connection()
+                .query_row("SELECT count(*) FROM configuration", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("current fixture query"),
+            1
+        );
+        drop(restored);
+
+        assert_eq!(restore_entry_snapshots(&database.path), before);
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_wal_and_shm_sidecars_without_mutation() {
+        for suffix in ["-wal", "-shm"] {
+            let database = TempDatabase::new();
+            let seeded = PaStore::open(&database.path, DATABASE_KEY).expect("seed sidecar fixture");
+            drop(seeded);
+
+            fs::write(
+                super::sqlite_sidecar_path(&database.path, suffix),
+                b"sidecar fixture",
+            )
+            .expect("create sidecar fixture");
+            let before = restore_entry_snapshots(&database.path);
+
+            let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+                .expect_err("restore sidecar must fail closed");
+            assert!(matches!(
+                error,
+                StoreError::NotFound {
+                    resource: "database"
+                }
+            ));
+            assert_eq!(restore_entry_snapshots(&database.path), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_open_existing_rejects_dangling_journal_sidecar_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let database = TempDatabase::new();
+        let seed =
+            PaStore::open(&database.path, DATABASE_KEY).expect("seed dangling-journal fixture");
+        drop(seed);
+
+        let journal_path = super::sqlite_sidecar_path(&database.path, "-journal");
+        symlink("missing-journal-target", &journal_path).expect("create dangling journal symlink");
+        let before = restore_entry_snapshots(&database.path);
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("dangling journal sidecar must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert_eq!(restore_entry_snapshots(&database.path), before);
+        assert!(before[3].symlink, "fixture must contain a dangling symlink");
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_empty_journal_sidecar_without_mutation() {
+        let database = TempDatabase::new();
+        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed journal fixture");
+        drop(seed);
+
+        let journal_path = super::sqlite_sidecar_path(&database.path, "-journal");
+        fs::write(&journal_path, []).expect("create empty journal sidecar");
+        let before = restore_entry_snapshots(&database.path);
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("empty journal sidecar must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert_eq!(restore_entry_snapshots(&database.path), before);
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_directory_journal_sidecar_without_mutation() {
+        let database = TempDatabase::new();
+        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed journal fixture");
+        drop(seed);
+
+        let journal_path = super::sqlite_sidecar_path(&database.path, "-journal");
+        fs::create_dir(&journal_path).expect("create directory journal sidecar");
+        let before = restore_entry_snapshots(&database.path);
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("directory journal sidecar must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert_eq!(restore_entry_snapshots(&database.path), before);
+        assert!(
+            before[3].directory,
+            "fixture must contain a directory entry"
+        );
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_malformed_journal_sidecar_without_mutation() {
+        let database = TempDatabase::new();
+        let seed =
+            PaStore::open(&database.path, DATABASE_KEY).expect("seed malformed journal fixture");
+        drop(seed);
+
+        let journal_path = super::sqlite_sidecar_path(&database.path, "-journal");
+        fs::write(&journal_path, [0xAA_u8; 512]).expect("create malformed rollback journal");
+        let before = restore_entry_snapshots(&database.path);
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("malformed journal sidecar must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert_eq!(restore_entry_snapshots(&database.path), before);
     }
 
     #[test]
@@ -8924,6 +9712,502 @@ END;
     }
 
     #[test]
+    fn migration_v15_adds_backup_attempt_schema() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open v15 store");
+        let schema_version: i64 = store
+            .connection()
+            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("schema version");
+        assert_eq!(schema_version, 15);
+
+        let columns = store
+            .connection()
+            .prepare("PRAGMA table_info('backup_operation_attempts')")
+            .expect("backup attempts table info")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .expect("backup attempts columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("backup attempts column rows");
+        assert_eq!(
+            columns,
+            vec![
+                ("id".to_owned(), "INTEGER".to_owned(), 0, None, 1),
+                ("attempt_key".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("operation".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("state".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("started_at".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("completed_at".to_owned(), "TEXT".to_owned(), 0, None, 0),
+                ("error_code".to_owned(), "TEXT".to_owned(), 0, None, 0),
+                (
+                    "created_at".to_owned(),
+                    "TEXT".to_owned(),
+                    1,
+                    Some("strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_owned()),
+                    0
+                ),
+                (
+                    "updated_at".to_owned(),
+                    "TEXT".to_owned(),
+                    1,
+                    Some("strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_owned()),
+                    0
+                ),
+            ]
+        );
+
+        assert_named_index(
+            &store,
+            "idx_backup_operation_attempts_operation_started",
+            "backup_operation_attempts",
+            &["operation", "started_at", "id"],
+        );
+        let index_columns = store
+            .connection()
+            .prepare("PRAGMA index_xinfo('idx_backup_operation_attempts_operation_started')")
+            .expect("backup attempts index info")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, i64>(5)? != 0,
+                ))
+            })
+            .expect("backup attempts index columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("backup attempts index column rows")
+            .into_iter()
+            .filter_map(|(name, is_descending, is_key)| {
+                is_key.then(|| (name.expect("key index column name"), is_descending))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            index_columns,
+            vec![
+                ("operation".to_owned(), false),
+                ("started_at".to_owned(), true),
+                ("id".to_owned(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn backup_attempt_schema_defaults_are_canonical_utc() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open v15 store");
+        store
+            .connection()
+            .execute(
+                "INSERT INTO backup_operation_attempts (
+                     attempt_key, operation, state, started_at
+                 ) VALUES ('default-timestamps', 'upload', 'running',
+                           '2026-09-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert row using timestamp defaults");
+        let defaults: (String, String) = store
+            .connection()
+            .query_row(
+                "SELECT created_at, updated_at
+                 FROM backup_operation_attempts
+                 WHERE attempt_key = 'default-timestamps'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read timestamp defaults");
+        for value in [defaults.0, defaults.1] {
+            assert_eq!(value.len(), 20, "canonical timestamps use whole seconds");
+            assert!(value.ends_with('Z'), "canonical timestamps are UTC");
+            let parsed =
+                OffsetDateTime::parse(&value, &Rfc3339).expect("default timestamp is RFC3339");
+            assert_eq!(parsed.offset(), UtcOffset::UTC);
+            assert_eq!(parsed.nanosecond(), 0);
+            assert_eq!(
+                parsed.format(&Rfc3339).expect("format timestamp"),
+                value,
+                "default timestamp is strict canonical RFC3339"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_v15_preserves_v14_rows_and_reopens_once() {
+        let database = TempDatabase::new();
+        let v14_migrations = &MIGRATIONS[..MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 15)
+            .expect("v15 migration")];
+        let table_row_counts = |connection: &Connection| {
+            let table_names = connection
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                     ORDER BY name",
+                )
+                .expect("v14 table names query")
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("v14 table name rows")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("v14 table names");
+            table_names
+                .into_iter()
+                .map(|table| {
+                    let count: i64 = connection
+                        .query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |row| {
+                            row.get(0)
+                        })
+                        .expect("v14 table row count");
+                    (table, count)
+                })
+                .collect::<Vec<_>>()
+        };
+        let v14_snapshot = {
+            let mut connection = Connection::open(&database.path).expect("open v14 database");
+            apply_sqlcipher_key(&connection, DATABASE_KEY).expect("apply SQLCipher key");
+            verify_sqlcipher(&connection).expect("verify SQLCipher");
+            connection
+                .pragma_update(None, "foreign_keys", true)
+                .expect("enable foreign keys");
+            run_migrations_with(&mut connection, v14_migrations).expect("apply v14 schema");
+            connection
+                .execute(
+                    "UPDATE configuration SET owner_email = ?1 WHERE id = 1",
+                    ["owner-v14@example.test"],
+                )
+                .expect("seed v14 configuration");
+            connection
+                .execute(
+                    "INSERT INTO http_idempotency_records (
+                         scope, idempotency_key, fingerprint, state, lease_generation,
+                         lease_until
+                     ) VALUES (?1, ?2, ?3, 'in_progress', 1, ?4)",
+                    rusqlite::params![
+                        "scope-v14",
+                        "key-v14",
+                        VALID_HTTP_FINGERPRINT,
+                        1_700_000_000_i64
+                    ],
+                )
+                .expect("seed v14 idempotency row");
+            let configuration: (Option<String>, String) = connection
+                .query_row(
+                    "SELECT owner_email, email_triage_model FROM configuration WHERE id = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("v14 configuration snapshot");
+            let idempotency: (String, String, String, String, i64, i64) = connection
+                .query_row(
+                    "SELECT scope, idempotency_key, fingerprint, state,
+                            lease_generation, lease_until
+                     FROM http_idempotency_records",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .expect("v14 idempotency snapshot");
+            (table_row_counts(&connection), configuration, idempotency)
+        };
+        let assert_v14_table_counts = |connection: &Connection| {
+            let actual = table_row_counts(connection);
+            for (table, before_count) in &v14_snapshot.0 {
+                let expected = if table == "schema_migrations" {
+                    *before_count + 1
+                } else {
+                    *before_count
+                };
+                assert_eq!(
+                    actual
+                        .iter()
+                        .find(|(name, _)| name == table)
+                        .map(|(_, count)| *count),
+                    Some(expected),
+                    "{table} row count changed"
+                );
+            }
+            assert_eq!(
+                actual
+                    .iter()
+                    .find(|(name, _)| name == "backup_operation_attempts")
+                    .map(|(_, count)| *count),
+                Some(0),
+                "new backup-attempt table must start empty"
+            );
+        };
+
+        {
+            let store = PaStore::open(&database.path, DATABASE_KEY).expect("migrate v14 store");
+            assert_v14_table_counts(store.connection());
+            assert_eq!(
+                store
+                    .connection()
+                    .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("migrated schema version"),
+                15
+            );
+            assert_eq!(
+                store
+                    .connection()
+                    .query_row(
+                        "SELECT owner_email, email_triage_model
+                         FROM configuration WHERE id = 1",
+                        [],
+                        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .expect("preserved configuration"),
+                v14_snapshot.1
+            );
+            assert_eq!(
+                store
+                    .connection()
+                    .query_row(
+                        "SELECT scope, idempotency_key, fingerprint, state,
+                                lease_generation, lease_until
+                         FROM http_idempotency_records",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, i64>(5)?,
+                            ))
+                        },
+                    )
+                    .expect("preserved idempotency row"),
+                v14_snapshot.2
+            );
+            assert_eq!(
+                store
+                    .connection()
+                    .query_row(
+                        "SELECT count(*) FROM schema_migrations WHERE version = 15",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("v15 migration count"),
+                1
+            );
+        }
+
+        let reopened = PaStore::open(&database.path, DATABASE_KEY).expect("reopen v15 store");
+        assert_v14_table_counts(reopened.connection());
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("reopened migration count"),
+            15
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'backup_operation_attempts'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("backup attempts table count"),
+            1
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT owner_email, email_triage_model
+                     FROM configuration WHERE id = 1",
+                    [],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("reopened preserved configuration"),
+            v14_snapshot.1
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT scope, idempotency_key, fingerprint, state,
+                            lease_generation, lease_until
+                     FROM http_idempotency_records",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .expect("reopened preserved idempotency row"),
+            v14_snapshot.2
+        );
+    }
+
+    #[test]
+    fn backup_attempt_schema_rejects_invalid_state_rows() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open v15 store");
+        let insert = |attempt_key: &str,
+                      operation: &str,
+                      state: &str,
+                      completed_at: Option<&str>,
+                      error_code: Option<&str>| {
+            store.connection().execute(
+                "INSERT INTO backup_operation_attempts (
+                     attempt_key, operation, state, started_at, completed_at, error_code
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    attempt_key,
+                    operation,
+                    state,
+                    "2026-09-01T00:00:00Z",
+                    completed_at,
+                    error_code
+                ],
+            )
+        };
+
+        for (index, operation) in ["snapshot_create", "upload", "restore_verify", "retention"]
+            .into_iter()
+            .enumerate()
+        {
+            insert(
+                &format!("valid-running-{index}"),
+                operation,
+                "running",
+                None,
+                None,
+            )
+            .expect("valid running row");
+            insert(
+                &format!("valid-succeeded-{index}"),
+                operation,
+                "succeeded",
+                Some("2026-09-01T00:01:00Z"),
+                None,
+            )
+            .expect("valid succeeded row");
+            insert(
+                &format!("valid-failed-{index}"),
+                operation,
+                "failed",
+                Some("2026-09-01T00:02:00Z"),
+                Some("provider_error"),
+            )
+            .expect("valid failed row");
+        }
+
+        for (attempt_key, operation, state, completed_at, error_code) in [
+            ("invalid-operation", "unknown", "running", None, None),
+            ("invalid-state", "upload", "paused", None, None),
+            (
+                "running-completed",
+                "upload",
+                "running",
+                Some("2026-09-01T00:01:00Z"),
+                None,
+            ),
+            (
+                "running-error",
+                "upload",
+                "running",
+                None,
+                Some("provider_error"),
+            ),
+            ("succeeded-incomplete", "upload", "succeeded", None, None),
+            (
+                "succeeded-error",
+                "upload",
+                "succeeded",
+                Some("2026-09-01T00:01:00Z"),
+                Some("provider_error"),
+            ),
+            (
+                "failed-incomplete",
+                "upload",
+                "failed",
+                None,
+                Some("provider_error"),
+            ),
+            (
+                "failed-without-error",
+                "upload",
+                "failed",
+                Some("2026-09-01T00:01:00Z"),
+                None,
+            ),
+        ] {
+            assert!(
+                insert(attempt_key, operation, state, completed_at, error_code).is_err(),
+                "{attempt_key} must be rejected"
+            );
+        }
+        assert!(insert("duplicate-attempt-key", "upload", "running", None, None).is_ok());
+        assert!(insert("duplicate-attempt-key", "upload", "running", None, None).is_err());
+
+        assert_eq!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM backup_operation_attempts",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .expect("valid backup attempts remain"),
+            13
+        );
+    }
+
+    #[test]
+    fn migrations_record_every_version_once() {
+        let mut connection = keyed_connection_for_migration_test();
+        run_migrations_with(&mut connection, MIGRATIONS).expect("apply v15 schema");
+        run_migrations_with(&mut connection, MIGRATIONS).expect("reapply v15 schema");
+
+        let versions: Vec<i64> = connection
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .expect("migration versions query")
+            .query_map([], |row| row.get(0))
+            .expect("migration version rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("migration versions");
+        assert_eq!(versions, (1..=15).collect::<Vec<_>>());
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("migration count"),
+            15
+        );
+    }
+
+    #[test]
     fn http_idempotency_v14_migration_creates_schema() {
         let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
         let schema_version: i64 = store
@@ -8932,7 +10216,7 @@ END;
                 row.get(0)
             })
             .expect("schema version");
-        assert_eq!(schema_version, 14);
+        assert_eq!(schema_version, CURRENT_SCHEMA_VERSION);
 
         let table_sql: String = store
             .connection()
@@ -9990,11 +11274,11 @@ END;
             snapshots.push(snapshot(&store));
         }
 
-        assert_eq!(snapshots[0].0, v13_table_count + 1);
+        assert_eq!(snapshots[0].0, v13_table_count + 2);
         assert_eq!(snapshots[0].2, 1);
         assert_eq!(snapshots[0].3, 1);
         assert_eq!(snapshots[0].4, 1);
-        assert_eq!(snapshots[0].5, 14);
+        assert_eq!(snapshots[0].5, CURRENT_SCHEMA_VERSION);
         assert_eq!(snapshots[0], snapshots[1]);
         assert_eq!(snapshots[1], snapshots[2]);
     }
@@ -10050,14 +11334,14 @@ END;
                 row.get(0)
             })
             .expect("schema version");
-        assert_eq!(schema_version, 14);
+        assert_eq!(schema_version, CURRENT_SCHEMA_VERSION);
         let migration_count: i64 = store
             .connection()
             .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
                 row.get(0)
             })
             .expect("migration count");
-        assert_eq!(migration_count, 14);
+        assert_eq!(migration_count, CURRENT_SCHEMA_VERSION);
         let version: i64 = store
             .connection()
             .query_row(
@@ -12955,6 +14239,7 @@ END;
                 "appointment_quote_slots",
                 "appointment_quotes",
                 "audit_events",
+                "backup_operation_attempts",
                 "configuration",
                 "event_mappings",
                 "http_idempotency_records",
@@ -13376,7 +14661,7 @@ END;
             Err(StoreError::InvalidInput { .. })
         ));
         assert!(matches!(
-            store.save_provider_cursor("stream", None, " "),
+            store.advance_provider_cursor("stream", None, " "),
             Err(StoreError::InvalidInput { .. })
         ));
     }
@@ -13440,20 +14725,311 @@ END;
     }
 
     #[test]
-    fn provider_cursors_isolate_streams_upsert_and_delete() {
+    fn provider_cursor_cas_rejects_stale_and_equal_retry() {
         let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
         store
-            .save_provider_cursor("microsoft.mail:account-a", None, "cursor-1")
-            .expect("save cursor");
+            .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("first cursor");
         store
-            .save_provider_cursor("microsoft.mail:account-a", Some("cursor-1"), "cursor-1")
-            .expect("idempotent retry");
+            .advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), NEXT_CURSOR)
+            .expect("cursor advance");
+        let before_equal_count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM provider_cursors", [], |row| {
+                row.get(0)
+            })
+            .expect("cursor count before equal retry");
+        let before_equal_timestamp: String = store
+            .connection()
+            .query_row(
+                "SELECT updated_at FROM provider_cursors WHERE provider = ?1",
+                [STREAM_A],
+                |row| row.get(0),
+            )
+            .expect("timestamp before equal retry");
         store
-            .save_provider_cursor("microsoft.mail:account-a", Some("cursor-1"), "cursor-2")
-            .expect("cursor advances");
+            .advance_provider_cursor(STREAM_A, Some(NEXT_CURSOR), NEXT_CURSOR)
+            .expect("equal retry");
+        let after_equal_count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM provider_cursors", [], |row| {
+                row.get(0)
+            })
+            .expect("cursor count after equal retry");
+        let after_equal_timestamp: String = store
+            .connection()
+            .query_row(
+                "SELECT updated_at FROM provider_cursors WHERE provider = ?1",
+                [STREAM_A],
+                |row| row.get(0),
+            )
+            .expect("timestamp after equal retry");
+        assert!(before_equal_count == after_equal_count);
+        assert!(before_equal_timestamp == after_equal_timestamp);
+        assert!(matches!(
+            store.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == NEXT_CURSOR
+        ));
+        assert!(matches!(
+            store.advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), STALE_CURSOR),
+            Err(StoreError::CursorConflict {
+                resource: "provider cursor"
+            })
+        ));
+        assert!(matches!(
+            store.advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), NEXT_CURSOR),
+            Err(StoreError::CursorConflict {
+                resource: "provider cursor"
+            })
+        ));
+        assert!(matches!(
+            store.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == NEXT_CURSOR
+        ));
+    }
+
+    #[test]
+    fn provider_cursor_first_write_and_restart() {
+        let null_store = PaStore::open_in_memory(DATABASE_KEY).expect("open null store");
+        null_store
+            .connection()
+            .execute(
+                "INSERT INTO provider_cursors(provider, cursor) VALUES (?1, NULL)",
+                [STREAM_A],
+            )
+            .expect("insert nullable cursor row");
+        assert!(matches!(
+            null_store.load_provider_cursor(STREAM_A),
+            Ok(None)
+        ));
+        null_store
+            .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("replace nullable cursor");
+        assert!(matches!(
+            null_store.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == FIRST_CURSOR
+        ));
+
+        let database = TempDatabase::new();
+        let store = PaStore::open(&database.path, DATABASE_KEY).expect("open file store");
+        assert!(matches!(store.load_provider_cursor(STREAM_A), Ok(None)));
         store
-            .save_provider_cursor("google.mail:account-a", None, "other-cursor")
-            .expect("save isolated cursor");
+            .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("first file cursor");
+        assert!(matches!(
+            store.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == FIRST_CURSOR
+        ));
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM provider_cursors", [], |row| {
+                row.get(0)
+            })
+            .expect("cursor row count");
+        assert!(count == 1);
+        drop(store);
+
+        let reopened = PaStore::open(&database.path, DATABASE_KEY).expect("reopen file store");
+        assert!(matches!(
+            reopened.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == FIRST_CURSOR
+        ));
+        assert!(matches!(
+            reopened.advance_provider_cursor(STREAM_A, None, NEXT_CURSOR),
+            Err(StoreError::CursorConflict {
+                resource: "provider cursor"
+            })
+        ));
+        let reopened_count: i64 = reopened
+            .connection()
+            .query_row("SELECT count(*) FROM provider_cursors", [], |row| {
+                row.get(0)
+            })
+            .expect("reopened cursor row count");
+        assert!(reopened_count == 1);
+    }
+
+    #[test]
+    fn provider_cursor_two_handles_have_one_winner() {
+        let database = TempDatabase::new();
+        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("open seed store");
+        seed.advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("seed cursor");
+        drop(seed);
+
+        let first = PaStore::open(&database.path, DATABASE_KEY).expect("open first store");
+        let second = PaStore::open(&database.path, DATABASE_KEY).expect("open second store");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_barrier = std::sync::Arc::clone(&barrier);
+        let second_barrier = std::sync::Arc::clone(&barrier);
+        let first_handle = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), NEXT_CURSOR)
+        });
+        let second_handle = std::thread::spawn(move || {
+            second_barrier.wait();
+            second.advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), STALE_CURSOR)
+        });
+        let results = [
+            first_handle.join().expect("first cursor thread"),
+            second_handle.join().expect("second cursor thread"),
+        ];
+        assert!(results.iter().filter(|result| result.is_ok()).count() == 1);
+        assert!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(StoreError::CursorConflict {
+                        resource: "provider cursor"
+                    })
+                ))
+                .count()
+                == 1
+        );
+
+        let reopened = PaStore::open(&database.path, DATABASE_KEY).expect("reopen race store");
+        let current = reopened
+            .load_provider_cursor(STREAM_A)
+            .expect("load race winner");
+        assert!(matches!(
+            current.as_deref(),
+            Some(value) if value == NEXT_CURSOR || value == STALE_CURSOR
+        ));
+        assert!(matches!(
+            reopened.advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), NEXT_CURSOR),
+            Err(StoreError::CursorConflict {
+                resource: "provider cursor"
+            })
+        ));
+        let winner = current.as_deref().expect("race winner value");
+        assert!(
+            reopened
+                .advance_provider_cursor(STREAM_A, Some(winner), winner)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn provider_cursor_invalid_inputs_are_atomic_and_redacted() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        let invalid_streams = vec![
+            String::new(),
+            " ".to_owned(),
+            "stream id".to_owned(),
+            "stream\tid".to_owned(),
+            "stream\nid".to_owned(),
+            "é".to_owned(),
+            "x".repeat(257),
+            format!("{REDACTION_SENTINEL}\n"),
+        ];
+        for stream in invalid_streams {
+            let error = store
+                .load_provider_cursor(&stream)
+                .expect_err("invalid stream must fail");
+            assert!(matches!(error, StoreError::InvalidInput { .. }));
+            assert!(!error.to_string().contains(REDACTION_SENTINEL));
+            assert!(!format!("{error:?}").contains(REDACTION_SENTINEL));
+        }
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM provider_cursors", [], |row| {
+                row.get(0)
+            })
+            .expect("invalid stream row count");
+        assert!(count == 0);
+
+        let printable_stream = "microsoft.mail:account-printable";
+        let printable_cursor = "page=abc/def+ 1";
+        store
+            .advance_provider_cursor(printable_stream, None, printable_cursor)
+            .expect("provider-compatible cursor must persist");
+        assert!(matches!(
+            store.load_provider_cursor(printable_stream),
+            Ok(Some(value)) if value == printable_cursor
+        ));
+
+        store
+            .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("seed cursor");
+        let invalid_expected = vec![
+            Some(String::new()),
+            Some(" ".to_owned()),
+            Some("stream\tid".to_owned()),
+            Some("stream\nid".to_owned()),
+            Some("é".to_owned()),
+            Some("x".repeat(257)),
+            Some(format!("{REDACTION_SENTINEL}\n")),
+        ];
+        for expected in invalid_expected {
+            let error = store
+                .advance_provider_cursor(STREAM_A, expected.as_deref(), NEXT_CURSOR)
+                .expect_err("invalid expected cursor must fail");
+            assert!(matches!(error, StoreError::InvalidInput { .. }));
+            assert!(!error.to_string().contains(REDACTION_SENTINEL));
+            assert!(!format!("{error:?}").contains(REDACTION_SENTINEL));
+            assert!(matches!(
+                store.load_provider_cursor(STREAM_A),
+                Ok(Some(value)) if value == FIRST_CURSOR
+            ));
+        }
+        let invalid_next = vec![
+            String::new(),
+            " ".to_owned(),
+            "stream\tid".to_owned(),
+            "stream\nid".to_owned(),
+            "é".to_owned(),
+            "x".repeat(257),
+            format!("{REDACTION_SENTINEL}\n"),
+        ];
+        for next in invalid_next {
+            let error = store
+                .advance_provider_cursor(STREAM_A, Some(FIRST_CURSOR), &next)
+                .expect_err("invalid next cursor must fail");
+            assert!(matches!(error, StoreError::InvalidInput { .. }));
+            assert!(!error.to_string().contains(REDACTION_SENTINEL));
+            assert!(!format!("{error:?}").contains(REDACTION_SENTINEL));
+        }
+        assert!(matches!(
+            store.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == FIRST_CURSOR
+        ));
+
+        let corrupt = PaStore::open_in_memory(DATABASE_KEY).expect("open corrupt store");
+        corrupt
+            .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("seed corrupt store");
+        corrupt
+            .connection()
+            .execute(
+                "UPDATE provider_cursors SET cursor = ?1 WHERE provider = ?2",
+                rusqlite::params![format!("{REDACTION_SENTINEL}\n"), STREAM_A],
+            )
+            .expect("corrupt cursor fixture");
+        let error = corrupt
+            .load_provider_cursor(STREAM_A)
+            .expect_err("corrupt cursor must fail closed");
+        assert!(matches!(
+            error,
+            StoreError::StoredRecordInvalid {
+                resource: "provider cursor"
+            }
+        ));
+        assert!(!error.to_string().contains(REDACTION_SENTINEL));
+        assert!(!format!("{error:?}").contains(REDACTION_SENTINEL));
+    }
+
+    #[test]
+    fn provider_cursor_streams_are_isolated() {
+        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
+        assert!(matches!(store.load_provider_cursor(STREAM_A), Ok(None)));
+        assert!(matches!(store.load_provider_cursor(STREAM_B), Ok(None)));
+        store
+            .advance_provider_cursor(STREAM_A, None, FIRST_CURSOR)
+            .expect("stream A cursor");
+        store
+            .advance_provider_cursor(STREAM_B, None, FIRST_CURSOR)
+            .expect("stream B cursor");
 
         let count: i64 = store
             .connection()
@@ -13461,55 +15037,21 @@ END;
                 row.get(0)
             })
             .expect("cursor count");
-        assert_eq!(count, 2);
-        assert_eq!(
-            store
-                .load_provider_cursor("microsoft.mail:account-a")
-                .expect("load cursor"),
-            "cursor-2"
-        );
-        let before_retry: String = store
-            .connection()
-            .query_row(
-                "SELECT updated_at FROM provider_cursors WHERE provider = 'microsoft.mail:account-a'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("timestamp before retry");
-        store
-            .save_provider_cursor("microsoft.mail:account-a", Some("cursor-2"), "cursor-2")
-            .expect("identical retry");
-        let after_retry: String = store
-            .connection()
-            .query_row(
-                "SELECT updated_at FROM provider_cursors WHERE provider = 'microsoft.mail:account-a'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("timestamp after retry");
-        assert_eq!(before_retry, after_retry);
+        assert!(count == 2);
         assert!(matches!(
-            store.save_provider_cursor("microsoft.mail:account-a", Some("cursor-1"), "cursor-1",),
+            store.load_provider_cursor(STREAM_A),
+            Ok(Some(value)) if value == FIRST_CURSOR
+        ));
+        assert!(matches!(
+            store.load_provider_cursor(STREAM_B),
+            Ok(Some(value)) if value == FIRST_CURSOR
+        ));
+        assert!(matches!(
+            store.advance_provider_cursor(STREAM_A, None, NEXT_CURSOR),
             Err(StoreError::CursorConflict { .. })
         ));
-        assert_eq!(
-            store
-                .load_provider_cursor("microsoft.mail:account-a")
-                .expect("stale retry leaves newer cursor"),
-            "cursor-2"
-        );
-        store
-            .delete_provider_cursor("microsoft.mail:account-a")
-            .expect("delete cursor");
-        assert!(matches!(
-            store.load_provider_cursor("microsoft.mail:account-a"),
-            Err(StoreError::NotFound { .. })
-        ));
-        assert_eq!(
-            store
-                .load_provider_cursor("google.mail:account-a")
-                .expect("isolated cursor remains"),
-            "other-cursor"
+        assert!(
+            matches!(store.load_provider_cursor(STREAM_B), Ok(Some(value)) if value == FIRST_CURSOR)
         );
     }
 
@@ -13563,24 +15105,6 @@ END;
                 Err(StoreError::InvalidInput { .. })
             ));
         }
-    }
-
-    #[test]
-    fn provider_cursor_initial_compare_and_set_rejects_a_race() {
-        let store = PaStore::open_in_memory(DATABASE_KEY).expect("open store");
-        store
-            .save_provider_cursor("microsoft.mail:account-a", None, "cursor-1")
-            .expect("first insert");
-        assert!(matches!(
-            store.save_provider_cursor("microsoft.mail:account-a", None, "cursor-2"),
-            Err(StoreError::CursorConflict { .. })
-        ));
-        assert_eq!(
-            store
-                .load_provider_cursor("microsoft.mail:account-a")
-                .expect("cursor remains"),
-            "cursor-1"
-        );
     }
 
     fn draft_time() -> OffsetDateTime {
@@ -21213,6 +22737,112 @@ END;
         assert!(super::validate_http_idempotency_key(&key_boundary).is_ok());
 
         assert!(super::validate_http_idempotency_fingerprint(VALID_HTTP_FINGERPRINT).is_ok());
+    }
+
+    #[test]
+    fn http_idempotency_response_new_accepts_valid_json() {
+        let body = br#"{"ok":true,"items":[1,2]}"#.to_vec();
+        let response =
+            super::HttpIdempotencyResponse::new(201, body.clone()).expect("valid response");
+
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.content_type(), "application/json");
+        assert_eq!(response.body(), body.as_slice());
+        assert_eq!(response, response.clone());
+    }
+
+    #[test]
+    fn http_idempotency_response_boundary_matrix() {
+        let shortest = b"0".to_vec();
+        for status in [200, 599] {
+            let response = super::HttpIdempotencyResponse::new(status, shortest.clone())
+                .expect("status boundary is accepted");
+            assert_eq!(response.status(), status);
+            assert_eq!(response.body(), shortest.as_slice());
+        }
+        for status in [199, 600] {
+            assert!(super::HttpIdempotencyResponse::new(status, shortest.clone()).is_err());
+        }
+
+        assert!(super::HttpIdempotencyResponse::new(200, Vec::new()).is_err());
+
+        let mut exact_limit = Vec::with_capacity(super::MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES);
+        exact_limit.push(b'"');
+        exact_limit.extend(std::iter::repeat_n(
+            b'a',
+            super::MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES - 2,
+        ));
+        exact_limit.push(b'"');
+        assert_eq!(
+            exact_limit.len(),
+            super::MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES
+        );
+        let response = super::HttpIdempotencyResponse::new(200, exact_limit.clone())
+            .expect("exact byte limit is accepted");
+        assert_eq!(response.body(), exact_limit.as_slice());
+
+        let mut over_limit = exact_limit;
+        over_limit.insert(1, b'a');
+        assert_eq!(
+            over_limit.len(),
+            super::MAX_HTTP_IDEMPOTENCY_RESPONSE_BYTES + 1
+        );
+        assert!(super::HttpIdempotencyResponse::new(200, over_limit).is_err());
+    }
+
+    #[test]
+    fn http_idempotency_response_preserves_exact_bytes() {
+        let body = b" {\"z\":1e+2,\"message\":\"caf\xc3\xa9\",\"a\":[true,null]} \n".to_vec();
+        let response =
+            super::HttpIdempotencyResponse::new(202, body.clone()).expect("valid response");
+
+        assert_eq!(response.status(), 202);
+        assert_eq!(response.content_type(), "application/json");
+        assert_eq!(response.body(), body.as_slice());
+    }
+
+    #[test]
+    fn http_idempotency_response_rejects_invalid_utf8_and_json() {
+        let invalid_bodies = [
+            vec![0x7b, 0xff, 0x7d],
+            br#"{"ok":}"#.to_vec(),
+            b"{".to_vec(),
+            b"0x".to_vec(),
+            b" ".to_vec(),
+        ];
+
+        for body in invalid_bodies {
+            assert!(super::HttpIdempotencyResponse::new(200, body).is_err());
+        }
+    }
+
+    #[test]
+    fn http_idempotency_response_debug_is_redacted() {
+        let response = super::HttpIdempotencyResponse::new(
+            418,
+            br#"{"debug":"debug-body-sentinel-7d1b"} "#.to_vec(),
+        )
+        .expect("valid response");
+        let debug = format!("{response:?}");
+
+        assert!(debug.contains("HttpIdempotencyResponse"));
+        assert!(debug.contains("418"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("debug-body-sentinel-7d1b"));
+    }
+
+    #[test]
+    fn http_idempotency_response_errors_are_redacted() {
+        let error = super::HttpIdempotencyResponse::new(
+            199,
+            br#"{"secret":"error-body-sentinel-7d1b"}"#.to_vec(),
+        )
+        .expect_err("invalid status");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+
+        assert!(!display.contains("error-body-sentinel-7d1b"));
+        assert!(!debug.contains("error-body-sentinel-7d1b"));
     }
 
     #[test]

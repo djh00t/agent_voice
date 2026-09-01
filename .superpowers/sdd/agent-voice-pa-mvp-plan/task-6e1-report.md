@@ -5,11 +5,13 @@
 - **Feature:** [#138](https://github.com/djh00t/agent_voice/issues/138)
 - **Prerequisite:** merged [#210](https://github.com/djh00t/agent_voice/issues/210)
 - **Package:** `task-6e1`
-- **Evidence date:** 2026-08-31 (Australia/Sydney)
-- **Worktree:** `/private/tmp/agent-voice-pa-06e1-owner-prepare`
-- **Branch:** `codex/agent-voice-pa-06e1-owner-prepare`
-- **Base:** `76e8df4` (current `origin/main`)
-- **Implementation commit:** `260e501` (rebased onto the current base)
+- **Evidence date:** 2026-09-01 (Australia/Sydney)
+- **Worktree:** `/private/tmp/agent-voice-issue-323`
+- **Branch:** `codex/issue-323`
+- **Current base:** `a20a28be3be37c84cbe5046415497b7053dd8906` (`origin/main` and GitHub `main`)
+- **Implementation commit:** `260e501` (historical PR #248 implementation commit)
+- **PR #248 final head:** `f47abfc0eaeb8254082f4b9c2ad9e87fc26d92dd`
+- **PR #248 merge commit:** `ef12c79479e9b3d841fcaeec7e8f7d8f2de248cb`
 
 ## Scope
 
@@ -42,7 +44,11 @@ The package does not modify stores, migrations, providers, fakes, HTTP/voice
 routing, OAuth/Graph adapters, deployment, dependencies, or live-provider
 configuration.
 
-## RED evidence
+## Historical RED evidence (LOCAL implementation history)
+
+The following RED observation was captured during the original #212
+implementation, before PR #248 merged. It is retained as historical evidence
+and was not rerun for this documentation-only reconciliation.
 
 The first focused test was written before the owner capability implementation:
 
@@ -75,7 +81,12 @@ typo or unrelated baseline error.
 | Legacy fingerprint fails closed | `prepare_owner_task_rejects_legacy_fingerprint_without_overwriting_it` | PASS |
 | Concurrent identical prepares converge | `concurrent_identical_owner_prepares_converge_to_one_stable_aggregate` | PASS |
 
-## GREEN evidence (LOCAL)
+## Historical GREEN evidence (LOCAL implementation history)
+
+The following results were captured during the original #212 implementation
+before PR #248 merged. They are preserved as historical LOCAL evidence only;
+this report-only reconciliation does not reinterpret them as current CI or
+live-provider evidence.
 
 | Check | Result |
 | --- | --- |
@@ -115,15 +126,40 @@ moderate, 17 high). This package makes no dependency changes.
 - No Outlook, Google, SIP, OAuth, network, or live-provider behavior was
   exercised by this package.
 
+## Current GitHub/main and CI evidence
+
+GitHub API readback and the local remote-tracking ref both resolve `main` to
+`a20a28be3be37c84cbe5046415497b7053dd8906`. Local ancestry verification
+confirms that PR #248's merge commit `ef12c79479e9b3d841fcaeec7e8f7d8f2de248cb`
+is an ancestor of that current `origin/main`. GitHub records PR #248 as
+`MERGED` at `2026-08-31T09:01:15Z`, with final PR head
+`f47abfc0eaeb8254082f4b9c2ad9e87fc26d92dd` and merge commit
+`ef12c79479e9b3d841fcaeec7e8f7d8f2de248cb`.
+
+Current checks for main commit `a20a28be3be37c84cbe5046415497b7053dd8906`
+are:
+
+| Workflow / run | Observed result |
+| --- | --- |
+| [CI run 33397442809](https://github.com/djh00t/agent_voice/actions/runs/33397442809) | PASS — Quality Gates and Compose Config |
+| [CodeQL run 33397442727](https://github.com/djh00t/agent_voice/actions/runs/33397442727) | PASS — Rust and JavaScript/TypeScript analysis |
+| [Container run 33397442646](https://github.com/djh00t/agent_voice/actions/runs/33397442646) | FAIL — Publish Image passed; Deploy tv04 failed during the health check |
+
+The Container failure log reports `agent_api.oauth.microsoft.client_id must
+not be blank` after the runtime started, so this report makes no successful
+deployment claim. Current main is therefore not an all-green workflow set.
+
 ## Non-claims and residual gates
 
-- Evidence is LOCAL/controller plus independent final review. This report does
-  not claim deployment, publication, authenticated UAT, or live-provider
-  evidence.
+- Historical implementation evidence is LOCAL/controller plus independent
+  final review. Current GitHub/main workflow results are recorded above. This
+  report does not claim a successful deployment, authenticated UAT, or
+  live-provider evidence.
 - Independent final review: SPEC PASS and QUALITY PASS, with no residual P0-P3
   findings.
-- The later owner-task submission/provider package remains responsible for
-  consuming this projection and performing any external calendar mutation.
+- The later owner-task submission/provider package was delivered by merged PR
+  [#294](https://github.com/djh00t/agent_voice/pull/294); this report remains
+  preparation-only and does not claim that package's provider-side evidence.
 - Rollback is a code revert of `260e501`; no database deletion or remote
   provider cleanup is inferred or attempted.
 
@@ -131,9 +167,11 @@ moderate, 17 high). This package makes no dependency changes.
 
 - **Implementer:** delegated service lane for #212
 - **Implementation commit:** `260e501`
-- **Report commit:** added separately after implementation
-- **PR/push:** pending controller publication
+- **PR #248:** merged at `ef12c79`; issue #212 is CLOSED.
+- **Report update:** this file is the sole owned path for the #323
+  reconciliation; its delivery PR closes #323 and references #182, #212, and
+  #248.
 - **Reviewer:** independent final review complete — SPEC PASS, QUALITY PASS,
   no residual P0-P3 findings
-- **Residual gates:** controller publication, deployment, authenticated UAT,
-  and live-provider verification
+- **Residual gates:** deployment, authenticated UAT, and live-provider
+  verification remain unproven; current main's tv04 deployment check failed.
