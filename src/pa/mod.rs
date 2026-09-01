@@ -4,6 +4,8 @@ pub mod admin_config;
 pub mod admin_store;
 pub mod auth;
 pub mod availability;
+#[allow(dead_code)]
+mod backup;
 pub mod crypto;
 pub mod domain;
 pub mod http;
