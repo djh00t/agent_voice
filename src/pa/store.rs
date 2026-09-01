@@ -7,7 +7,9 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use chrono_tz::Tz;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -643,7 +645,7 @@ impl fmt::Debug for StoredTask {
     }
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 15;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 15;
 const BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 struct Migration {
@@ -2132,7 +2134,27 @@ impl PaStore {
         let key = database_key.as_ref();
         reject_empty_key(key)?;
         let mut connection = Connection::open(path)?;
-        initialize(&mut connection, key, true)?;
+        initialize(&mut connection, key, true, true)?;
+        Ok(Self { connection })
+    }
+
+    /// Opens an existing encrypted file-backed store without running migrations.
+    #[allow(dead_code)]
+    pub(crate) fn open_existing<P, K>(path: P, database_key: K) -> StoreResult<Self>
+    where
+        P: AsRef<Path>,
+        K: AsRef<[u8]>,
+    {
+        let key = database_key.as_ref();
+        reject_empty_key(key)?;
+        let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|_| StoreError::NotFound {
+            resource: "database",
+        })?;
+        initialize(&mut connection, key, false, false)?;
+        connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
         Ok(Self { connection })
     }
 
@@ -2144,7 +2166,7 @@ impl PaStore {
         let key = database_key.as_ref();
         reject_empty_key(key)?;
         let mut connection = Connection::open_in_memory()?;
-        initialize(&mut connection, key, false)?;
+        initialize(&mut connection, key, false, true)?;
         Ok(Self { connection })
     }
 
@@ -6986,7 +7008,12 @@ fn reject_empty_key(key: &[u8]) -> StoreResult<()> {
     Ok(())
 }
 
-fn initialize(connection: &mut Connection, key: &[u8], file_store: bool) -> StoreResult<()> {
+fn initialize(
+    connection: &mut Connection,
+    key: &[u8],
+    file_store: bool,
+    migrate: bool,
+) -> StoreResult<()> {
     apply_sqlcipher_key(connection, key)?;
     verify_sqlcipher(connection)?;
     connection.pragma_update(None, "recursive_triggers", true)?;
@@ -7003,7 +7030,10 @@ fn initialize(connection: &mut Connection, key: &[u8], file_store: bool) -> Stor
         }
     }
 
-    run_migrations(connection)
+    if migrate {
+        run_migrations(connection)?;
+    }
+    Ok(())
 }
 
 fn apply_sqlcipher_key(connection: &Connection, key: &[u8]) -> StoreResult<()> {
@@ -8293,12 +8323,12 @@ mod tests {
     };
 
     use super::{
-        AuditEntityType, AuditEventType, CURRENT_SCHEMA_VERSION, MAX_APPOINTMENT_QUOTE_SLOTS,
-        MAX_AUDIT_ENTITY_ID_LENGTH, MAX_AUDIT_LIST_LIMIT, MAX_MESSAGE_ID_LENGTH,
-        MAX_MESSAGE_LIST_LIMIT, MAX_MESSAGE_SENDER_LENGTH, MAX_MESSAGE_SUBJECT_LENGTH,
-        MAX_MESSAGE_SUMMARY_LENGTH, MAX_TASK_DURATION_MINUTES, MAX_TASK_ID_LENGTH,
-        MAX_TASK_TITLE_LENGTH, MIGRATIONS, MessageProvider, MessageSummary, MessageTriageState,
-        Migration, NotificationKind, NotificationRecipient, NotificationStatus,
+        AuditEntityType, AuditEventType, BUSY_TIMEOUT, CURRENT_SCHEMA_VERSION,
+        MAX_APPOINTMENT_QUOTE_SLOTS, MAX_AUDIT_ENTITY_ID_LENGTH, MAX_AUDIT_LIST_LIMIT,
+        MAX_MESSAGE_ID_LENGTH, MAX_MESSAGE_LIST_LIMIT, MAX_MESSAGE_SENDER_LENGTH,
+        MAX_MESSAGE_SUBJECT_LENGTH, MAX_MESSAGE_SUMMARY_LENGTH, MAX_TASK_DURATION_MINUTES,
+        MAX_TASK_ID_LENGTH, MAX_TASK_TITLE_LENGTH, MIGRATIONS, MessageProvider, MessageSummary,
+        MessageTriageState, Migration, NotificationKind, NotificationRecipient, NotificationStatus,
         NotificationTemplateData, OAuthCredential, PaStore, ProposalSource, StoreError,
         StoreResult, StoredAppointmentDraft, StoredAppointmentQuote, StoredAppointmentQuoteState,
         StoredMessage, StoredProposal, StoredTask, StoredTaskState, TaskTitle, apply_sqlcipher_key,
@@ -8608,6 +8638,106 @@ END;
     fn empty_database_key_is_rejected() {
         let error = PaStore::open_in_memory([]).expect_err("empty key must fail");
         assert!(error.to_string().contains("database key"));
+    }
+
+    #[test]
+    fn restore_open_existing_contract() {
+        assert_eq!(
+            MIGRATIONS.last().map(|migration| migration.version),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+
+        let absent = TempDatabase::new();
+        let absent_error = PaStore::open_existing(&absent.path, DATABASE_KEY)
+            .expect_err("an absent restore database must not be created");
+        assert!(!absent.path.exists(), "absent restore database was created");
+        assert!(!absent_error.to_string().contains("agent_voice_pa_store_"));
+
+        let removed = TempDatabase::new();
+        let removed_store =
+            PaStore::open(&removed.path, DATABASE_KEY).expect("seed removable store");
+        drop(removed_store);
+        remove_database_files(&removed.path);
+        let removed_error = PaStore::open_existing(&removed.path, DATABASE_KEY)
+            .expect_err("a removed restore database must not be recreated");
+        assert!(
+            !removed.path.exists(),
+            "removed restore database was recreated"
+        );
+        assert!(!removed_error.to_string().contains("agent_voice_pa_store_"));
+
+        let current = TempDatabase::new();
+        let seeded = PaStore::open(&current.path, DATABASE_KEY).expect("seed current fixture");
+        let schema_version: i64 = seeded
+            .connection()
+            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("current schema version");
+        assert_eq!(schema_version, CURRENT_SCHEMA_VERSION);
+        drop(seeded);
+
+        let restored = PaStore::open_existing(&current.path, DATABASE_KEY)
+            .expect("current SQLCipher fixture opens without migration");
+        let foreign_keys: i64 = restored
+            .connection()
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign key setting");
+        assert_eq!(foreign_keys, 1);
+        let busy_timeout: i64 = restored
+            .connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy timeout setting");
+        assert_eq!(busy_timeout, BUSY_TIMEOUT.as_millis() as i64);
+        assert_eq!(
+            restored
+                .connection()
+                .query_row("SELECT count(*) FROM configuration", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("current fixture query"),
+            1
+        );
+        drop(restored);
+
+        let wrong_key = b"restore-open-existing-wrong-key";
+        let wrong_key_error = PaStore::open_existing(&current.path, wrong_key)
+            .expect_err("wrong restore key must fail");
+        assert!(
+            !wrong_key_error
+                .to_string()
+                .contains("restore-open-existing-wrong-key")
+        );
+
+        let older = TempDatabase::new();
+        let mut older_connection = Connection::open(&older.path).expect("open older fixture");
+        apply_sqlcipher_key(&older_connection, DATABASE_KEY).expect("apply SQLCipher key");
+        verify_sqlcipher(&older_connection).expect("verify SQLCipher");
+        let older_schema_version = CURRENT_SCHEMA_VERSION - 1;
+        run_migrations_with(
+            &mut older_connection,
+            &MIGRATIONS[..older_schema_version as usize],
+        )
+        .expect("apply older schema");
+        let older_journal_mode: String = older_connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("older journal mode");
+        drop(older_connection);
+
+        let older_restored = PaStore::open_existing(&older.path, DATABASE_KEY)
+            .expect("older schema opens without migration");
+        let older_version: i64 = older_restored
+            .connection()
+            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("older schema version");
+        assert_eq!(older_version, older_schema_version);
+        assert_ne!(older_version, CURRENT_SCHEMA_VERSION);
+        let restored_journal_mode: String = older_restored
+            .connection()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("restored journal mode");
+        assert_eq!(restored_journal_mode, older_journal_mode);
     }
 
     #[test]
