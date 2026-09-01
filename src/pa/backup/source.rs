@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 #[cfg(unix)]
@@ -8,6 +9,8 @@ use std::time::Duration;
 
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OpenFlags, backup::Backup};
+#[cfg(unix)]
+use rustix::{fs as rustix_fs, process};
 
 use crate::pa::store::{PaStore, StoreError, StoreResult};
 
@@ -20,20 +23,19 @@ static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Construction never creates a directory or chooses a system temporary path:
 /// deployment supplies the already-isolated lifecycle mount.
 pub(crate) struct LifecycleWorkspace {
-    root: PathBuf,
+    directory: File,
 }
 
 impl LifecycleWorkspace {
     pub(crate) fn from_private_root(root: impl AsRef<Path>) -> StoreResult<Self> {
-        let root = root.as_ref();
-        validate_workspace_root(root)?;
         Ok(Self {
-            root: root.to_owned(),
+            directory: open_private_workspace(root.as_ref())?,
         })
     }
 
-    fn allocate_attempt_path(&self) -> StoreResult<PathBuf> {
-        opaque_sibling_attempt_path(&self.root)
+    fn allocate_attempt_name(&self) -> StoreResult<OsString> {
+        let _ = &self.directory;
+        opaque_attempt_name()
     }
 }
 
@@ -298,20 +300,30 @@ fn trusted_attempt_parent(_destination: &Path) -> StoreResult<&Path> {
 }
 
 #[cfg(unix)]
-fn validate_workspace_root(root: &Path) -> StoreResult<()> {
-    let metadata = fs::symlink_metadata(root).map_err(|_| backup_error())?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.permissions().mode() & 0o022 != 0
+fn open_private_workspace(root: &Path) -> StoreResult<File> {
+    let directory = File::open(root).map_err(|_| backup_error())?;
+    let handle_metadata = directory.metadata().map_err(|_| backup_error())?;
+    let path_metadata = fs::symlink_metadata(root).map_err(|_| backup_error())?;
+    let stat = rustix_fs::fstat(&directory).map_err(|_| backup_error())?;
+    if !handle_metadata.is_dir()
+        || handle_metadata.dev() != path_metadata.dev()
+        || handle_metadata.ino() != path_metadata.ino()
+        || stat.st_mode & 0o022 != 0
+        || !workspace_owner_matches_effective_uid(stat.st_uid, process::geteuid().as_raw())
     {
         return Err(backup_error());
     }
-    Ok(())
+    Ok(directory)
 }
 
 #[cfg(not(unix))]
-fn validate_workspace_root(_root: &Path) -> StoreResult<()> {
+fn open_private_workspace(_root: &Path) -> StoreResult<File> {
     Err(backup_error())
+}
+
+#[cfg(unix)]
+fn workspace_owner_matches_effective_uid(root_uid: u32, effective_uid: u32) -> bool {
+    root_uid == effective_uid
 }
 
 fn ensure_destination_absent(destination: &Path) -> StoreResult<()> {
@@ -325,12 +337,16 @@ fn ensure_destination_absent(destination: &Path) -> StoreResult<()> {
 }
 
 fn opaque_sibling_attempt_path(parent: &Path) -> StoreResult<PathBuf> {
+    Ok(parent.join(opaque_attempt_name()?))
+}
+
+fn opaque_attempt_name() -> StoreResult<OsString> {
     let mut nonce = [0_u8; 16];
     SystemRandom::new()
         .fill(&mut nonce)
         .map_err(|_| backup_error())?;
     let sequence = ATTEMPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    Ok(parent.join(format!(
+    Ok(OsString::from(format!(
         "{ATTEMPT_FILE_PREFIX}{}-{sequence}-{}.db",
         std::process::id(),
         hex_encode(&nonce)
@@ -357,7 +373,7 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(all(test, unix))]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
 
     use ring::rand::{SecureRandom, SystemRandom};
@@ -654,10 +670,13 @@ mod tests {
         let workspace = super::LifecycleWorkspace::from_private_root(&destination.directory)
             .expect("private fixture directory is a workspace root");
         let attempt = workspace
-            .allocate_attempt_path()
-            .expect("allocate opaque workspace attempt");
-        assert_eq!(attempt.parent(), Some(destination.directory.as_path()));
-        assert_ne!(attempt, destination.path);
+            .allocate_attempt_name()
+            .expect("allocate opaque workspace attempt name");
+        assert!(
+            attempt
+                .to_string_lossy()
+                .starts_with(super::ATTEMPT_FILE_PREFIX)
+        );
 
         let missing = destination.sibling("missing-secret-workspace-root");
         let error = match super::LifecycleWorkspace::from_private_root(&missing) {
@@ -670,7 +689,7 @@ mod tests {
         ));
         assert!(!error.to_string().contains("secret-workspace-root"));
 
-        let not_directory = destination.sibling("not-a-directory");
+        let not_directory = destination.sibling("not-a-secret-workspace-root");
         fs::write(&not_directory, b"not a workspace root").expect("create non-directory root");
         let error = match super::LifecycleWorkspace::from_private_root(&not_directory) {
             Ok(_) => panic!("non-directory root must fail closed"),
@@ -680,6 +699,7 @@ mod tests {
             error,
             StoreError::StoredRecordInvalid { resource: "backup" }
         ));
+        assert!(!error.to_string().contains("secret-workspace-root"));
         fs::remove_file(&not_directory).expect("remove non-directory root");
 
         let symlink_root = destination.sibling("workspace-root-symlink");
@@ -707,6 +727,36 @@ mod tests {
             unsafe_error,
             StoreError::StoredRecordInvalid { resource: "backup" }
         ));
+    }
+
+    #[test]
+    fn lifecycle_workspace_pins_the_validated_directory_handle() {
+        let destination = TempDestination::new("lifecycle-pinned-root");
+        let workspace = super::LifecycleWorkspace::from_private_root(&destination.directory)
+            .expect("construct workspace from private root");
+        let relocated = destination.directory.with_extension("relocated-root");
+        fs::rename(&destination.directory, &relocated).expect("relocate private root");
+        let replacement = fs::DirBuilder::new();
+        replacement
+            .create(&destination.directory)
+            .expect("create replacement root");
+
+        let pinned = workspace
+            .directory
+            .metadata()
+            .expect("read pinned root metadata");
+        let relocated_metadata = fs::metadata(&relocated).expect("read relocated root metadata");
+        assert_eq!(pinned.dev(), relocated_metadata.dev());
+        assert_eq!(pinned.ino(), relocated_metadata.ino());
+
+        fs::remove_dir(&destination.directory).expect("remove replacement root");
+        fs::rename(&relocated, &destination.directory).expect("restore fixture root");
+    }
+
+    #[test]
+    fn lifecycle_workspace_requires_service_owner() {
+        assert!(super::workspace_owner_matches_effective_uid(42, 42));
+        assert!(!super::workspace_owner_matches_effective_uid(42, 41));
     }
 
     #[test]
