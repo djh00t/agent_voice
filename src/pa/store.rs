@@ -2147,8 +2147,19 @@ impl PaStore {
     {
         let key = database_key.as_ref();
         reject_empty_key(key)?;
-        let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|_| StoreError::NotFound {
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Err(StoreError::NotFound {
+                resource: "database",
+            });
+        }
+        reject_sqlite_sidecars(path)?;
+        let immutable_uri = immutable_read_only_uri(path)?;
+        let mut connection = Connection::open_with_flags(
+            immutable_uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|_| StoreError::NotFound {
             resource: "database",
         })?;
         initialize(&mut connection, key, false, false)?;
@@ -7008,6 +7019,143 @@ fn reject_empty_key(key: &[u8]) -> StoreResult<()> {
     Ok(())
 }
 
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut sidecar_path = path.as_os_str().to_os_string();
+    sidecar_path.push(suffix);
+    sidecar_path.into()
+}
+
+fn reject_sqlite_sidecars(path: &Path) -> StoreResult<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        match std::fs::symlink_metadata(sqlite_sidecar_path(path, suffix)) {
+            Ok(_) => {
+                return Err(StoreError::NotFound {
+                    resource: "database",
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(StoreError::NotFound {
+                    resource: "database",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn immutable_read_only_uri(path: &Path) -> StoreResult<String> {
+    #[cfg(unix)]
+    let path_bytes = {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(windows)]
+    let normalized_path = {
+        let path_text = path.to_str().ok_or(StoreError::NotFound {
+            resource: "database",
+        })?;
+        let path_bytes = path_text.as_bytes();
+        if path_bytes.get(1) == Some(&b':')
+            && !matches!(path_bytes.get(2), Some(b'/') | Some(b'\\'))
+        {
+            return Err(StoreError::NotFound {
+                resource: "database",
+            });
+        }
+        path.canonicalize()
+            .map_err(|_| StoreError::NotFound {
+                resource: "database",
+            })?
+            .to_str()
+            .ok_or(StoreError::NotFound {
+                resource: "database",
+            })?
+            .replace('\\', "/")
+    };
+    #[cfg(windows)]
+    let path_bytes = normalized_path.as_bytes();
+    #[cfg(not(any(unix, windows)))]
+    let path_text = path.to_str().ok_or(StoreError::NotFound {
+        resource: "database",
+    })?;
+    #[cfg(not(any(unix, windows)))]
+    let path_bytes = path_text.as_bytes();
+
+    #[cfg(windows)]
+    let is_windows_path = true;
+    #[cfg(not(windows))]
+    let is_windows_path = false;
+
+    immutable_read_only_uri_for_path_bytes(path_bytes, is_windows_path, {
+        #[cfg(windows)]
+        {
+            true
+        }
+        #[cfg(not(windows))]
+        {
+            path.is_absolute()
+        }
+    })
+}
+
+fn immutable_read_only_uri_for_path_bytes(
+    path_bytes: &[u8],
+    is_windows_path: bool,
+    is_absolute: bool,
+) -> StoreResult<String> {
+    if is_windows_path && !is_absolute {
+        return Err(StoreError::NotFound {
+            resource: "database",
+        });
+    }
+    let path_bytes = if is_windows_path && path_bytes.starts_with(b"//?/") {
+        let drive_path = &path_bytes[4..];
+        if drive_path.len() < 3
+            || !drive_path[0].is_ascii_alphabetic()
+            || drive_path[1] != b':'
+            || drive_path[2] != b'/'
+        {
+            return Err(StoreError::NotFound {
+                resource: "database",
+            });
+        }
+        drive_path
+    } else {
+        path_bytes
+    };
+    if is_windows_path && (path_bytes.starts_with(b"//") || path_bytes.starts_with(b"\\\\")) {
+        return Err(StoreError::NotFound {
+            resource: "database",
+        });
+    }
+    let mut uri = String::from("file:");
+    if is_windows_path && is_absolute {
+        uri.push_str("///");
+    }
+    if !is_windows_path && path_bytes.starts_with(b"//") {
+        uri.push_str("//");
+    }
+    append_uri_path_bytes(&mut uri, path_bytes);
+    uri.push_str("?immutable=1");
+    Ok(uri)
+}
+
+fn append_uri_path_bytes(uri: &mut String, path_bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    for &byte in path_bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push(char::from(HEX[(byte >> 4) as usize]));
+            uri.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+}
+
 fn initialize(
     connection: &mut Connection,
     key: &[u8],
@@ -8373,8 +8521,56 @@ mod tests {
 
     fn remove_database_files(path: &Path) {
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
-        let _ = fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let sidecar = super::sqlite_sidecar_path(path, suffix);
+            let _ = fs::remove_file(&sidecar);
+            let _ = fs::remove_dir(&sidecar);
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct EntrySnapshot {
+        exists: bool,
+        regular: bool,
+        directory: bool,
+        symlink: bool,
+        bytes: Option<Vec<u8>>,
+    }
+
+    fn entry_snapshot(path: &Path) -> EntrySnapshot {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                EntrySnapshot {
+                    exists: true,
+                    regular: file_type.is_file(),
+                    directory: file_type.is_dir(),
+                    symlink: file_type.is_symlink(),
+                    bytes: fs::read(path).ok(),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => EntrySnapshot {
+                exists: false,
+                regular: false,
+                directory: false,
+                symlink: false,
+                bytes: None,
+            },
+            Err(error) => panic!("snapshot restore entry: {error}"),
+        }
+    }
+
+    fn restore_entry_snapshots(path: &Path) -> [EntrySnapshot; 4] {
+        ["", "-wal", "-shm", "-journal"].map(|suffix| {
+            entry_snapshot(
+                if suffix.is_empty() {
+                    path.to_path_buf()
+                } else {
+                    super::sqlite_sidecar_path(path, suffix)
+                }
+                .as_path(),
+            )
+        })
     }
 
     fn random_replay_nonce() -> String {
@@ -8641,6 +8837,46 @@ END;
     }
 
     #[test]
+    fn immutable_uri_rejects_non_absolute_windows_path() {
+        let error = super::immutable_read_only_uri_for_path_bytes(b"C:restore.db", true, false)
+            .expect_err("drive-relative Windows paths must fail closed");
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+    }
+
+    #[test]
+    fn immutable_uri_rejects_unc_windows_path() {
+        let error =
+            super::immutable_read_only_uri_for_path_bytes(b"//server/share/restore.db", true, true)
+                .expect_err("UNC Windows paths must fail closed");
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+    }
+
+    #[test]
+    fn immutable_uri_normalizes_extended_absolute_drive_path() {
+        let uri = super::immutable_read_only_uri_for_path_bytes(b"//?/C:/restore.db", true, true)
+            .expect("extended drive path is an absolute Windows path");
+        assert_eq!(uri, "file:///C:/restore.db?immutable=1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_uri_preserves_unix_double_slash_path_as_uri_path_data() {
+        let uri = super::immutable_read_only_uri_for_path_bytes(b"//tmp/candidate.db", false, true)
+            .expect("Unix double-slash absolute path is valid");
+        assert_eq!(uri, "file:////tmp/candidate.db?immutable=1");
+    }
+
+    #[test]
     fn restore_open_existing_contract() {
         assert_eq!(
             MIGRATIONS.last().map(|migration| migration.version),
@@ -8738,6 +8974,155 @@ END;
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .expect("restored journal mode");
         assert_eq!(restored_journal_mode, older_journal_mode);
+    }
+
+    #[test]
+    fn restore_open_existing_preserves_sidecar_free_current_snapshot() {
+        let database = TempDatabase::new();
+        let seeded = PaStore::open(&database.path, DATABASE_KEY).expect("seed current fixture");
+        drop(seeded);
+
+        let before = restore_entry_snapshots(&database.path);
+        assert!(before[0].regular, "database fixture must be a regular file");
+        assert!(before[1..].iter().all(|entry| !entry.exists));
+
+        let restored = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect("sidecar-free current snapshot opens");
+        assert_eq!(
+            restored
+                .connection()
+                .query_row("SELECT count(*) FROM configuration", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("current fixture query"),
+            1
+        );
+        drop(restored);
+
+        assert_eq!(restore_entry_snapshots(&database.path), before);
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_wal_and_shm_sidecars_without_mutation() {
+        for suffix in ["-wal", "-shm"] {
+            let database = TempDatabase::new();
+            let seeded = PaStore::open(&database.path, DATABASE_KEY).expect("seed sidecar fixture");
+            drop(seeded);
+
+            fs::write(
+                super::sqlite_sidecar_path(&database.path, suffix),
+                b"sidecar fixture",
+            )
+            .expect("create sidecar fixture");
+            let before = restore_entry_snapshots(&database.path);
+
+            let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+                .expect_err("restore sidecar must fail closed");
+            assert!(matches!(
+                error,
+                StoreError::NotFound {
+                    resource: "database"
+                }
+            ));
+            assert_eq!(restore_entry_snapshots(&database.path), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_open_existing_rejects_dangling_journal_sidecar_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let database = TempDatabase::new();
+        let seed =
+            PaStore::open(&database.path, DATABASE_KEY).expect("seed dangling-journal fixture");
+        drop(seed);
+
+        let journal_path = super::sqlite_sidecar_path(&database.path, "-journal");
+        symlink("missing-journal-target", &journal_path).expect("create dangling journal symlink");
+        let before = restore_entry_snapshots(&database.path);
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("dangling journal sidecar must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert_eq!(restore_entry_snapshots(&database.path), before);
+        assert!(before[3].symlink, "fixture must contain a dangling symlink");
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_empty_journal_sidecar_without_mutation() {
+        let database = TempDatabase::new();
+        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed journal fixture");
+        drop(seed);
+
+        let journal_path = super::sqlite_sidecar_path(&database.path, "-journal");
+        fs::write(&journal_path, []).expect("create empty journal sidecar");
+        let before = restore_entry_snapshots(&database.path);
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("empty journal sidecar must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert_eq!(restore_entry_snapshots(&database.path), before);
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_directory_journal_sidecar_without_mutation() {
+        let database = TempDatabase::new();
+        let seed = PaStore::open(&database.path, DATABASE_KEY).expect("seed journal fixture");
+        drop(seed);
+
+        let journal_path = super::sqlite_sidecar_path(&database.path, "-journal");
+        fs::create_dir(&journal_path).expect("create directory journal sidecar");
+        let before = restore_entry_snapshots(&database.path);
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("directory journal sidecar must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert_eq!(restore_entry_snapshots(&database.path), before);
+        assert!(
+            before[3].directory,
+            "fixture must contain a directory entry"
+        );
+    }
+
+    #[test]
+    fn restore_open_existing_rejects_malformed_journal_sidecar_without_mutation() {
+        let database = TempDatabase::new();
+        let seed =
+            PaStore::open(&database.path, DATABASE_KEY).expect("seed malformed journal fixture");
+        drop(seed);
+
+        let journal_path = super::sqlite_sidecar_path(&database.path, "-journal");
+        fs::write(&journal_path, [0xAA_u8; 512]).expect("create malformed rollback journal");
+        let before = restore_entry_snapshots(&database.path);
+
+        let error = PaStore::open_existing(&database.path, DATABASE_KEY)
+            .expect_err("malformed journal sidecar must fail closed");
+
+        assert!(matches!(
+            error,
+            StoreError::NotFound {
+                resource: "database"
+            }
+        ));
+        assert_eq!(restore_entry_snapshots(&database.path), before);
     }
 
     #[test]
