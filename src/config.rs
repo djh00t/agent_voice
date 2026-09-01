@@ -43,7 +43,13 @@ impl AppConfig {
                 let raw = fs::read_to_string(path)
                     .with_context(|| format!("failed to read config file {}", path.display()))?;
                 Self::validate_backup_policy_yaml_events(&raw)?;
-                serde_yaml::from_str(&raw).with_context(|| "failed to parse YAML config")?
+                serde_yaml::from_str(&raw).map_err(|error: serde_yaml::Error| {
+                    if error.to_string().starts_with("backup: invalid_type") {
+                        anyhow::anyhow!("backup: invalid_type")
+                    } else {
+                        anyhow::anyhow!("failed to parse YAML config")
+                    }
+                })?
             }
             None if require_path => {
                 bail!("configuration file path was required but not provided");
@@ -721,6 +727,9 @@ impl<'de> Deserialize<'de> for BackupConfig {
         D: serde::Deserializer<'de>,
     {
         let value = serde_yaml::Value::deserialize(deserializer)?;
+        if value.as_mapping().is_none() {
+            return Err(serde::de::Error::custom("backup: invalid_type"));
+        }
         if value.as_mapping().is_some_and(|mapping| {
             mapping
                 .keys()
@@ -3877,6 +3886,51 @@ agent_api:
             assert!(error.contains(&format!("unknown field `{field}`")));
             assert!(!error.contains("do-not-log-this"));
         }
+    }
+
+    #[test]
+    fn backup_config_yaml_container_errors_are_frozen_and_redacted() {
+        for yaml in ["do-not-log-this", "[do-not-log-this]", "null"] {
+            let error = serde_yaml::from_str::<BackupConfig>(yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "backup: invalid_type");
+            assert!(!error.contains("do-not-log-this"));
+        }
+
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.openai.api_key = Some("test-api-key".to_string());
+        let base_yaml = serde_yaml::to_string(&config).unwrap();
+
+        for value in ["do-not-log-this", "[do-not-log-this]", "null"] {
+            let yaml = replace_backup_yaml_mapping(&base_yaml, &format!("backup: {value}"));
+            let path = std::env::temp_dir().join(format!(
+                "agent-voice-backup-invalid-type-{}-{}.yaml",
+                std::process::id(),
+                value.len()
+            ));
+            fs::write(&path, yaml).unwrap();
+            let result = AppConfig::load(Some(&path), false);
+            fs::remove_file(&path).unwrap();
+            let error = result.unwrap_err().to_string();
+            assert_eq!(error, "backup: invalid_type");
+            assert!(!error.contains("do-not-log-this"));
+        }
+    }
+
+    #[test]
+    fn backup_config_preserves_mapping_deserialization() {
+        let backup: BackupConfig = serde_yaml::from_str(
+            "enabled: false\nprefix: backups\nretention_days: 30\nmax_age_hours: 24\n",
+        )
+        .unwrap();
+        assert!(!backup.enabled);
+        assert_eq!(backup.prefix, "backups");
+        assert_eq!(backup.retention_days, 30);
+        assert_eq!(backup.max_age_hours, 24);
     }
 
     #[test]
