@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -356,6 +358,7 @@ fn open_private_workspace(root: &Path) -> StoreResult<File> {
         || handle_metadata.ino() != path_metadata.ino()
         || stat.st_mode & 0o022 != 0
         || !workspace_owner_matches_effective_uid(stat.st_uid, process::geteuid().as_raw())
+        || !trusted_workspace_acl(&directory)
     {
         return Err(backup_error());
     }
@@ -370,6 +373,52 @@ fn open_private_workspace(_root: &Path) -> StoreResult<File> {
 #[cfg(unix)]
 fn workspace_owner_matches_effective_uid(root_uid: u32, effective_uid: u32) -> bool {
     root_uid == effective_uid
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const ACL_TYPE_EXTENDED: std::ffi::c_int = 0x0000_0100;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe extern "C" {
+    fn acl_free(object: *mut std::ffi::c_void) -> std::ffi::c_int;
+    fn acl_get_fd_np(fd: std::ffi::c_int, acl_type: std::ffi::c_int) -> *mut std::ffi::c_void;
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+struct WorkspaceExtendedAcl(*mut std::ffi::c_void);
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl WorkspaceExtendedAcl {
+    fn from_directory(directory: &File) -> Result<Option<Self>, ()> {
+        let acl = unsafe { acl_get_fd_np(directory.as_raw_fd(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            return if std::io::Error::last_os_error().kind() == ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(())
+            };
+        }
+        Ok(Some(Self(acl)))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl Drop for WorkspaceExtendedAcl {
+    fn drop(&mut self) {
+        unsafe {
+            acl_free(self.0);
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn trusted_workspace_acl(directory: &File) -> bool {
+    matches!(WorkspaceExtendedAcl::from_directory(directory), Ok(None))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn trusted_workspace_acl(_directory: &File) -> bool {
+    true
 }
 
 fn ensure_destination_absent(destination: &Path) -> StoreResult<()> {
@@ -772,6 +821,31 @@ mod tests {
         assert!(matches!(
             unsafe_error,
             StoreError::StoredRecordInvalid { resource: "backup" }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lifecycle_workspace_rejects_an_extended_acl_root() {
+        let destination = TempDestination::new("lifecycle-acl-root");
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow write,delete"])
+            .arg(&destination.directory)
+            .status()
+            .expect("install extended ACL on private workspace root");
+        assert!(status.success(), "install extended ACL on private workspace root");
+
+        let result = super::LifecycleWorkspace::from_private_root(&destination.directory);
+
+        let status = std::process::Command::new("chmod")
+            .args(["-N"])
+            .arg(&destination.directory)
+            .status()
+            .expect("remove extended ACL from private workspace root");
+        assert!(status.success(), "remove extended ACL from private workspace root");
+        assert!(matches!(
+            result,
+            Err(StoreError::StoredRecordInvalid { resource: "backup" })
         ));
     }
 
