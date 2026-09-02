@@ -1,4 +1,4 @@
 mod envelope;
 mod metadata;
-mod source;
+pub(crate) mod source;
 mod writer;
