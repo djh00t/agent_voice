@@ -11,9 +11,11 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{Timelike, Utc};
 use chrono_tz::Tz;
 use parking_lot::RwLock;
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, sleep};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+use xphone::types::{Codec, RtpHeader, RtpPacket};
 use xphone::{Call, DialOptions, Phone};
 
 use crate::accounting::{
@@ -22,13 +24,14 @@ use crate::accounting::{
 };
 use crate::api;
 use crate::audio::{TELEPHONY_FRAME_SAMPLES, TELEPHONY_RATE, encode_wav_mono_i16};
-use crate::config::{AppConfig, BehaviorConfig};
+use crate::config::{AppConfig, BehaviorConfig, VoiceTransport};
 use crate::llm::LlmService;
 use crate::openai::{ConversationContext, OpenAiClients, TranscriptEvent, TranscriptSink};
 use crate::phonebook::{
     CallerUpdate, PhoneBookStore, caller_id_display, is_valid_timezone, normalize_caller_id,
     normalize_email_candidate,
 };
+use crate::realtime_voice::{RealtimeAudioSink, RealtimeEvent, RealtimeSession};
 use crate::sherpa_onnx::SherpaOnnxClient;
 use crate::stt::SttService;
 use crate::tts::{SynthesisOutcome, TtsService};
@@ -75,7 +78,9 @@ impl VoiceAgentService {
         if config.llm.uses_openai() {
             required_models.push(config.openai.response_model.as_str());
         }
-        if config.voice.uses_openai() {
+        if config.voice.uses_openai()
+            && config.voice.openai.transport == VoiceTransport::ChatCompletions
+        {
             required_models.push(config.voice.openai.model.as_str());
         }
         accounting.validate_required_models(required_models)?;
@@ -209,6 +214,16 @@ impl VoiceAgentService {
             .get(call_id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown call id {}", call_id))?;
+        if let Some(realtime) = call.realtime_session() {
+            let transcript_text = text.clone();
+            realtime.speak(text, voice, instructions).await?;
+            call.record_manual_realtime_assistant_text(transcript_text);
+            info!(
+                call_id = %call.call.call_id(),
+                "manual assistant speech queued through realtime provider"
+            );
+            return Ok(());
+        }
         let tx = call
             .speaker_tx
             .read()
@@ -249,7 +264,7 @@ impl VoiceAgentService {
             .get(call_id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown call id {}", call_id))?;
-        call.call.end().map_err(|error| anyhow!(error.to_string()))
+        call.end_call()
     }
 
     fn register_callbacks(self: &Arc<Self>) {
@@ -357,6 +372,7 @@ impl VoiceAgentService {
         let transcript_dir = self.config.behavior.transcript_dir.clone();
         let accounting = Arc::clone(&self.accounting);
         call.on_ended(move |reason| {
+            record_clone.close_realtime_session();
             record_clone.set_status(format!("ended:{reason}"));
             if let Err(error) = record_clone.persist_transcript(&transcript_dir) {
                 record_clone.mark_error(format!("failed to persist transcript: {error}"));
@@ -487,7 +503,7 @@ impl VoiceAgentService {
                 .calls
                 .read()
                 .get(call_id)
-                .map(|call| call.speaker_tx.read().is_some())
+                .map(|call| call.media_ready())
                 .unwrap_or(false);
             if media_ready {
                 let caller = peer.as_deref().and_then(|key| self.phone_book.get(key));
@@ -551,6 +567,8 @@ struct ManagedCall {
     call: Arc<Call>,
     direction: String,
     speaker_tx: RwLock<Option<crossbeam_channel::Sender<Vec<i16>>>>,
+    realtime_session: RwLock<Option<RealtimeSession>>,
+    manual_realtime_assistant_texts: RwLock<VecDeque<String>>,
     transcript_events: RwLock<Vec<TranscriptEvent>>,
     status: RwLock<String>,
     last_error: RwLock<Option<String>>,
@@ -560,6 +578,7 @@ struct ManagedCall {
     track_existing_caller: bool,
     bridge_started: AtomicBool,
     end_requested: AtomicBool,
+    end_sent: AtomicBool,
     idle_watch_generation: AtomicU64,
     input_suppressed_until: RwLock<Option<Instant>>,
     pending_email_confirmation: RwLock<Option<String>>,
@@ -592,6 +611,8 @@ impl ManagedCall {
             call,
             direction,
             speaker_tx: RwLock::new(None),
+            realtime_session: RwLock::new(None),
+            manual_realtime_assistant_texts: RwLock::new(VecDeque::new()),
             transcript_events: RwLock::new(Vec::new()),
             status: RwLock::new("pending-media".to_string()),
             last_error: RwLock::new(None),
@@ -603,6 +624,7 @@ impl ManagedCall {
             track_existing_caller,
             bridge_started: AtomicBool::new(false),
             end_requested: AtomicBool::new(false),
+            end_sent: AtomicBool::new(false),
             idle_watch_generation: AtomicU64::new(0),
             input_suppressed_until: RwLock::new(None),
             pending_email_confirmation: RwLock::new(None),
@@ -621,7 +643,7 @@ impl ManagedCall {
             peer: self.peer.clone(),
             state: self.status.read().clone(),
             started_at: self.started_at.clone(),
-            media_ready: self.speaker_tx.read().is_some(),
+            media_ready: self.media_ready(),
             transcript_events: self.transcript_events.read().len(),
             api_call_count: accounting.api_call_count,
             total_cost_usd: accounting.total_cost_usd,
@@ -633,6 +655,70 @@ impl ManagedCall {
 
     fn set_speaker_tx(&self, speaker_tx: crossbeam_channel::Sender<Vec<i16>>) {
         *self.speaker_tx.write() = Some(speaker_tx);
+    }
+
+    fn set_realtime_session(&self, session: RealtimeSession) {
+        *self.realtime_session.write() = Some(session);
+    }
+
+    fn close_realtime_session(&self) {
+        if let Some(session) = self.realtime_session.read().as_ref() {
+            session.close();
+        }
+    }
+
+    fn request_end(&self) -> bool {
+        !self.end_requested.swap(true, Ordering::SeqCst)
+    }
+
+    fn send_end(&self) -> Result<()> {
+        if self
+            .end_sent
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Ok(());
+        }
+        match self.call.end() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.end_sent.store(false, Ordering::SeqCst);
+                Err(anyhow!(error.to_string()))
+            }
+        }
+    }
+
+    fn end_call(&self) -> Result<()> {
+        self.end_requested.store(true, Ordering::SeqCst);
+        self.send_end()
+    }
+
+    fn realtime_session(&self) -> Option<RealtimeSession> {
+        self.realtime_session.read().clone()
+    }
+
+    fn media_ready(&self) -> bool {
+        self.speaker_tx.read().is_some() || self.realtime_session.read().is_some()
+    }
+
+    fn record_manual_realtime_assistant_text(&self, text: String) {
+        let mut pending = self.manual_realtime_assistant_texts.write();
+        pending.push_back(text.clone());
+        while pending.len() > 16 {
+            pending.pop_front();
+        }
+        drop(pending);
+        self.record_assistant_text(text);
+    }
+
+    fn consume_manual_realtime_assistant_text(&self, text: &str) -> bool {
+        let mut pending = self.manual_realtime_assistant_texts.write();
+        if let Some(index) = pending.iter().position(|candidate| candidate == text) {
+            pending.remove(index);
+            true
+        } else {
+            false
+        }
     }
 
     fn set_status(&self, status: String) {
@@ -920,6 +1006,10 @@ async fn activate_call_bridge(
     record: Arc<ManagedCall>,
     call: Arc<Call>,
 ) -> Result<()> {
+    if bridge.voice.as_ref().is_some_and(VoiceService::is_realtime) {
+        return activate_realtime_bridge(bridge, record, call).await;
+    }
+
     if record.bridge_started.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
@@ -987,6 +1077,296 @@ async fn activate_call_bridge(
     });
 
     Ok(())
+}
+
+async fn activate_realtime_bridge(
+    bridge: MediaBridgeContext,
+    record: Arc<ManagedCall>,
+    call: Arc<Call>,
+) -> Result<()> {
+    if record.bridge_started.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let voice = bridge
+        .voice
+        .as_ref()
+        .ok_or_else(|| anyhow!("realtime bridge requires a voice service"))?;
+    let adapter = voice
+        .realtime_adapter()
+        .ok_or_else(|| anyhow!("realtime adapter is not configured"))?;
+    let endpoint = adapter.endpoint().to_string();
+    let model = adapter.model().to_string();
+    let rtp_rx = match call.rtp_reader() {
+        Some(reader) => reader,
+        None => {
+            record.bridge_started.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+    };
+    if call.codec() != Codec::PCMU {
+        record.mark_error("realtime voice requires the PCMU codec".to_string());
+        let _ = record.end_call();
+        return Ok(());
+    }
+    let rtp_tx = match call.rtp_writer() {
+        Some(writer) => writer,
+        None => {
+            record.bridge_started.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+    };
+
+    let sink = match RtpPcmuSink::new(rtp_tx) {
+        Ok(sink) => Arc::new(sink),
+        Err(_) => {
+            record.mark_error("realtime RTP initialization failed".to_string());
+            let _ = record.end_call();
+            return Err(anyhow!("realtime RTP initialization failed"));
+        }
+    };
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let session = match RealtimeSession::connect(adapter, sink, events_tx).await {
+        Ok(session) => session,
+        Err(_) => {
+            record.mark_error("realtime provider connection failed".to_string());
+            warn!(
+                call_id = %record.call.call_id(),
+                voice_backend = %voice.backend_name(),
+                voice_model = %model,
+                "failed to connect realtime provider"
+            );
+            let _ = record.end_call();
+            return Err(anyhow!("realtime provider connection failed"));
+        }
+    };
+    record.set_realtime_session(session.clone());
+    record.set_status(call.state().to_string());
+    info!(
+        call_id = %record.call.call_id(),
+        voice_backend = %voice.backend_name(),
+        voice_model = %model,
+        "started full-duplex realtime voice session"
+    );
+
+    let input_session = session.clone();
+    let input_call_id = record.call.call_id();
+    std::thread::spawn(move || {
+        let mut dropped_frames = 0_u64;
+        let mut next_drop_log = Instant::now();
+        while let Ok(packet) = rtp_rx.recv() {
+            if packet.header.payload_type != 0 {
+                continue;
+            }
+            match input_session.try_send_audio(packet.payload) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    dropped_frames += 1;
+                    let now = Instant::now();
+                    if now >= next_drop_log {
+                        debug!(
+                            call_id = %input_call_id,
+                            dropped_frames,
+                            "dropped realtime input RTP frames because the queue was full"
+                        );
+                        dropped_frames = 0;
+                        next_drop_log = now + REALTIME_DROP_LOG_INTERVAL;
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+            }
+        }
+        input_session.close();
+    });
+
+    let event_record = Arc::clone(&record);
+    let event_accounting = Arc::clone(&bridge.accounting);
+    tokio::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            match event {
+                RealtimeEvent::InputTranscript {
+                    text,
+                    final_text: true,
+                } => {
+                    if !text.trim().is_empty() {
+                        event_record.record_caller_text(text);
+                        event_record.note_activity();
+                    }
+                }
+                RealtimeEvent::OutputTranscript {
+                    text,
+                    final_text: true,
+                } => {
+                    if !text.trim().is_empty() {
+                        if !event_record.consume_manual_realtime_assistant_text(&text) {
+                            event_record.record_assistant_text(text);
+                        }
+                        event_record.note_activity();
+                    }
+                }
+                RealtimeEvent::SpeechStarted => {
+                    event_record.note_activity();
+                }
+                RealtimeEvent::ResponseDone { usage: Some(usage) } => {
+                    if let Err(error) = record_api_call(
+                        &event_accounting,
+                        &event_record,
+                        LoggedApiCall {
+                            operation: "voice.realtime",
+                            endpoint: &endpoint,
+                            model: &model,
+                            duration_ms: 0,
+                            usage_source: "api",
+                            estimated: false,
+                            usage,
+                        },
+                    ) {
+                        event_record
+                            .mark_error(format!("failed to record realtime usage: {error}"));
+                    }
+                }
+                RealtimeEvent::Error { error_type, code } => {
+                    warn!(
+                        call_id = %event_record.call.call_id(),
+                        error_type = error_type.as_deref().unwrap_or("unknown"),
+                        error_code = code.as_deref().unwrap_or("none"),
+                        "realtime provider error"
+                    );
+                    event_record.mark_error(realtime_error_status(
+                        error_type.as_deref(),
+                        code.as_deref(),
+                    ));
+                }
+                RealtimeEvent::AudioDelta { .. }
+                | RealtimeEvent::InputTranscript {
+                    final_text: false, ..
+                }
+                | RealtimeEvent::OutputTranscript {
+                    final_text: false, ..
+                }
+                | RealtimeEvent::ResponseDone { usage: None } => {}
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        session.wait_closed().await;
+        if !record.end_requested.load(Ordering::SeqCst)
+            && !matches!(call.state(), xphone::types::CallState::Ended)
+        {
+            warn!(
+                call_id = %call.call_id(),
+                "realtime session closed; ending SIP call"
+            );
+            if record.end_call().is_err() {
+                warn!(
+                    call_id = %call.call_id(),
+                    "failed to end SIP call after realtime session closed"
+                );
+            }
+        }
+    });
+
+    Ok(())
+}
+
+fn realtime_error_status(error_type: Option<&str>, code: Option<&str>) -> String {
+    match (error_type, code) {
+        (Some(error_type), Some(code)) => {
+            format!("realtime provider error (type={error_type}, code={code})")
+        }
+        (Some(error_type), None) => {
+            format!("realtime provider error (type={error_type})")
+        }
+        (None, Some(code)) => {
+            format!("realtime provider error (code={code})")
+        }
+        (None, None) => "realtime provider error".to_string(),
+    }
+}
+
+struct RtpPcmuSink {
+    rtp_tx: crossbeam_channel::Sender<RtpPacket>,
+    state: parking_lot::Mutex<RtpState>,
+}
+
+struct RtpState {
+    sequence_number: u16,
+    initial_timestamp: u32,
+    ssrc: u32,
+    last_packet: Option<(Instant, u32)>,
+}
+
+const REALTIME_DROP_LOG_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const RTP_FRAME_INTERVAL_MS: u128 = 20;
+
+impl RtpState {
+    fn new() -> Result<Self> {
+        let mut seed = [0_u8; 10];
+        SystemRandom::new()
+            .fill(&mut seed)
+            .map_err(|_| anyhow!("failed to generate RTP state"))?;
+        let mut ssrc = u32::from_be_bytes([seed[0], seed[1], seed[2], seed[3]]);
+        if ssrc == 0 {
+            ssrc = 1;
+        }
+        Ok(Self {
+            sequence_number: u16::from_be_bytes([seed[4], seed[5]]),
+            initial_timestamp: u32::from_be_bytes([seed[6], seed[7], seed[8], seed[9]]),
+            ssrc,
+            last_packet: None,
+        })
+    }
+
+    fn next_header(&mut self, marker: bool, now: Instant) -> RtpHeader {
+        let timestamp = match self.last_packet {
+            Some((last_sent_at, last_timestamp)) => {
+                let elapsed_frames = if marker {
+                    (now.saturating_duration_since(last_sent_at).as_millis()
+                        / RTP_FRAME_INTERVAL_MS)
+                        .max(1) as u32
+                } else {
+                    1
+                };
+                last_timestamp.wrapping_add(TELEPHONY_FRAME_SAMPLES as u32 * elapsed_frames)
+            }
+            None => self.initial_timestamp,
+        };
+        let sequence_number = self.sequence_number;
+        self.sequence_number = self.sequence_number.wrapping_add(1);
+        self.last_packet = Some((now, timestamp));
+        RtpHeader {
+            version: 2,
+            marker,
+            payload_type: 0,
+            sequence_number,
+            timestamp,
+            ssrc: self.ssrc,
+        }
+    }
+}
+
+impl RtpPcmuSink {
+    fn new(rtp_tx: crossbeam_channel::Sender<RtpPacket>) -> Result<Self> {
+        Ok(Self {
+            rtp_tx,
+            state: parking_lot::Mutex::new(RtpState::new()?),
+        })
+    }
+}
+
+impl RealtimeAudioSink for RtpPcmuSink {
+    fn send_audio(&self, audio: &[u8], marker: bool) -> Result<()> {
+        let packet = RtpPacket {
+            header: self.state.lock().next_header(marker, Instant::now()),
+            payload: audio.to_vec(),
+        };
+        self.rtp_tx
+            .send(packet)
+            .map_err(|_| anyhow!("RTP writer closed"))
+    }
+
+    fn flush(&self) {}
 }
 
 async fn process_detected_utterance(
@@ -1655,16 +2035,15 @@ fn schedule_idle_prompt(
 }
 
 fn schedule_end_call(record: Arc<ManagedCall>, playback_ms: u64, buffer_ms: u64) {
-    if record.end_requested.swap(true, Ordering::SeqCst) {
+    if !record.request_end() {
         return;
     }
     let delay_ms = playback_ms.saturating_add(buffer_ms);
-    let call = Arc::clone(&record.call);
-    let call_id = call.call_id();
+    let call_id = record.call.call_id();
     tokio::spawn(async move {
         info!(call_id = %call_id, delay_ms, "scheduling SIP BYE after farewell playback");
         sleep(Duration::from_millis(delay_ms)).await;
-        match call.end() {
+        match record.send_end() {
             Ok(()) => info!(call_id = %call_id, "sent SIP BYE after farewell"),
             Err(error) => {
                 warn!(call_id = %call_id, error = %error, "failed to send SIP BYE after farewell")
@@ -1868,9 +2247,7 @@ fn sanitize_caller_update(
     update.first_name = normalize_name_candidate(update.first_name);
     update.last_name = normalize_name_candidate(update.last_name);
     update.company = normalize_company_candidate(update.company);
-    update.timezone = update
-        .timezone
-        .filter(|value| is_valid_timezone(value));
+    update.timezone = update.timezone.filter(|value| is_valid_timezone(value));
 
     if update.preferred_language.is_some()
         && !caller_explicitly_set_language_preference(latest_caller_text)
@@ -2664,5 +3041,32 @@ mod tests {
             Some("Okay, bye.")
         );
         assert_eq!(fast_path_end_call_response("Goodbye."), None);
+    }
+
+    #[test]
+    fn rtp_timestamp_advances_through_silence() {
+        let start = Instant::now();
+        let mut state = RtpState {
+            sequence_number: 7,
+            initial_timestamp: 100,
+            ssrc: 42,
+            last_packet: None,
+        };
+
+        let first = state.next_header(true, start);
+        assert_eq!(first.sequence_number, 7);
+        assert_eq!(first.timestamp, 100);
+        assert!(first.marker);
+
+        let second = state.next_header(false, start + StdDuration::from_millis(20));
+        assert_eq!(second.sequence_number, 8);
+        assert_eq!(second.timestamp, 260);
+        assert!(!second.marker);
+
+        let third = state.next_header(true, start + StdDuration::from_millis(100));
+        assert_eq!(third.sequence_number, 9);
+        assert_eq!(third.timestamp, 900);
+        assert!(third.marker);
+        assert_eq!(third.ssrc, 42);
     }
 }
