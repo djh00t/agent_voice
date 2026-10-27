@@ -13,7 +13,8 @@ services:
       - ./models:/app/models
     environment:
       AGENT_VOICE_CONFIG: /app/config/agent_voice.yaml
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
       SIP_USERNAME: ${SIP_USERNAME:?set SIP_USERNAME in .env}
       SIP_PASSWORD: ${SIP_PASSWORD:?set SIP_PASSWORD in .env}
       SIP_HOST: ${SIP_HOST:?set SIP_HOST in .env}
@@ -41,8 +42,18 @@ services:
       LLM_PROVIDER: ${LLM_PROVIDER:-none}
       VOICE_PROVIDER: ${VOICE_PROVIDER:-disabled}
       OPENAI_VOICE_TRANSPORT: ${OPENAI_VOICE_TRANSPORT:-chat_completions}
+      OPENAI_VOICE_REALTIME_URL: ${OPENAI_VOICE_REALTIME_URL:-wss://api.openai.com/v1/realtime}
       OPENAI_VOICE_MODEL: ${OPENAI_VOICE_MODEL:-gpt-audio-1.5}
       OPENAI_VOICE_NAME: ${OPENAI_VOICE_NAME:-alloy}
+      OPENAI_VOICE_INSTRUCTIONS: ${OPENAI_VOICE_INSTRUCTIONS:-You are a helpful voice agent on a phone call. Keep replies brief, natural, and conversational.}
+      OPENAI_VOICE_INPUT_TRANSCRIPTION_MODEL: ${OPENAI_VOICE_INPUT_TRANSCRIPTION_MODEL:-}
+      XAI_REALTIME_URL: ${XAI_REALTIME_URL:-wss://api.x.ai/v1/realtime}
+      XAI_VOICE_MODEL: ${XAI_VOICE_MODEL:-grok-voice-latest}
+      XAI_VOICE_NAME: ${XAI_VOICE_NAME:-eve}
+      XAI_VOICE_INSTRUCTIONS: ${XAI_VOICE_INSTRUCTIONS:-You are a helpful voice agent on a phone call. Keep replies brief, natural, and conversational.}
+      XAI_REASONING_EFFORT: ${XAI_REASONING_EFFORT:-none}
+      XAI_TRANSCRIPTION_MODEL: ${XAI_TRANSCRIPTION_MODEL:-grok-transcribe}
+      XAI_LANGUAGE_HINT: ${XAI_LANGUAGE_HINT:-}
       OPENAI_TTS_INSTRUCTIONS: ${OPENAI_TTS_INSTRUCTIONS:-Speak in a cheerful, upbeat, warm, and helpful tone with a friendly Australian accent. Sound engaged and natural, not flat, stiff, or monotone.}
       OPENAI_TRANSCRIPTION_PROMPT: ${OPENAI_TRANSCRIPTION_PROMPT:-}
       OPENAI_TRANSCRIPTION_LANGUAGE: ${OPENAI_TRANSCRIPTION_LANGUAGE:-}

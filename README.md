@@ -2,7 +2,7 @@
 
 `agent_voice` is a Rust SIP bridge for agent workflows.
 
-It registers a SIP endpoint with `xphone`, exposes a localhost HTTP API for agents, turns inbound RTP into caller utterances, and can run either a split `STT -> LLM -> TTS` pipeline or a unified OpenAI voice-model reply path.
+It registers a SIP endpoint with `xphone`, exposes a localhost HTTP API for agents, turns inbound RTP into caller utterances, and can run a split `STT -> LLM -> TTS` pipeline, OpenAI chat-completions voice, or full-duplex OpenAI/xAI Realtime voice.
 
 ## Features
 
@@ -11,7 +11,7 @@ It registers a SIP endpoint with `xphone`, exposes a localhost HTTP API for agen
 - Selectable OpenAI or local sherpa-onnx speech backends for STT and TTS
 - Separately configurable standalone LLM and unified voice-model backends
 - Inbound caller turn detection with OpenAI `POST /v1/audio/transcriptions` or local Moonshine
-- Agent replies via OpenAI `POST /v1/responses` or OpenAI audio chat completions
+- Agent replies via OpenAI `POST /v1/responses`, OpenAI audio chat completions, or full-duplex OpenAI/xAI Realtime
 - Outbound speech injection via OpenAI `POST /v1/audio/speech` or local Kokoro
 - Persistent JSON phone book keyed by caller ID
 - Deny-by-default inbound caller-ID access control via the phone book
@@ -79,6 +79,15 @@ Important environment variables:
 - `OPENAI_VOICE_MODEL`
 - `OPENAI_VOICE_NAME`
 - `OPENAI_VOICE_INSTRUCTIONS`
+- `OPENAI_VOICE_REALTIME_URL`
+- `XAI_API_KEY`
+- `XAI_VOICE_MODEL`
+- `XAI_VOICE_NAME`
+- `XAI_VOICE_INSTRUCTIONS`
+- `XAI_REALTIME_URL`
+- `XAI_REASONING_EFFORT`
+- `XAI_TRANSCRIPTION_MODEL`
+- `XAI_LANGUAGE_HINT`
 - `SHERPA_ONNX_PYTHON_BIN`
 - `SHERPA_ONNX_BRIDGE_SCRIPT`
 - `SHERPA_ONNX_STT_*`
@@ -130,6 +139,32 @@ LLM_PROVIDER=none
 VOICE_PROVIDER=openai
 OPENAI_VOICE_MODEL=gpt-audio-1.5
 ```
+
+For OpenAI Realtime:
+
+```bash
+LLM_PROVIDER=none
+VOICE_PROVIDER=openai
+OPENAI_VOICE_TRANSPORT=realtime
+# Optional; defaults to gpt-realtime-2.1 and marin.
+OPENAI_VOICE_MODEL=gpt-realtime-2.1
+OPENAI_VOICE_NAME=marin
+```
+
+For xAI Realtime:
+
+```bash
+LLM_PROVIDER=none
+VOICE_PROVIDER=xai
+XAI_API_KEY=replace-me
+XAI_VOICE_MODEL=grok-voice-latest
+XAI_VOICE_NAME=eve
+XAI_REASONING_EFFORT=none
+```
+
+Realtime modes stream μ-law directly and use server VAD. Caller speech stops queued assistant audio and cancels the active provider response. `/speak`, `/transcript`, and `/hangup` keep the same control API.
+
+The chat-completions path remains the default. The OpenAI `gpt-live-1` `/v1/live/sessions` API is future work and is not selected by `OPENAI_VOICE_TRANSPORT=realtime`.
 
 In that mode, inbound caller audio goes directly into the voice model by default (single API hop for reply generation + transcript), so STT is skipped unless you explicitly set:
 
