@@ -36,10 +36,18 @@ curl -sS -X POST http://127.0.0.1:8089/v1/calls/<call_id>/speak \
 Relevant top-level fields:
 
 - `phone_state`
+- `conversation_mode`
 - `stt_backend`
+- `stt_model`
 - `tts_backend`
 - `tts_model`
+- `llm_backend`
+- `llm_model`
+- `voice_backend`
+- `voice_model`
 - `calls`
+
+`voice_backend` is `disabled`, `openai`, or `xai`. `voice_model` is the selected chat-completions or realtime model when a voice backend is enabled.
 
 ## Transcript example
 

@@ -864,7 +864,7 @@ fn audio_chat_messages(transcript: &[TranscriptEvent]) -> Vec<serde_json::Value>
         .collect()
 }
 
-fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
+pub(crate) fn extract_usage(payload: &serde_json::Value) -> TokenUsage {
     let usage = payload
         .get("usage")
         .cloned()

@@ -8,6 +8,8 @@ The service supports three config sources, in this order:
 
 That makes the Docker and Compose workflow environment-first while still allowing mounted YAML for explicit deployments.
 
+Credentials are read from YAML or the environment. Debug output redacts both keys. The OpenAI key remains serializable for existing config round-trips; the xAI key is omitted from serialized xAI settings.
+
 ## Main groups
 
 ### SIP
@@ -34,6 +36,18 @@ That makes the Docker and Compose workflow environment-first while still allowin
 - `OPENAI_VOICE_MODEL`
 - `OPENAI_VOICE_NAME`
 - `OPENAI_VOICE_INSTRUCTIONS`
+- `OPENAI_VOICE_REALTIME_URL`
+
+### xAI realtime voice
+
+- `XAI_API_KEY`
+- `XAI_REALTIME_URL`
+- `XAI_VOICE_MODEL`
+- `XAI_VOICE_NAME`
+- `XAI_VOICE_INSTRUCTIONS`
+- `XAI_REASONING_EFFORT`
+- `XAI_TRANSCRIPTION_MODEL`
+- `XAI_LANGUAGE_HINT`
 
 ### Speech backends
 
@@ -132,13 +146,31 @@ The default runtime is the split pipeline:
 - configured LLM backend generates the reply text
 - configured TTS backend generates assistant audio
 
-Set `VOICE_PROVIDER=openai` to switch assistant reply generation to an OpenAI voice model. Set `OPENAI_VOICE_TRANSPORT` to `chat_completions` (the default, with `gpt-audio-1.5`) or `realtime` (with `gpt-realtime-2.1` or `gpt-realtime-2.1-mini`).
+Set `VOICE_PROVIDER=openai` to switch assistant reply generation to an OpenAI voice model. `OPENAI_VOICE_TRANSPORT=chat_completions` remains the default and uses `gpt-audio-1.5`.
 
-In voice-model mode:
+`OPENAI_VOICE_TRANSPORT=realtime` uses a full-duplex websocket. It supports `gpt-realtime-2.1`, `gpt-realtime-2.1-mini`, `gpt-realtime-2`, and `gpt-realtime-1.5`. When the model is omitted, realtime defaults to `gpt-realtime-2.1`; its default voice is `marin`.
+
+For xAI, set `VOICE_PROVIDER=xai` and provide `XAI_API_KEY`. The default endpoint is `wss://api.x.ai/v1/realtime`, the default model is `grok-voice-latest` (the `grok-voice-3.0` alias), and the default voice is `eve`. `XAI_REASONING_EFFORT` defaults to `none` for telephone latency. The deprecated `grok-voice-2.0` model is not recommended.
+
+Realtime sessions use server VAD and stream G.711 μ-law directly. Caller speech interrupts queued assistant audio and cancels the active response. OpenAI and xAI realtime endpoints require `OPENAI_API_KEY` and `XAI_API_KEY` respectively. `OPENAI_VOICE_REALTIME_URL` overrides `voice.openai.realtime_url`; `OPENAI_REALTIME_URL` remains the legacy fallback.
+
+The bridge retries the initial websocket connection up to three times. If an established session closes or fails, the error enters the call status and the bridge ends the SIP call. It does not replay the conversation into a new provider session.
+
+In chat-completions voice-model mode:
 
 - the configured STT backend still runs for transcript bookkeeping, caller-history context, and phone-book flows
 - the standalone `llm` backend is optional and can be set to `none`
 - assistant reply text and audio come from the voice model in one API call
+
+In realtime voice-model mode, caller audio streams directly to the provider. The provider returns caller and assistant transcripts plus PCMU audio. `/v1/calls/{id}/speak` sends text into the active realtime session. `/v1/calls/{id}/transcript` and `/v1/calls/{id}/hangup` keep the same contract.
+
+`GET /v1/status` reports `voice_backend` as `openai` or `xai` and `voice_model` as the selected realtime model.
+
+### Realtime mode limitations
+
+- Realtime calls bypass the split-pipeline phone-book and caller-intent handling. Transcripts are recorded and exposed through `/v1/calls/{id}/transcript`, but phone-book editing and STT-driven flows are not applied.
+- xAI `/v1/calls/{id}/speak` uses `force_message`. Per-request voice and instruction overrides are ignored.
+- `gpt-live-1` (`/v1/live/sessions`) is not implemented. It needs a separate transport contract and is future work.
 
 If `VOICE_PROVIDER=disabled`, `LLM_PROVIDER` must remain enabled.
 

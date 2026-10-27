@@ -28,6 +28,8 @@ pub mod pa;
 pub mod phonebook;
 /// Inert boundary for the future OpenAI Realtime provider integration.
 pub mod realtime;
+/// Streaming OpenAI and xAI Realtime voice transport.
+pub mod realtime_voice;
 /// SIP call orchestration and runtime service state.
 pub mod service;
 /// Local sherpa-onnx speech bridge support.

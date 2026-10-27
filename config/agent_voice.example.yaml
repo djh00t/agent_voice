@@ -44,10 +44,20 @@ voice:
   openai:
     transport: "chat_completions"
     api_url: "https://api.openai.com/v1/chat/completions"
+    realtime_url: "wss://api.openai.com/v1/realtime"
     model: "gpt-audio-1.5"
     voice: "alloy"
     instructions: "You are a helpful voice agent on a phone call. Keep replies brief, natural, and conversational."
     input_transcription_model: null
+  xai:
+    api_key: null
+    realtime_url: "wss://api.x.ai/v1/realtime"
+    model: "grok-voice-latest"
+    voice: "eve"
+    instructions: "You are a helpful voice agent on a phone call. Keep replies brief, natural, and conversational."
+    reasoning_effort: "none"
+    transcription_model: "grok-transcribe"
+    language_hint: null
 
 agent_api:
   listen: "127.0.0.1:8089"

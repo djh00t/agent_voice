@@ -353,12 +353,18 @@ impl AppConfig {
             &mut self.llm.openai.instructions,
         );
         apply_voice_provider(env, "VOICE_PROVIDER", &mut self.voice.provider);
+        let previous_voice_transport = self.voice.openai.transport;
         apply_voice_transport(
             env,
             "OPENAI_VOICE_TRANSPORT",
             &mut self.voice.openai.transport,
         );
         apply_string(env, "OPENAI_VOICE_API_URL", &mut self.voice.openai.api_url);
+        apply_string(
+            env,
+            "OPENAI_VOICE_REALTIME_URL",
+            &mut self.voice.openai.realtime_url,
+        );
         apply_string(env, "OPENAI_VOICE_MODEL", &mut self.voice.openai.model);
         apply_string(env, "OPENAI_VOICE_NAME", &mut self.voice.openai.voice);
         apply_optional_string(
@@ -371,6 +377,38 @@ impl AppConfig {
             "OPENAI_VOICE_INPUT_TRANSCRIPTION_MODEL",
             &mut self.voice.openai.input_transcription_model,
         );
+        if env.contains_key("OPENAI_VOICE_TRANSPORT") {
+            if !env.contains_key("OPENAI_VOICE_MODEL")
+                && self.voice.openai.model == previous_voice_transport.default_model()
+            {
+                self.voice.openai.model = self.voice.openai.transport.default_model();
+            }
+            if !env.contains_key("OPENAI_VOICE_NAME")
+                && self.voice.openai.voice == previous_voice_transport.default_voice()
+            {
+                self.voice.openai.voice = self.voice.openai.transport.default_voice();
+            }
+        }
+        apply_optional_string(env, "XAI_API_KEY", &mut self.voice.xai.api_key);
+        apply_string(env, "XAI_REALTIME_URL", &mut self.voice.xai.realtime_url);
+        apply_string(env, "XAI_VOICE_MODEL", &mut self.voice.xai.model);
+        apply_string(env, "XAI_VOICE_NAME", &mut self.voice.xai.voice);
+        apply_optional_string(
+            env,
+            "XAI_VOICE_INSTRUCTIONS",
+            &mut self.voice.xai.instructions,
+        );
+        apply_string(
+            env,
+            "XAI_REASONING_EFFORT",
+            &mut self.voice.xai.reasoning_effort,
+        );
+        apply_optional_string(
+            env,
+            "XAI_TRANSCRIPTION_MODEL",
+            &mut self.voice.xai.transcription_model,
+        );
+        apply_optional_string(env, "XAI_LANGUAGE_HINT", &mut self.voice.xai.language_hint);
 
         apply_speech_provider(env, "SPEECH_STT_PROVIDER", &mut self.speech.stt_provider);
         apply_speech_provider(env, "SPEECH_TTS_PROVIDER", &mut self.speech.tts_provider);
@@ -614,19 +652,29 @@ impl AppConfig {
             // Legacy openai.response_instructions is set and llm is default; propagate legacy value.
             self.llm.openai.instructions = self.openai.response_instructions.clone();
         }
+
+        // OPENAI_REALTIME_URL remains the legacy fallback for the voice realtime endpoint.
+        if self.voice.openai.realtime_url == default_openai_voice_realtime_url()
+            && self.openai.realtime_url != default_realtime_url()
+        {
+            self.voice.openai.realtime_url = self.openai.realtime_url.clone();
+        }
     }
 
     fn validate(&self) -> Result<()> {
-        let requires_openai = self.speech.uses_openai_stt()
-            || self.speech.uses_openai_tts()
-            || self.llm.uses_openai()
-            || self.voice.uses_openai();
+        // xAI realtime replaces the split pipeline, so it does not use the OpenAI key.
+        let requires_openai = !self.voice.uses_xai()
+            && (self.speech.uses_openai_stt()
+                || self.speech.uses_openai_tts()
+                || self.llm.uses_openai()
+                || self.voice.uses_openai());
         if requires_openai
             && self
                 .openai
                 .api_key
                 .as_deref()
                 .unwrap_or_default()
+                .trim()
                 .is_empty()
         {
             bail!("OpenAI API key is required via config or OPENAI_API_KEY");
@@ -1317,9 +1365,10 @@ impl Default for SipConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 /// OpenAI endpoints, models, and prompt defaults.
 pub struct OpenAiConfig {
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default = "default_realtime_url")]
     pub realtime_url: String,
@@ -1351,6 +1400,37 @@ pub struct OpenAiConfig {
     pub tts_format: String,
     #[serde(default = "default_response_instructions")]
     pub response_instructions: Option<String>,
+}
+
+impl fmt::Debug for OpenAiConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiConfig")
+            .field(
+                "api_key",
+                &if self.api_key().is_empty() {
+                    "absent"
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .field("realtime_url", &self.realtime_url)
+            .field("audio_api_url", &self.audio_api_url)
+            .field("transcription_model", &self.transcription_model)
+            .field("transcription_api_url", &self.transcription_api_url)
+            .field("http_connect_timeout_ms", &self.http_connect_timeout_ms)
+            .field("http_timeout_ms", &self.http_timeout_ms)
+            .field("tts_model", &self.tts_model)
+            .field("tts_voice", &self.tts_voice)
+            .field("tts_instructions", &self.tts_instructions)
+            .field("responses_api_url", &self.responses_api_url)
+            .field("response_model", &self.response_model)
+            .field("transcription_prompt", &self.transcription_prompt)
+            .field("transcription_language", &self.transcription_language)
+            .field("tts_format", &self.tts_format)
+            .field("response_instructions", &self.response_instructions)
+            .finish()
+    }
 }
 
 impl OpenAiConfig {
@@ -1433,6 +1513,8 @@ pub enum VoiceProvider {
     Disabled,
     #[serde(rename = "openai", alias = "open_ai")]
     OpenAi,
+    #[serde(rename = "xai")]
+    Xai,
 }
 
 impl VoiceProvider {
@@ -1440,6 +1522,7 @@ impl VoiceProvider {
     pub fn parse(value: &str) -> Option<Self> {
         match normalize_env_value(value).to_ascii_lowercase().as_str() {
             "openai" => Some(Self::OpenAi),
+            "xai" | "grok" => Some(Self::Xai),
             "none" | "disabled" | "off" => Some(Self::Disabled),
             _ => None,
         }
@@ -1471,7 +1554,27 @@ impl VoiceTransport {
         let model = normalize_env_value(model);
         match self {
             Self::ChatCompletions => model == "gpt-audio-1.5",
-            Self::Realtime => matches!(model, "gpt-realtime-2.1" | "gpt-realtime-2.1-mini"),
+            Self::Realtime => matches!(
+                model,
+                "gpt-realtime-2.1"
+                    | "gpt-realtime-2.1-mini"
+                    | "gpt-realtime-2"
+                    | "gpt-realtime-1.5"
+            ),
+        }
+    }
+
+    fn default_model(self) -> String {
+        match self {
+            Self::ChatCompletions => default_openai_voice_model(),
+            Self::Realtime => default_openai_realtime_model(),
+        }
+    }
+
+    fn default_voice(self) -> String {
+        match self {
+            Self::ChatCompletions => default_openai_voice_name(),
+            Self::Realtime => default_openai_realtime_voice_name(),
         }
     }
 }
@@ -1532,12 +1635,16 @@ pub struct VoiceConfig {
     pub provider: VoiceProvider,
     #[serde(default)]
     pub openai: OpenAiVoiceConfig,
+    #[serde(default)]
+    pub xai: XaiVoiceConfig,
 }
 
 impl VoiceConfig {
     fn validate(&self) -> Result<()> {
         if self.uses_openai() {
             self.openai.validate()?;
+        } else if self.uses_xai() {
+            self.xai.validate()?;
         }
         Ok(())
     }
@@ -1551,15 +1658,22 @@ impl VoiceConfig {
     pub fn uses_openai(&self) -> bool {
         self.provider == VoiceProvider::OpenAi
     }
+
+    /// Returns true when xAI handles full duplex voice turns.
+    pub fn uses_xai(&self) -> bool {
+        self.provider == VoiceProvider::Xai
+    }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Serialize)]
 /// OpenAI voice-model settings for full audio-in/audio-out calls.
 pub struct OpenAiVoiceConfig {
     #[serde(default)]
     pub transport: VoiceTransport,
     #[serde(default = "default_openai_voice_api_url")]
     pub api_url: String,
+    #[serde(default = "default_openai_voice_realtime_url")]
+    pub realtime_url: String,
     #[serde(default = "default_openai_voice_model")]
     pub model: String,
     #[serde(default = "default_openai_voice_name")]
@@ -1568,6 +1682,46 @@ pub struct OpenAiVoiceConfig {
     pub instructions: Option<String>,
     #[serde(default = "default_openai_voice_input_transcription_model")]
     pub input_transcription_model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiVoiceConfigFields {
+    #[serde(default)]
+    transport: VoiceTransport,
+    #[serde(default = "default_openai_voice_api_url")]
+    api_url: String,
+    #[serde(default = "default_openai_voice_realtime_url")]
+    realtime_url: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    voice: Option<String>,
+    #[serde(default = "default_openai_voice_instructions")]
+    instructions: Option<String>,
+    #[serde(default = "default_openai_voice_input_transcription_model")]
+    input_transcription_model: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for OpenAiVoiceConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = OpenAiVoiceConfigFields::deserialize(deserializer)?;
+        Ok(Self {
+            transport: fields.transport,
+            api_url: fields.api_url,
+            realtime_url: fields.realtime_url,
+            model: fields
+                .model
+                .unwrap_or_else(|| fields.transport.default_model()),
+            voice: fields
+                .voice
+                .unwrap_or_else(|| fields.transport.default_voice()),
+            instructions: fields.instructions,
+            input_transcription_model: fields.input_transcription_model,
+        })
+    }
 }
 
 impl OpenAiVoiceConfig {
@@ -1582,6 +1736,9 @@ impl OpenAiVoiceConfig {
                 self.transport
             );
         }
+        if self.transport == VoiceTransport::Realtime {
+            validate_realtime_url("voice.openai.realtime_url", &self.realtime_url)?;
+        }
         Ok(())
     }
 }
@@ -1591,11 +1748,109 @@ impl Default for OpenAiVoiceConfig {
         Self {
             transport: VoiceTransport::default(),
             api_url: default_openai_voice_api_url(),
+            realtime_url: default_openai_voice_realtime_url(),
             model: default_openai_voice_model(),
             voice: default_openai_voice_name(),
             instructions: default_openai_voice_instructions(),
             input_transcription_model: default_openai_voice_input_transcription_model(),
         }
+    }
+}
+
+impl fmt::Debug for OpenAiVoiceConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiVoiceConfig")
+            .field("transport", &self.transport)
+            .field("api_url", &self.api_url)
+            .field("realtime_url", &self.realtime_url)
+            .field("model", &self.model)
+            .field("voice", &self.voice)
+            .field("instructions", &self.instructions)
+            .field("input_transcription_model", &self.input_transcription_model)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+/// xAI realtime voice settings for full audio-in/audio-out calls.
+pub struct XaiVoiceConfig {
+    #[serde(default, skip_serializing)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_xai_realtime_url")]
+    pub realtime_url: String,
+    #[serde(default = "default_xai_voice_model")]
+    pub model: String,
+    #[serde(default = "default_xai_voice_name")]
+    pub voice: String,
+    #[serde(default = "default_openai_voice_instructions")]
+    pub instructions: Option<String>,
+    #[serde(default = "default_xai_reasoning_effort")]
+    pub reasoning_effort: String,
+    #[serde(default = "default_xai_transcription_model")]
+    pub transcription_model: Option<String>,
+    #[serde(default)]
+    pub language_hint: Option<String>,
+}
+
+impl XaiVoiceConfig {
+    /// Returns the configured xAI API key or an empty string when unset.
+    pub fn api_key(&self) -> &str {
+        self.api_key.as_deref().unwrap_or_default()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.api_key().trim().is_empty() {
+            bail!("xAI API key is required via config or XAI_API_KEY");
+        }
+        validate_realtime_url("voice.xai.realtime_url", &self.realtime_url)?;
+        require_non_empty("voice.xai.model", &self.model)?;
+        require_non_empty("voice.xai.voice", &self.voice)?;
+        if !matches!(
+            normalize_env_value(&self.reasoning_effort),
+            "none" | "low" | "high"
+        ) {
+            bail!("voice.xai.reasoning_effort must be none, low, or high");
+        }
+        Ok(())
+    }
+}
+
+impl Default for XaiVoiceConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            realtime_url: default_xai_realtime_url(),
+            model: default_xai_voice_model(),
+            voice: default_xai_voice_name(),
+            instructions: default_openai_voice_instructions(),
+            reasoning_effort: default_xai_reasoning_effort(),
+            transcription_model: default_xai_transcription_model(),
+            language_hint: None,
+        }
+    }
+}
+
+impl fmt::Debug for XaiVoiceConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("XaiVoiceConfig")
+            .field(
+                "api_key",
+                &if self.api_key().is_empty() {
+                    "absent"
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .field("realtime_url", &self.realtime_url)
+            .field("model", &self.model)
+            .field("voice", &self.voice)
+            .field("instructions", &self.instructions)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("transcription_model", &self.transcription_model)
+            .field("language_hint", &self.language_hint)
+            .finish()
     }
 }
 
@@ -2503,12 +2758,24 @@ fn default_openai_voice_api_url() -> String {
     "https://api.openai.com/v1/chat/completions".to_string()
 }
 
+fn default_openai_voice_realtime_url() -> String {
+    default_realtime_url()
+}
+
 fn default_openai_voice_model() -> String {
     "gpt-audio-1.5".to_string()
 }
 
+fn default_openai_realtime_model() -> String {
+    "gpt-realtime-2.1".to_string()
+}
+
 fn default_openai_voice_name() -> String {
     "alloy".to_string()
+}
+
+fn default_openai_realtime_voice_name() -> String {
+    "marin".to_string()
 }
 
 fn default_openai_voice_instructions() -> Option<String> {
@@ -2517,6 +2784,26 @@ fn default_openai_voice_instructions() -> Option<String> {
 
 fn default_openai_voice_input_transcription_model() -> Option<String> {
     None
+}
+
+fn default_xai_realtime_url() -> String {
+    "wss://api.x.ai/v1/realtime".to_string()
+}
+
+fn default_xai_voice_model() -> String {
+    "grok-voice-latest".to_string()
+}
+
+fn default_xai_voice_name() -> String {
+    "eve".to_string()
+}
+
+fn default_xai_reasoning_effort() -> String {
+    "none".to_string()
+}
+
+fn default_xai_transcription_model() -> Option<String> {
+    Some("grok-transcribe".to_string())
 }
 
 fn default_tts_format() -> String {
@@ -2900,6 +3187,20 @@ fn require_non_empty(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_realtime_url(field: &str, value: &str) -> Result<()> {
+    require_non_empty(field, value)?;
+    let url = reqwest::Url::parse(value).map_err(|_| anyhow::anyhow!("{field} must be a URL"))?;
+    if !matches!(url.scheme(), "ws" | "wss")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("{field} must use ws or wss");
+    }
+    Ok(())
+}
+
 fn require_existing_path(field: &str, value: &str) -> Result<()> {
     require_non_empty(field, value)?;
     if !Path::new(value).exists() {
@@ -3168,29 +3469,27 @@ mod tests {
         let serialized_defaults = serde_yaml::to_value(&defaults).unwrap();
         assert_eq!(serialized_defaults["transport"], "chat_completions");
         assert_eq!(defaults.model, "gpt-audio-1.5");
+        assert_eq!(defaults.voice, "alloy");
 
         let yaml = r#"
 transport: realtime
-model: gpt-realtime-2.1
 "#;
         let yaml_config: OpenAiVoiceConfig = serde_yaml::from_str(yaml).unwrap();
         let serialized = serde_yaml::to_value(&yaml_config).unwrap();
         assert_eq!(serialized["transport"], "realtime");
         assert_eq!(yaml_config.model, "gpt-realtime-2.1");
+        assert_eq!(yaml_config.voice, "marin");
 
         let mut config = AppConfig::default();
         let env = HashMap::from([
             ("VOICE_PROVIDER".to_string(), "openai".to_string()),
             ("OPENAI_VOICE_TRANSPORT".to_string(), "realtime".to_string()),
-            (
-                "OPENAI_VOICE_MODEL".to_string(),
-                "gpt-realtime-2.1".to_string(),
-            ),
         ]);
         config.apply_env_overrides_from_map(&env).unwrap();
         let serialized = serde_yaml::to_value(&config.voice.openai).unwrap();
         assert_eq!(serialized["transport"], "realtime");
         assert_eq!(config.voice.openai.model, "gpt-realtime-2.1");
+        assert_eq!(config.voice.openai.voice, "marin");
         assert!(config.voice.validate().is_ok());
 
         let incompatible: OpenAiVoiceConfig =
@@ -3198,8 +3497,126 @@ model: gpt-realtime-2.1
         let voice = VoiceConfig {
             provider: VoiceProvider::OpenAi,
             openai: incompatible,
+            ..VoiceConfig::default()
         };
         assert!(voice.validate().is_err());
+    }
+
+    #[test]
+    fn realtime_model_matrix_and_endpoint_fallback() {
+        for model in [
+            "gpt-realtime-2.1",
+            "gpt-realtime-2.1-mini",
+            "gpt-realtime-2",
+            "gpt-realtime-1.5",
+        ] {
+            assert!(VoiceTransport::Realtime.supports_model(model));
+        }
+        assert!(!VoiceTransport::Realtime.supports_model("gpt-audio-1.5"));
+        assert!(VoiceTransport::ChatCompletions.supports_model("gpt-audio-1.5"));
+        assert!(!VoiceTransport::ChatCompletions.supports_model("gpt-realtime-2.1"));
+
+        let mut config = AppConfig::default();
+        let env = HashMap::from([(
+            "OPENAI_REALTIME_URL".to_string(),
+            "wss://realtime.example.test/v1/realtime".to_string(),
+        )]);
+        config.apply_env_overrides_from_map(&env).unwrap();
+        config.sync_legacy_openai_sections();
+        assert_eq!(
+            config.voice.openai.realtime_url,
+            "wss://realtime.example.test/v1/realtime"
+        );
+
+        let env = HashMap::from([(
+            "OPENAI_VOICE_REALTIME_URL".to_string(),
+            "wss://voice.example.test/v1/realtime".to_string(),
+        )]);
+        config.apply_env_overrides_from_map(&env).unwrap();
+        config.sync_legacy_openai_sections();
+        assert_eq!(
+            config.voice.openai.realtime_url,
+            "wss://voice.example.test/v1/realtime"
+        );
+    }
+
+    #[test]
+    fn xai_defaults_env_overrides_and_key_validation() {
+        let defaults = XaiVoiceConfig::default();
+        assert_eq!(defaults.realtime_url, "wss://api.x.ai/v1/realtime");
+        assert_eq!(defaults.model, "grok-voice-latest");
+        assert_eq!(defaults.voice, "eve");
+        assert_eq!(defaults.reasoning_effort, "none");
+        assert_eq!(
+            defaults.transcription_model.as_deref(),
+            Some("grok-transcribe")
+        );
+
+        let mut config = AppConfig::default();
+        config.sip.username = "test-user".to_string();
+        config.sip.password = "test-password".to_string();
+        config.sip.host = "sip.example.test".to_string();
+        config.agent_api.listen = "127.0.0.1:8089".to_string();
+        let env = HashMap::from([
+            ("VOICE_PROVIDER".to_string(), "xai".to_string()),
+            ("XAI_API_KEY".to_string(), "xai-test".to_string()),
+            ("XAI_VOICE_MODEL".to_string(), "grok-voice-3.0".to_string()),
+            ("XAI_VOICE_NAME".to_string(), "custom".to_string()),
+            (
+                "XAI_VOICE_INSTRUCTIONS".to_string(),
+                "Be concise.".to_string(),
+            ),
+            ("XAI_REASONING_EFFORT".to_string(), "high".to_string()),
+            ("XAI_LANGUAGE_HINT".to_string(), "en".to_string()),
+        ]);
+        config.apply_env_overrides_from_map(&env).unwrap();
+        assert_eq!(config.voice.provider, VoiceProvider::Xai);
+        assert_eq!(
+            serde_yaml::from_str::<VoiceProvider>("xai").unwrap(),
+            VoiceProvider::Xai
+        );
+        assert_eq!(config.voice.xai.api_key(), "xai-test");
+        assert_eq!(config.voice.xai.model, "grok-voice-3.0");
+        assert_eq!(config.voice.xai.voice, "custom");
+        assert_eq!(config.voice.xai.reasoning_effort, "high");
+        assert_eq!(config.voice.xai.language_hint.as_deref(), Some("en"));
+        assert_eq!(config.openai.api_key, None);
+        assert!(config.validate().is_ok());
+
+        let serialized = serde_json::to_value(&config.voice.xai).unwrap();
+        assert!(serialized.get("api_key").is_none());
+        let debug = format!("{:?}", config.voice.xai);
+        assert!(!debug.contains("xai-test"));
+
+        config.voice.xai.api_key = Some("   ".to_string());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("xAI API key")
+        );
+        config.voice.xai.api_key = Some("xai-test".to_string());
+        config.voice.xai.reasoning_effort = "medium".to_string();
+        assert!(config.voice.validate().is_err());
+        config.voice.xai.reasoning_effort = "none".to_string();
+        config.voice.xai.realtime_url = "https://api.x.ai/v1/realtime".to_string();
+        assert!(config.voice.validate().is_err());
+    }
+
+    #[test]
+    fn openai_key_is_redacted_in_debug_and_preserved_in_serialization() {
+        let config = OpenAiConfig {
+            api_key: Some("sk-secret-test".to_string()),
+            ..OpenAiConfig::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("sk-secret-test"));
+        assert!(debug.contains("[REDACTED]"));
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["api_key"],
+            "sk-secret-test"
+        );
     }
 
     #[test]
