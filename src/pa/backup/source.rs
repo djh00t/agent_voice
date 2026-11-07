@@ -833,7 +833,10 @@ mod tests {
             .arg(&destination.directory)
             .status()
             .expect("install extended ACL on private workspace root");
-        assert!(status.success(), "install extended ACL on private workspace root");
+        assert!(
+            status.success(),
+            "install extended ACL on private workspace root"
+        );
 
         let result = super::LifecycleWorkspace::from_private_root(&destination.directory);
 
@@ -842,7 +845,10 @@ mod tests {
             .arg(&destination.directory)
             .status()
             .expect("remove extended ACL from private workspace root");
-        assert!(status.success(), "remove extended ACL from private workspace root");
+        assert!(
+            status.success(),
+            "remove extended ACL from private workspace root"
+        );
         assert!(matches!(
             result,
             Err(StoreError::StoredRecordInvalid { resource: "backup" })
