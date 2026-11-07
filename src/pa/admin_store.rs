@@ -279,7 +279,8 @@ fn proposal_from_row(row: &Row<'_>) -> rusqlite::Result<AdminProposal> {
     let kind: Option<String> = row.get(2)?;
     let appointment_draft_id: Option<i64> = row.get(7)?;
     let owner_task_draft_id: Option<i64> = row.get(8)?;
-    if id < 1 || !matches!((appointment_draft_id, owner_task_draft_id), (Some(id), None) if id > 0) {
+    if id < 1 || !matches!((appointment_draft_id, owner_task_draft_id), (Some(id), None) if id > 0)
+    {
         return Err(rusqlite::Error::InvalidQuery);
     }
     let state = match state.as_str() {
