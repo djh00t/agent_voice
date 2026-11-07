@@ -289,10 +289,7 @@ impl FakeGmail {
     pub(crate) fn send_mail<'a>(&'a self, mail: &'a OutboundMail) -> ProviderFuture<'a, SentMail> {
         Box::pin(async move {
             let seeded_message_ids = {
-                let read_state = self
-                    .state
-                    .lock()
-                    .map_err(|_| ProviderError::Unavailable)?;
+                let read_state = self.state.lock().map_err(|_| ProviderError::Unavailable)?;
                 read_state
                     .messages
                     .iter()
@@ -321,10 +318,7 @@ impl FakeGmail {
                 sequence = sequence.checked_add(1).ok_or(ProviderError::Unavailable)?;
             };
             let next_sequence = sequence.checked_add(1).ok_or(ProviderError::Unavailable)?;
-            let sent = SentMail::new(
-                provider_message_id,
-                self.control.now(),
-            )?;
+            let sent = SentMail::new(provider_message_id, self.control.now())?;
             state.sent_by_operation_key.insert(
                 mail.operation_key().to_owned(),
                 GmailSentMail {
@@ -909,7 +903,10 @@ mod tests {
             "private-label",
             "fake-gmail:",
         ] {
-            assert!(!debug.contains(secret), "debug output exposed a seeded value");
+            assert!(
+                !debug.contains(secret),
+                "debug output exposed a seeded value"
+            );
         }
     }
 
@@ -953,7 +950,10 @@ mod tests {
             "sentinel sent body",
             "fake-gmail-sent-1",
         ] {
-            assert!(!debug.contains(secret), "debug output exposed a seeded value");
+            assert!(
+                !debug.contains(secret),
+                "debug output exposed a seeded value"
+            );
         }
     }
 
