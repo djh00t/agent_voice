@@ -4118,7 +4118,7 @@ agent_api:
     }
 
     #[test]
-    fn oauth_example_has_only_documented_credential_placeholders() {
+    fn oauth_example_defaults_to_unconfigured_providers() {
         let example = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/config/agent_voice.example.yaml"
@@ -4126,22 +4126,19 @@ agent_api:
         let yaml: serde_yaml::Value = serde_yaml::from_str(example).unwrap();
         let oauth = &yaml["agent_api"]["oauth"];
 
-        assert_eq!(
-            oauth["microsoft"]["client_id"].as_str(),
-            Some("${AGENT_VOICE_PA_MICROSOFT_CLIENT_ID}")
-        );
-        assert_eq!(
-            oauth["microsoft"]["client_secret"].as_str(),
-            Some("${AGENT_VOICE_PA_MICROSOFT_CLIENT_SECRET}")
-        );
-        assert_eq!(
-            oauth["google"]["client_id"].as_str(),
-            Some("${AGENT_VOICE_PA_GOOGLE_CLIENT_ID}")
-        );
-        assert_eq!(
-            oauth["google"]["client_secret"].as_str(),
-            Some("${AGENT_VOICE_PA_GOOGLE_CLIENT_SECRET}")
-        );
+        for provider in ["microsoft", "google"] {
+            assert!(oauth[provider]["client_id"].is_null());
+            assert!(oauth[provider]["client_secret"].is_null());
+        }
+        let mut config: AppConfig = serde_yaml::from_str(example).unwrap();
+        config.agent_api.oauth.normalize_and_validate().unwrap();
+        for provider in [OAuthProvider::Microsoft, OAuthProvider::Google] {
+            let credentials = config.agent_api.oauth.for_provider(provider);
+            assert!(credentials.client_id.is_none());
+            assert!(credentials.client_secret.is_none());
+            assert!(credentials.require_client_id(provider).is_err());
+            assert!(credentials.require_client_secret(provider).is_err());
+        }
 
         assert_eq!(
             oauth["microsoft"]["authorize_url"].as_str(),
@@ -4167,16 +4164,99 @@ agent_api:
             oauth["google"]["redirect_uri"].as_str(),
             Some("http://127.0.0.1:8089/oauth/google/callback")
         );
+    }
 
-        let placeholders = [
-            "${AGENT_VOICE_PA_MICROSOFT_CLIENT_ID}",
-            "${AGENT_VOICE_PA_MICROSOFT_CLIENT_SECRET}",
-            "${AGENT_VOICE_PA_GOOGLE_CLIENT_ID}",
-            "${AGENT_VOICE_PA_GOOGLE_CLIENT_SECRET}",
-        ];
-        assert_eq!(example.matches("${").count(), placeholders.len());
-        for placeholder in placeholders {
-            assert_eq!(example.matches(placeholder).count(), 1);
+    #[test]
+    fn oauth_compose_preserves_unset_optional_credentials() {
+        let compose: serde_yaml::Value = serde_yaml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docker-compose.yml"
+        )))
+        .unwrap();
+        let environment = compose["services"]["agent-voice"]["environment"]
+            .as_mapping()
+            .unwrap();
+        for name in [
+            "AGENT_VOICE_PA_MICROSOFT_CLIENT_ID",
+            "AGENT_VOICE_PA_MICROSOFT_CLIENT_SECRET",
+            "AGENT_VOICE_PA_GOOGLE_CLIENT_ID",
+            "AGENT_VOICE_PA_GOOGLE_CLIENT_SECRET",
+        ] {
+            let key = serde_yaml::Value::String(name.to_string());
+            assert!(environment.contains_key(&key));
+            assert!(environment[&key].is_null());
+        }
+    }
+
+    #[test]
+    fn oauth_environment_example_leaves_optional_credentials_unset() {
+        let example = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/.env.example"));
+        for name in [
+            "AGENT_VOICE_PA_MICROSOFT_CLIENT_ID",
+            "AGENT_VOICE_PA_MICROSOFT_CLIENT_SECRET",
+            "AGENT_VOICE_PA_GOOGLE_CLIENT_ID",
+            "AGENT_VOICE_PA_GOOGLE_CLIENT_SECRET",
+        ] {
+            assert!(!example.lines().any(|line| {
+                line.trim_start()
+                    .split_once('=')
+                    .is_some_and(|(key, _)| key.trim() == name)
+            }));
+        }
+    }
+
+    #[test]
+    fn oauth_absent_env_preserves_yaml_credentials() {
+        let mut config: PaOAuthConfig = serde_yaml::from_str(
+            r#"
+microsoft:
+  client_id: microsoft-id
+  client_secret: microsoft-secret
+google:
+  client_id: google-id
+  client_secret: google-secret
+"#,
+        )
+        .unwrap();
+        let expected = config.clone();
+        config.apply_env_overrides_from_map(&HashMap::new());
+        config.normalize_and_validate().unwrap();
+        assert_eq!(config, expected);
+    }
+
+    #[test]
+    fn oauth_env_rejects_blank_and_placeholder_credentials() {
+        for name in [
+            "AGENT_VOICE_PA_MICROSOFT_CLIENT_ID",
+            "AGENT_VOICE_PA_MICROSOFT_CLIENT_SECRET",
+            "AGENT_VOICE_PA_GOOGLE_CLIENT_ID",
+            "AGENT_VOICE_PA_GOOGLE_CLIENT_SECRET",
+        ] {
+            for value in ["", "   ", "${UNSET_OAUTH_CREDENTIAL}"] {
+                let mut config = PaOAuthConfig::default();
+                config.apply_env_overrides_from_map(&HashMap::from([(
+                    name.to_string(),
+                    value.to_string(),
+                )]));
+                assert!(config.normalize_and_validate().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn oauth_env_rejects_secret_without_client_id() {
+        for name in [
+            "AGENT_VOICE_PA_MICROSOFT_CLIENT_SECRET",
+            "AGENT_VOICE_PA_GOOGLE_CLIENT_SECRET",
+        ] {
+            let mut config = PaOAuthConfig::default();
+            config.apply_env_overrides_from_map(&HashMap::from([(
+                name.to_string(),
+                "secret-only-sentinel".to_string(),
+            )]));
+            let error = config.normalize_and_validate().unwrap_err().to_string();
+            assert!(error.contains("client_id"));
+            assert!(!error.contains("secret-only-sentinel"));
         }
     }
 
