@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use base64::Engine as _;
-    use serde_json::{json, Value};
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use serde_json::{Value, json};
 
     use super::super::values::{G711Ulaw, OpaqueId, RealtimeValueError, TranscriptText};
     use super::RealtimeServerAudioEvent;
