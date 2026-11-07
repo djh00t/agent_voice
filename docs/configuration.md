@@ -49,6 +49,27 @@ Credentials are read from YAML or the environment. Debug output redacts both key
 - `XAI_TRANSCRIPTION_MODEL`
 - `XAI_LANGUAGE_HINT`
 
+### Personal-assistant OAuth
+
+Microsoft and Google OAuth credentials are optional until the corresponding
+provider is configured:
+
+- `AGENT_VOICE_PA_MICROSOFT_CLIENT_ID`
+- `AGENT_VOICE_PA_MICROSOFT_CLIENT_SECRET`
+- `AGENT_VOICE_PA_GOOGLE_CLIENT_ID`
+- `AGENT_VOICE_PA_GOOGLE_CLIENT_SECRET`
+
+Leave unused credentials unset. The environment example comments them out, and
+the YAML example uses `null`. Compose preserves missing variables instead of
+turning them into empty strings. Configured environment values override YAML;
+when an environment variable is absent, an existing YAML value remains intact.
+
+Explicit blank values, unresolved `${...}` placeholders, and a client secret
+without its client ID are rejected. OAuth operations still require configured
+credentials. For an older deployment, omit unused blank assignments and unused
+YAML placeholders, or provide the intended credentials; do not remove populated
+credentials merely to pass startup validation.
+
 ### Speech backends
 
 - `SPEECH_STT_PROVIDER`
