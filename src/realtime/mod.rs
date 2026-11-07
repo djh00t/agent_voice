@@ -5,15 +5,15 @@
 //! later event and dispatch packages can build on the same side-effect-free
 //! boundary.
 
-pub mod values;
 pub mod client_events;
+pub mod events;
 pub mod server_audio_events;
 pub mod server_function_events;
 pub mod server_response_events;
 pub mod server_session_events;
-pub mod events;
+pub mod values;
 
-pub use events::{decode_server_event, RealtimeServerEvent};
+pub use events::{RealtimeServerEvent, decode_server_event};
 pub use server_audio_events::RealtimeServerAudioEvent;
 pub use server_function_events::RealtimeServerFunctionEvent;
 pub use server_response_events::RealtimeServerResponseEvent;
